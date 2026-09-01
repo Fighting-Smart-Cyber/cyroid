@@ -1,44 +1,46 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/Status-Active%20Development-brightgreen" alt="Status">
-  <img src="https://img.shields.io/badge/Phase-5%20of%207-blue" alt="Phase">
-  <img src="https://img.shields.io/badge/Version-0.35.35-orange" alt="Version">
   <img src="https://img.shields.io/badge/License-AGPL%20v3-blue" alt="License">
+  <img src="https://img.shields.io/badge/Status-Active%20Development-brightgreen" alt="Status">
 </p>
 
-<h1 align="center">PROVING GROUND</h1>
-<h3 align="center">LOGC2 training range development</h3>
+<h1 align="center">CYROID</h1>
+<h3 align="center">Cyber Range Orchestrator</h3>
 
 <p align="center">
-  <strong>Enterprise-grade cyber range orchestration platform for automated deployment, management, and execution of Docker-based training environments</strong>
+  <strong>Deploy disposable, mission-relevant training environments — and keep a defensible
+  record of what each learner actually did.</strong>
 </p>
 
 <p align="center">
-  <a href="#features">Features</a> •
+  <a href="#overview">Overview</a> •
   <a href="#architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
-  <a href="#roadmap">Roadmap</a> •
   <a href="#api-reference">API</a> •
   <a href="#contributing">Contributing</a>
 </p>
-
 
 ---
 
 ## About
 
-PROVING GROUND builds rinsable, repeatable cyber range iterations supporting LOGC2
-capabilities, work roles, and workflows.
+CYROID is the engine: range lifecycle, placement, blueprints, networking, browser console,
+image management, the capability contract, curriculum entities, the learner record and
+assessment. It is deliberately agnostic of the software it trains people on.
 
-Content is installed from the
-[cyroid-catalog](https://github.com/JongoDB/cyroid-catalog) feed. The
-`proving_ground` Python package name, image namespace, environment variable keys
-and database names are held stable so catalog blueprints and images resolve
+A **distribution** is built on top of it — a theme, one or more capability packages, and
+training content. The engine ships the schema and the mechanism; a distribution ships the
+instance data. That separation is the whole design, and it is what makes a second customer a
+new distribution rather than a fork.
+
+Content is installed from the [cyroid-catalog](https://github.com/JongoDB/cyroid-catalog)
+feed. Some internal identifiers — the Python package name, image namespace, environment
+variable keys and database names — are held stable so catalog blueprints and images resolve
 without modification.
 
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JongoDB/PROVING GROUND/master/scripts/deploy.sh -o deploy.sh
+curl -fsSL https://raw.githubusercontent.com/Fighting-Smart-Cyber/cyroid/main/scripts/deploy.sh -o deploy.sh
 chmod +x deploy.sh
 ./deploy.sh
 ```
@@ -47,7 +49,7 @@ chmod +x deploy.sh
 
 ## Overview
 
-**PROVING GROUND** is a comprehensive web-based cyber range orchestration platform designed to automate the instantiation, management, and execution of Docker-based cyber training environments. Built for military, government, and educational institutions, PROVING GROUND enables rapid deployment of isolated, networked cyber environments for training, evaluation, and security testing.
+**CYROID** is a comprehensive web-based cyber range orchestration platform designed to automate the instantiation, management, and execution of Docker-based cyber training environments. Built for military, government, and educational institutions, CYROID enables rapid deployment of isolated, networked cyber environments for training, evaluation, and security testing.
 
 ### Key Capabilities
 
@@ -57,34 +59,6 @@ chmod +x deploy.sh
 - **Web-Based Console**: VNC access to all VMs through browser
 - **Scenario Automation**: MSEL (Master Scenario Events List) execution engine
 - **Evidence Management**: Student submission, validation, and automated scoring
-
----
-
-## What's New in v0.35.x
-
-### Production Deployment (v0.34.0 - v0.35.5)
-
-- **Self-Contained Deploy Script**: Full TUI-based deployment with version selection
-- **Non-Interactive Mode**: Deploy with `-y` flag for CI/CD pipelines
-- **Admin CLI Flags**: Create admin user via `--admin-user`, `--admin-password`, `--admin-email`
-- **Multi-Architecture Support**: Platform detection and proper image pulls for x86_64/ARM64
-- **Image Backup/Restore**: Backup all PROVING GROUND Docker images to disk for offline deployment
-- **Live Dashboard**: K9s-style TUI with real-time service status during deployment
-
-### Registry & Catalog (v0.30.0 - v0.33.x)
-
-- **Content Catalog**: Browse and install training scenarios from remote registries
-- **Storefront UI**: Professional catalog browsing with categories and search
-- **Registry Management**: Admin interface for managing catalog sources
-- **Scenario Installation**: One-click install of scenarios with all dependencies
-
-### Previous Highlights
-
-- **DinD Isolation**: Each range runs in isolated Docker-in-Docker container
-- **Content Library**: Student Lab walkthroughs with markdown support
-- **Blueprint Export/Import v3.0**: Dockerfiles included for reproducible environments
-- **Global Notifications**: Toast notifications + bell dropdown history
-- **Cross-Platform Support**: Linux and macOS (Docker Desktop)
 
 ---
 
@@ -101,7 +75,7 @@ Every range deploys inside its own isolated Docker-in-Docker container:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    PROVING GROUND Host Docker                                │
+│                    CYROID Host Docker                                │
 │                                                                      │
 │   pg-mgmt (172.30.0.0/24)         pg-ranges (172.30.1.0/24) │
 │   ├── API: 172.30.0.10                ├── Range-1 DinD: 172.30.1.x  │
@@ -185,7 +159,7 @@ Every range deploys inside its own isolated Docker-in-Docker container:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         PROVING GROUND Architecture                              │
+│                         CYROID Architecture                              │
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -242,11 +216,11 @@ Every range deploys inside its own isolated Docker-in-Docker container:
 │                                                                             │
 │  ┌───────────────────────────────────────────────────────────────────────┐ │
 │  │              pg-mgmt Network (172.30.0.0/24)                       │ │
-│  │           PROVING GROUND Infrastructure Services (External)                    │ │
+│  │           CYROID Infrastructure Services (External)                    │ │
 │  └─────────┬──────────────────┬──────────────────┬───────────────────────┘ │
 │            │                  │                  │                         │
 │       ┌────┴────┐        ┌────┴────┐        ┌────┴────┐  ┌─────────┐       │
-│       │ PROVING GROUND  │        │ Traefik │        │ Database│  │Registry │       │
+│       │ CYROID          │        │ Traefik │        │ Database│  │Registry │       │
 │       │   API   │        │ (VNC)   │        │  Redis  │  │ (Local) │       │
 │       │ Worker  │        │         │        │  MinIO  │  │         │       │
 │       └────┬────┘        └────┬────┘        └─────────┘  └────┬────┘       │
@@ -274,7 +248,7 @@ Every range deploys inside its own isolated Docker-in-Docker container:
 
 ### Local Docker Registry
 
-PROVING GROUND includes a local Docker registry (`registry:2`) for efficient image distribution to DinD containers:
+CYROID includes a local Docker registry (`registry:2`) for efficient image distribution to DinD containers:
 
 **Purpose:**
 - Eliminates redundant image pulls from external registries (Docker Hub, GHCR)
@@ -321,20 +295,18 @@ PROVING GROUND includes a local Docker registry (`registry:2`) for efficient ima
 | | Docker DinD | 24 | Range Isolation |
 | | Registry | 2 | Local Image Distribution |
 
-### Container Images (GHCR)
+### Container images
 
-All PROVING GROUND images are published to GitHub Container Registry:
+Build from source. `scripts/compose.sh` builds every service image locally and is the
+supported path:
 
-| Image | Description | Pull Command |
-|-------|-------------|--------------|
-| `ghcr.io/jongodb/cyroid-api` | FastAPI backend | `docker pull ghcr.io/jongodb/cyroid-api:latest` |
-| `ghcr.io/jongodb/cyroid-frontend` | React web UI | `docker pull ghcr.io/jongodb/cyroid-frontend:latest` |
-| `ghcr.io/jongodb/cyroid-worker` | Dramatiq task worker | `docker pull ghcr.io/jongodb/cyroid-worker:latest` |
-| `ghcr.io/jongodb/cyroid-proxy` | Traefik reverse proxy | `docker pull ghcr.io/jongodb/cyroid-proxy:latest` |
-| `ghcr.io/jongodb/cyroid-dind` | Docker-in-Docker | `docker pull ghcr.io/jongodb/cyroid-dind:latest` |
-| `ghcr.io/jongodb/cyroid-storage` | MinIO object storage | `docker pull ghcr.io/jongodb/cyroid-storage:latest` |
+```bash
+./scripts/compose.sh up -d --build
+```
 
-Images are automatically built and pushed on every commit to master via GitHub Actions.
+Release images are built by CI into a private registry, so they are not pullable from
+outside. The `ghcr.io/jongodb/cyroid-*` images referenced by older documentation predate the
+move and no longer receive builds — treat them as legacy rather than current.
 
 ### Per-Range Network Architecture (Inside DinD)
 
@@ -390,7 +362,7 @@ Each range runs inside a DinD container with iptables-based routing (VyOS option
 ### Easy Install (3 Commands)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JongoDB/PROVING GROUND/master/scripts/deploy.sh -o deploy.sh
+curl -fsSL https://raw.githubusercontent.com/Fighting-Smart-Cyber/cyroid/main/scripts/deploy.sh -o deploy.sh
 chmod +x deploy.sh
 ./deploy.sh
 ```
@@ -410,7 +382,7 @@ The deploy script provides a TUI-based installation wizard that handles everythi
 
 **Interactive mode (with TUI wizard):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JongoDB/PROVING GROUND/master/scripts/deploy.sh -o deploy.sh
+curl -fsSL https://raw.githubusercontent.com/Fighting-Smart-Cyber/cyroid/main/scripts/deploy.sh -o deploy.sh
 chmod +x deploy.sh
 ./deploy.sh
 ```
@@ -430,7 +402,7 @@ chmod +x deploy.sh
 | `--admin-user USER` | Admin username (default: admin) |
 | `--admin-password PASS` | Admin password (default: admin123) |
 | `--admin-email EMAIL` | Admin email (default: admin@proving_ground.local) |
-| `--version VER` | PROVING GROUND version to deploy |
+| `--version VER` | CYROID version to deploy |
 | `--backup [NAME]` | Backup Docker images to disk |
 | `--restore [NAME]` | Restore Docker images from backup |
 
@@ -438,8 +410,8 @@ chmod +x deploy.sh
 
 ```bash
 # Clone the repository
-git clone https://github.com/JongoDB/PROVING GROUND.git
-cd PROVING GROUND
+git clone https://github.com/Fighting-Smart-Cyber/cyroid.git
+cd cyroid
 
 # Copy environment template
 cp .env.example .env
@@ -450,7 +422,7 @@ sed -i "s/your-secret-key-here/$(openssl rand -hex 32)/" .env
 # macOS: Generate secure secrets
 sed -i '' "s/your-secret-key-here/$(openssl rand -hex 32)/" .env
 
-# Initialize PROVING GROUND networks
+# Initialize CYROID networks
 ./scripts/init-networks.sh
 
 # Start all services (pulls pre-built images from GHCR)
@@ -494,14 +466,14 @@ echo "PROVING_GROUND_DATA_DIR=$HOME/.proving_ground" >> .env
 
 ### Network Initialization
 
-PROVING GROUND uses external Docker networks for isolation. Initialize them before first run:
+CYROID uses external Docker networks for isolation. Initialize them before first run:
 
 ```bash
 # Create required networks
 ./scripts/init-networks.sh
 
 # Output:
-# === Initializing PROVING GROUND Networks ===
+# === Initializing CYROID Networks ===
 # Created pg-mgmt (172.30.0.0/24)
 # Created pg-ranges (172.30.1.0/24)
 # Created traefik-routing
@@ -528,7 +500,7 @@ PROVING GROUND uses external Docker networks for isolation. Initialize them befo
 
 ## Platform Support
 
-PROVING GROUND runs natively on both **x86_64** and **ARM64** architectures (Apple Silicon, AWS Graviton, Raspberry Pi, etc.).
+CYROID runs natively on both **x86_64** and **ARM64** architectures (Apple Silicon, AWS Graviton, Raspberry Pi, etc.).
 
 ### Architecture Compatibility Matrix
 
@@ -544,7 +516,7 @@ PROVING GROUND runs natively on both **x86_64** and **ARM64** architectures (App
 
 ### Running on ARM64 Hosts
 
-When running PROVING GROUND on ARM64 hosts (e.g., Apple Silicon Macs, AWS Graviton instances):
+When running CYROID on ARM64 hosts (e.g., Apple Silicon Macs, AWS Graviton instances):
 
 **Native Performance:**
 - All core platform services (API, database, cache, storage) run natively
@@ -571,7 +543,7 @@ When running PROVING GROUND on ARM64 hosts (e.g., Apple Silicon Macs, AWS Gravit
 ## Project Structure
 
 ```
-PROVING GROUND/
+cyroid/
 ├── backend/                    # FastAPI Application
 │   ├── proving_ground/
 │   │   ├── main.py            # Application entry point
@@ -826,7 +798,7 @@ DIND_DOCKER_PORT=2375
 
 | Network | Subnet | Purpose |
 |---------|--------|---------|
-| pg-mgmt | 172.30.0.0/24 | PROVING GROUND infrastructure services |
+| pg-mgmt | 172.30.0.0/24 | CYROID infrastructure services |
 | pg-ranges | 172.30.1.0/24 | Range DinD containers |
 | traefik-routing | Dynamic | Traefik service routing |
 
@@ -1128,6 +1100,6 @@ conversation.
 ---
 
 <p align="center">
-  <strong>PROVING GROUND</strong> - Cyber Range Orchestrator In Docker<br>
+  <strong>CYROID</strong> — Cyber Range Orchestrator<br>
   <em>Built for secure, scalable cyber training environments</em>
 </p>

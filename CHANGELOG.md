@@ -10,6 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `backend/tests/unit/test_changelog_agrees.py` fails if the two disagree about which versions
 > exist. That file is the one to write carefully — it is what operators actually read.
 
+## [0.42.3] - 2026-09-01
+
+### Fixed
+
+- **The public engine's README described the distribution, not the engine**, and named a customer
+  programme in its subtitle — on a capability-agnostic engine. Rewritten; no published file names a
+  customer, verified by scanning the publish filter's whole output.
+- The install one-liner and the clone command each contained a literal space in the URL
+  (`github.com/JongoDB/PROVING GROUND`), so neither could ever have worked.
+- Removed a stale version badge (`0.35.35` against a real `0.42.2`), a "What's New in v0.35.x"
+  section five minor releases old, and a table pointing at `ghcr.io/jongodb/cyroid-*` images that no
+  longer receive builds.
+
+### Changed
+
+- `test_no_customer_names_in_code.py` now scans published prose (README, CONTRIBUTING, CHANGELOG),
+  not only code — prose was invisible to it, which is how the customer name shipped. The test is
+  itself excluded from publication: it carried the list of forbidden customer terms as a regex, so
+  publishing it named them more plainly than the string it was written to catch.
+
 ## [0.42.2] - 2026-09-01
 
 ### Changed

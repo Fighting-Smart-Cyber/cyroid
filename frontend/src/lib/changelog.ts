@@ -35,6 +35,17 @@ export interface Release {
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.42.3',
+    date: '2026-09-01',
+    title: 'Corrections to the open-source engine\'s documentation',
+    highlights: [
+      {
+        kind: 'fix',
+        text: 'No product change. The open-source engine\'s README described the wrong product, named a specific customer programme on the front page of what is a customer-agnostic engine, and carried install and clone commands that could never have worked — both contained a space in the URL. It also advertised a version five releases old and container images that are no longer built.',
+      },
+    ],
+  },
+  {
     version: '0.42.2',
     date: '2026-09-01',
     title: 'The engine moved to its own home and is published as CYROID',
