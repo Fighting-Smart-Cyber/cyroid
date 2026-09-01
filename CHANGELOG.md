@@ -1,0 +1,435 @@
+# Changelog
+
+All notable changes to PROVING GROUND will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+> **User-facing entries live in `frontend/src/lib/changelog.ts`**, which is what the in-app
+> "What's new" modal renders. Add a release there and here together;
+> `backend/tests/unit/test_changelog_agrees.py` fails if the two disagree about which versions
+> exist. That file is the one to write carefully — it is what operators actually read.
+
+## [0.42.2] - 2026-09-01
+
+### Changed
+
+- **The engine moved to `fighting-smart-cyber/cyroid`** and is published as CYROID rather than under
+  the distribution's name (`MIG-8`, [ADR-0011](docs/adr/0011-the-engine-and-the-distribution-are-separate-products.md)).
+  Full history moved — 1,020 commits, 24 branches, 206 tags, verified at parity. No product change.
+- The product name is read from one module (`frontend/src/lib/branding.ts`) rather than 28 literals
+  across ten files, so a distribution can re-theme from a single place.
+
+## [0.42.1] - 2026-08-31
+
+### Fixed
+
+- **In-UI update took the platform down instead of updating it.** The update container mounted
+  the repository at `/repo`, but `docker compose` inside it drives the *host's* daemon while
+  resolving the compose files' relative bind mounts against its own filesystem. The host had no
+  `/repo`, so Docker created every missing path as a directory — `config/registry-config.yml`,
+  `VERSION` and `traefik.yml` among them — and the registry died on "not a directory", taking
+  the API, workers and proxy with it. The repo is now bound at its host path, the only
+  arrangement where a relative mount means the same thing on both sides.
+
+### Added
+
+- **The update card reports whether an update is available**, with how far behind the host is
+  and the latest tag, via `GET /admin/infrastructure/update/check`.
+
+### Changed
+
+- A check that cannot reach the remote reports *that*, never "up to date" — the two must not
+  render alike, or the update goes quiet exactly when the credential or remote is broken. The
+  button disables only on a confirmed up-to-date and stays enabled when the check fails.
+- The update and the check share one container spec, so the mount path has a single definition.
+
+## [0.42.0] - 2026-08-30
+
+### Fixed
+
+- **Postgres, Redis and MinIO were published on `0.0.0.0`.** Now bound to loopback. Only 80 and
+  443 remain public.
+- **The frontend was an internet-facing Vite dev server** — a development tool that resolves and
+  transforms modules per request. Now a production build behind nginx (`docker-compose.serve.yml`,
+  on by default; `PG_SERVE_FRONTEND=0` opts out).
+- **`api.insecure` served the Traefik dashboard and full API unauthenticated on :8080.** That
+  listener no longer exists; the dashboard is a router on the internal entrypoint, loopback-published
+  on **8082**.
+- **The warm pool did not survive a Redis restart.** The ready set lives only in Redis, so
+  recreating that container orphaned healthy members — still running, still holding their memory,
+  never claimable. `reconcile_ready_set()` rebuilds it from container labels, refusing any member
+  that a range already holds.
+- Digest references were attempting a registry push that cannot succeed (`repo@sha256` is not a
+  repository), erroring on every pinned deploy before falling back to tar.
+
+### Added
+
+- **Platform update from the UI** (Admin → Infrastructure), admin-only, using a Fernet-encrypted
+  token the platform stores itself. See [ADR-0014](docs/adr/0014-the-platform-updates-itself-from-a-container-it-does-not-own.md).
+- Traefik access logging for 4xx/5xx, recording the client address. Nothing in the stack recorded
+  one before, so "who probed this host" could not be answered even after the fact.
+
+### Changed
+
+- `scripts/compose.sh` is the single definition of the compose overlay chain. `pg-update.sh` and
+  the in-UI update both call it; they each carried their own copy before, so a host could be
+  redeployed by either path and get a different stack.
+
+## [0.41.1] - 2026-08-29
+
+### Changed
+
+- No customer names in shipped code — placeholder and example values referring to a specific
+  customer replaced with generic ones. The platform is agnostic of who trains on it.
+
+## [0.41.0] - 2026-08-29
+
+### Added
+
+- **Windows golden images**: capture a running Windows VM and deploy from it, booting the
+  installed system rather than reinstalling. Stored sparsely — a 64 GiB disk occupies ~12 GiB.
+- VM memory is validated against its range's cap at edit time instead of failing at deploy.
+
+### Changed
+
+- Golden-image deploys went from ~199s to ~75s, and to ~15s when a warm pool member is claimed.
+  The pool now pre-pulls the exact runtime digests golden images pin, which is what makes the
+  warm path reachable for Windows at all.
+- QEMU headroom raised to 2 GiB after measurement: a 4 GiB guest settles at 4.91 GiB, so the
+  previous 1 GiB allowance left ~0.1 GiB of real margin and guests were being OOM-killed.
+- One definition of what a VM runs and clones (`image_resolution.py`) and of which image a VM came
+  from (`VM.effective_image`), replacing copies that had drifted apart.
+
+### Fixed
+
+- Runtime digests were recorded against this host's local mirror address, which means nothing on
+  another deployment. They are now stored registry-agnostically, with the mirror applied at pull.
+- A leftover scratch directory was mistaken for a learner's disk, skipping the clone and leaving
+  the VM to download Windows from Microsoft.
+- The console, cloning and several other paths only understood VMs created from a base image and
+  silently did nothing for golden images and snapshots.
+
+---
+
+> **Gap: 0.9.0 – 0.40.x are not recorded here.** Roughly two hundred tags were cut between
+> January and August 2026 without changelog entries. They are not reconstructed below rather than
+> being invented after the fact; `git log v0.8.1..v0.41.0` is the record. Entries resume at 0.41.0.
+
+## [0.8.1] - 2026-01-18
+
+### Added
+
+- **VyOS Router Template**: New seed template allowing engineers to deploy additional VyOS routers within ranges for internal network segmentation under the edge router.
+- **Edge Router Configuration in Range Wizard**: New configuration options for the edge router including:
+  - DHCP server toggle for non-isolated networks
+  - Custom DNS servers configuration
+  - DNS search domain setting
+- **Network OS Type**: Added `network` OS type for network device templates (VyOS, OPNsense, pfSense, etc.)
+
+### Fixed
+
+- **Training Scenarios Seeding**: Fixed scenario seeding that failed on first boot due to volume mount timing. Scenarios now seed correctly on container restart.
+
+## [0.8.0] - 2026-01-18
+
+### Added
+
+- **Training Scenarios** ([#25](../../issues/25)): Pre-built MSEL packages for deploying realistic cyber training exercises with one click.
+  - 4 ready-to-use scenarios: Ransomware Attack, APT Intrusion, Insider Threat, Incident Response Drill
+  - New Training Scenarios page at `/scenarios` showing scenario cards with filtering
+  - Role-based VM mapping: map scenario roles (e.g., "domain-controller") to actual range VMs
+  - "Add Scenario" button on Range Detail page for running ranges
+  - Scenario seeding from YAML files in `data/seed-scenarios/`
+  - New API endpoints: `GET /scenarios`, `GET /scenarios/{id}`, `POST /ranges/{id}/scenario`
+
+### Changed
+
+- **Naming Updates**: Improved naming consistency across the application
+  - Templates → VM Templates
+  - Blueprints → Range Blueprints
+  - Guided Builder → Range Wizard
+
+## [0.7.3] - 2026-01-18
+
+### Fixed
+
+- **Seed Templates Not Visible** - Fixed query in templates API that excluded seed templates from non-admin users. Seed templates (built-in PROVING GROUND templates) are now always visible to all users regardless of visibility tag settings.
+- **Seed Templates Not Mounted** - Added volume mount for `data/seed-templates` directory in docker-compose.yml so the API container can access seed template YAML files.
+- **Template Response Schema** - Allow null `created_by` in template response for seed templates. Added `is_seed` and `seed_id` fields to response schema.
+
+## [0.7.2] - 2026-01-18
+
+### Fixed
+
+- **API Startup Crash** - Fixed import error in template seeding that prevented API from starting (`SessionLocal` → `get_session_local()`)
+
+## [0.7.1] - 2026-01-17
+
+### Added
+
+- **Docker Image Build UI**: Build custom Docker images directly from the Image Cache page with real-time progress tracking.
+  - New "Build Images" tab in Image Cache
+  - Lists all available Dockerfiles from `images/` directory
+  - Background build with progress percentage, step tracking, and live logs
+  - Build persists across page navigation (polling-based like pull tracking)
+  - Cancel build functionality
+  - No-cache rebuild option for fresh builds
+  - New API endpoints: `/cache/images/buildable`, `/cache/images/build`, `/cache/images/build/{key}/status`
+
+## [0.7.0] - 2026-01-17
+
+### Added
+
+- **PROVING GROUND Kali Attack Box** ([#28](../../issues/28)): Custom Docker image with comprehensive offensive security toolkit.
+  - Based on `kasmweb/core-kali-rolling` with KasmVNC desktop access
+  - Includes: Metasploit, Impacket suite, BloodHound, CrackMapExec, Evil-WinRM
+  - Password tools: Hashcat, John, Hydra, Responder
+  - Tunneling: Chisel, Ligolo-ng, Proxychains
+  - Web testing: Feroxbuster, FFuf, SQLMap, Nikto
+  - Wordlists: Rockyou, SecLists
+  - PEAS scripts for privilege escalation
+  - Multi-architecture support (x86_64 and ARM64)
+
+- **Samba AD Domain Controller** ([#29](../../issues/29)): Docker image for Active Directory functionality on ARM64.
+  - Full AD DC using Samba with LDAP, Kerberos, DNS
+  - Works on Apple Silicon and other ARM64 hosts
+  - Environment variable configuration for realm, domain, admin password
+  - Optional test user creation
+
+- **Built-in Template Repository**: Pre-configured templates that ship with PROVING GROUND.
+  - Templates: Kali Attack Box, Samba DC, Windows Server 2022 DC, Ubuntu Desktop, Ubuntu Server
+  - Auto-seeded on application startup
+  - New `is_seed` and `seed_id` fields for template identification
+
+- **VM Snapshot UI** ([#28](../../issues/28)): Create snapshots directly from running VMs.
+  - New Camera icon button on VM action bar (visible when VM is running)
+  - CreateSnapshotModal component with name and description fields
+  - Auto-generated snapshot name with hostname and date
+  - Integrates with existing /snapshots API
+
+### Changed
+
+- Template model now supports nullable `created_by` for seed templates
+- Application startup seeds built-in templates if not already present
+
+## [0.6.3] - 2026-01-17
+
+### Added
+
+- **Lifecycle Timestamps & Activity History** ([#23](../../issues/23)): Track when ranges are deployed, started, and stopped with user attribution.
+  - Range model now includes `deployed_at`, `started_at`, `stopped_at` timestamps
+  - EventLog now includes `user_id` to track who triggered events
+  - Timestamps displayed in Range header with relative time (hover for exact)
+  - New Activity tab on RangeDetail showing event history grouped by day
+  - Events show username/email of who triggered them
+
+## [0.6.2] - 2026-01-17
+
+### Added
+
+- **Granular Deployment Status** ([#24](../../issues/24)): Per-resource deployment tracking showing individual status for every network and VM during deployment.
+  - New `/deployment-status` API endpoint returns structured status for each resource
+  - Refactored DeploymentProgress component with per-resource rows
+  - StatusIcon, ResourceRow, ResourceSection components for granular display
+  - Router, networks, and VMs shown individually with status icons and durations
+  - Added `network_id` field to EventLog for network-specific event tracking
+  - Progress bar with elapsed time and resource counts
+
+## [0.6.1] - 2026-01-17
+
+### Fixed
+
+- **Student Lab Panel Import** - Fixed react-resizable-panels v4.x API compatibility issue in StudentLab.tsx. Updated renamed exports (`PanelGroup` → `Group`, `PanelResizeHandle` → `Separator`) and props (`direction` → `orientation`).
+
+## [0.6.0] - 2026-01-17
+
+### Added
+
+- **Range Blueprints** ([#18](../../issues/18)): Save ranges as reusable blueprints and deploy multiple isolated instances with auto-allocated subnets.
+  - Save any range as a blueprint with "Save as Blueprint" button
+  - Deploy instances from blueprints with automatic subnet offset (10.100 → 10.101 → 10.102)
+  - Instance actions: reset (same version), redeploy (latest version), clone
+  - Blueprints page with card grid showing all blueprints
+  - Blueprint detail page with instances tab
+  - Instance info banner on RangeDetail for blueprint-deployed ranges
+  - New API endpoints: /blueprints, /instances
+  - RangeBlueprint and RangeInstance database models
+
+## [0.5.0] - 2026-01-17
+
+### Added
+
+- **Guided Range Builder Wizard** ([#19](../../issues/19)): New wizard-style interface for creating complete cyber training environments with minimal manual configuration.
+  - 4 scenario presets: AD Enterprise Lab, Segmented Network (DMZ), Incident Response Lab, Penetration Testing Target
+  - 5-step wizard flow: Scenario Selection → Zone Configuration → System Selection → Configuration Options → Review & Deploy
+  - Auto-assigned subnets and IP addresses for each zone and system
+  - AD configuration options: domain name, admin password, user count
+  - Vulnerability level selection (cosmetic in v1)
+  - Sequential deployment with progress indicator
+  - "Guided Builder" button on Ranges page header
+  - Empty state CTA prioritizes guided builder for first-time users
+  - Template name-to-ID mapping for flexible preset definitions
+
+## [0.4.11] - 2026-01-17
+
+### Added
+
+- **Student Lab Page with Walkthrough Panel** ([#8](../../issues/8)): New `/lab/:rangeId` page provides a student-focused experience with integrated step-by-step walkthrough alongside VNC consoles.
+  - WalkthroughPanel: Collapsible left panel with phase navigation, step checklist, and markdown content
+  - Progress tracking: Local storage + optional server sync with auto-save
+  - VM integration: "Open VM" button switches console to referenced VM
+  - Split-pane layout: Resizable panels with embedded VNC console
+  - Markdown rendering: Code blocks, blockquotes (tips/warnings), headers
+  - MSEL extension: Walkthrough content authored in YAML `walkthrough:` section
+  - New WalkthroughProgress model for server-side progress persistence
+  - "Open Lab" button on RangeDetail page for running ranges
+
+## [0.4.10] - 2026-01-17
+
+### Fixed
+
+- **Delete Confirmation UX** ([#20](../../issues/20)): Replaced browser native `window.confirm()` popups with styled confirmation dialogs. Fixed double-click issue and improved visual consistency across all delete operations.
+  - Created reusable ConfirmDialog component with danger/warning/info variants
+  - Updated Range, Network, VM, Template, and Image Cache delete confirmations
+  - Replaced `alert()` error messages with toast notifications
+
+## [0.4.9] - 2026-01-17
+
+### Added
+
+- **Diagnostics Dashboard** ([#4](../../issues/4)): New "Diagnostics" tab on RangeDetail page provides visibility into component health, error history, and container logs without requiring SSH or Docker CLI access.
+  - ComponentHealth: Collapsible status tree showing Range → Router → Networks → VMs with color-coded health indicators
+  - ErrorTimeline: Chronological display of error events (vm_error, deployment_failed, inject_failed) with filtering
+  - LogViewer: On-demand container log retrieval with refresh, copy-to-clipboard, and auto-scroll
+  - Error badge on tab shows count of components in error state
+  - `error_message` field added to VM and Range models to persist error details
+  - New `GET /api/v1/vms/{id}/logs` endpoint for fetching container logs
+
+## [0.4.8] - 2026-01-17
+
+### Fixed
+
+- **Traefik Network Connection** ([#17](../../issues/17)): Fixed bug where Traefik was only connected to isolated networks during deployment, causing VNC console access to fail for non-isolated networks. Traefik is now connected to all range networks regardless of isolation status.
+
+## [0.4.7] - 2026-01-17
+
+### Fixed
+
+- **Console Connection Feedback** ([#15](../../issues/15)): Console windows now provide clear feedback when connections fail or timeout instead of showing blank screens.
+  - VNC console shows 30-second timeout warning with troubleshooting options
+  - Terminal console shows connection status and helpful error messages
+  - Both consoles have a Help button with troubleshooting tips
+  - Loading states clearly indicate connection progress
+  - Error states provide actionable guidance (Retry, Keep Waiting, Close)
+
+## [0.4.6] - 2026-01-17
+
+### Added
+
+- **AI-Friendly API Documentation** ([#12](../../issues/12)): Enhanced OpenAPI documentation with comprehensive descriptions, organized tags, and a dedicated `/api/v1/schema/ai-context` endpoint that provides a condensed API guide for AI assistants. Enables AI tools to generate valid PROVING GROUND configurations without source code access.
+
+### Changed
+
+- OpenAPI description now includes concepts guide, quick start, and authentication info
+- API endpoints organized with descriptive tags in Swagger UI
+
+## [0.4.5] - 2026-01-17
+
+### Fixed
+
+- **Console Opens in New Window** ([#13](../../issues/13)): Console button on Range Detail page now opens console in a new browser window by default (Shift+click for inline modal). Previously only worked from Execution Console.
+- **Range Stop Cleans Up Router** ([#11](../../issues/11)): Stopping a range now properly stops the VyOS router container in addition to VMs. Starting a stopped range now starts the router before VMs.
+- **Escape Key Closes Console** ([#14](../../issues/14)): Pressing Escape now closes the inline console modal and returns to the range view.
+
+## [0.4.4] - 2026-01-16
+
+### Added
+
+- **Real-Time UI Updates via WebSocket** ([#5](../../issues/5)): Live status updates without page refresh. When deploying a range, starting VMs, or performing any operation, users now see status updates in real-time as they happen.
+  - WebSocket event streaming with Redis pub/sub for scalable broadcasting
+  - Selective subscription to specific ranges for efficient bandwidth usage
+  - Toast notifications for significant events (deployment complete, VM errors)
+  - Pulse animations on status badges when VM states change
+  - Connection status indicator showing live update availability
+  - `useRealtimeRange` React hook for easy integration
+
+### Changed
+
+- WebSocket endpoints enhanced with Redis pub/sub infrastructure
+- EventService now broadcasts events to connected clients in real-time
+- Added connection manager for WebSocket lifecycle and subscriptions
+
+## [0.4.3] - 2026-01-16
+
+### Added
+
+- **Verbose Deployment Progress** ([#6](../../issues/6)): Real-time deployment status with visual stepper and expandable log panel. Shows step-by-step progress through router creation, network provisioning, and VM startup. Includes detailed event logging with timestamps and color-coded status indicators.
+
+### Changed
+
+- Added 9 new deployment event types for granular progress tracking
+- Events API now supports filtering by event_types parameter
+- Event log component updated with icons for all deployment events
+
+## [0.4.2] - 2026-01-16
+
+### Added
+
+- **Multi-Architecture Support**: Native support for both x86_64 and ARM64 host systems with automatic architecture detection and emulation warnings for cross-architecture VMs
+
+## [0.4.1] - 2026-01-16
+
+### Added
+
+- **Version Display in UI** ([#7](../../issues/7)): Application version is now displayed in the sidebar footer, showing version number and git commit hash when available. Added `/api/v1/version` endpoint returning version, commit, build date, and API version.
+
+- **Console Pop-out as Default** ([#9](../../issues/9)): Clicking the console button on a running VM now opens the console in a dedicated browser window by default, providing a better multi-tasking experience. Use Shift+click to open inline (legacy behavior). Added standalone `/console/:vmId` route for pop-out windows with automatic console type detection (terminal vs VNC).
+
+### Changed
+
+- Console button icon changed from Terminal to ExternalLink to indicate pop-out behavior
+- FastAPI app version now dynamically reads from config instead of hardcoded value
+
+## [0.4.0] - 2026-01-15
+
+### Added
+
+- Execution Console with multi-panel dashboard
+- MSEL (Master Scenario Events List) parser with Markdown/YAML support
+- Manual inject execution from console
+- Connection tracking for monitoring student activity
+- Real-time event logging via WebSocket streaming
+- Network interface management (add/remove NICs on running VMs)
+
+## [0.3.0] - 2026-01-XX
+
+### Added
+
+- Range templating with import/export/clone
+- Comprehensive range export with Docker images for offline deployment
+- Range import with conflict detection and template resolution
+- Artifact repository backed by MinIO with SHA256 verification
+- Snapshot management and golden images for Windows VMs
+
+## [0.2.0] - 2026-01-XX
+
+### Added
+
+- Multi-network support with custom subnets
+- Visual range builder interface
+- Range deployment orchestration
+- VNC console access through Traefik proxy
+- Dynamic network attachment for multi-homed VMs
+
+## [0.1.0] - 2026-01-XX
+
+### Added
+
+- Initial release
+- JWT authentication with user registration
+- RBAC with 4 roles (Admin, Range Engineer, White Cell, Evaluator)
+- ABAC with resource tags for fine-grained visibility
+- VM template CRUD with 27+ OS templates
+- Range CRUD with full lifecycle management
+- Basic network management

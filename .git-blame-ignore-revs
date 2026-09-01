@@ -1,0 +1,9 @@
+# Commits that are pure reformatting. `git blame` should skip them.
+#
+# Enable locally (it is not automatic):
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Most forges honour this file automatically in their blame views.
+
+# style: format the backend with black (2026-08-27)
+3bfcb094def5df5d65f659cef1e0377e35570b35

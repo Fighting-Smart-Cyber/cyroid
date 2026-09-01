@@ -1,0 +1,77 @@
+# Traefik Static Configuration
+# See: https://doc.traefik.io/traefik/reference/static-configuration/file/
+
+api:
+  # insecure: true opens a second, separate HTTP listener on :8080 that serves
+  # the dashboard and the full Traefik API with no authentication and no
+  # routers in front of it. Binding 8080 to 127.0.0.1 hid it, but the listener
+  # was still there, and hiding is not the same as not having it: one careless
+  # `-p 8080:8080` and the router table, service health and TLS config are
+  # public.
+  #
+  # With this false, no such listener exists. The dashboard is reached the same
+  # way everything else is -- through an entrypoint and a router, defined in
+  # traefik/dynamic/base.yml on the internal `traefik` entrypoint. Read it
+  # through a tunnel:
+  #   ssh -L 8082:127.0.0.1:8082 pg-ec2   then http://127.0.0.1:8082/dashboard/
+  insecure: false
+  dashboard: true
+
+# Who is calling. Without this there is no record of a client address anywhere
+# in the stack: 27 path-traversal probes (/etc/passwd, /proc/self/environ) were
+# refused by Vite's allow list and left no trace of where they came from, so
+# the question could not be answered even after the fact.
+#
+# ClientHost is the field that answers it. Traefik trusts X-Forwarded-For from
+# any peer by default, so treat ClientHost as authoritative only while nothing
+# untrusted sits in front of this host.
+accessLog:
+  filePath: /var/log/traefik/access.log
+  format: json
+  bufferingSize: 100
+  filters:
+    # 2xx and 3xx are the product working; keeping only the rest makes the
+    # scanning legible rather than buried in normal traffic.
+    statusCodes:
+      - "400-499"
+      - "500-599"
+    retryAttempts: true
+    minDuration: "10s"
+  fields:
+    defaultMode: keep
+    headers:
+      defaultMode: drop
+      names:
+        # Deliberately no Authorization or Cookie: an access log that records
+        # credentials becomes a credential store.
+        User-Agent: keep
+        X-Forwarded-For: keep
+        X-Real-Ip: keep
+
+# Health check ping endpoint
+ping:
+  entryPoint: traefik
+
+entryPoints:
+  # Internal entrypoint for health checks
+  traefik:
+    address: ":8082"
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  # Docker provider for container labels
+  docker:
+    exposedByDefault: false
+
+  # File provider watching directory for dynamic config
+  # Contains: base.yml (TLS, serversTransport) + vnc-*.yml (VNC routes)
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+# Logging (uncomment for debugging)
+# log:
+#   level: DEBUG

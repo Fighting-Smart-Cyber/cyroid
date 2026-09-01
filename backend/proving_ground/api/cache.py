@@ -1,0 +1,4415 @@
+# backend/proving_ground/api/cache.py
+"""API endpoints for image caching and golden image management."""
+import os
+import logging
+from typing import List, Optional, Dict, Any
+
+from fastapi import APIRouter, HTTPException, status, BackgroundTasks, Query, UploadFile, File, Form
+from pydantic import BaseModel
+
+from uuid import UUID
+
+from proving_ground.api.deps import CurrentUser, AdminUser, DBSession, require_role
+from proving_ground.services.docker_service import get_docker_service
+from proving_ground.services.registry_service import get_registry_service, RegistryPushError
+from proving_ground.config import get_settings
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/cache", tags=["Image Cache"])
+
+# Track active Docker image pulls for progress reporting
+_active_docker_pulls: Dict[str, Dict[str, Any]] = {}
+
+# Track active Docker image builds for progress reporting
+_active_docker_builds: Dict[str, Dict[str, Any]] = {}
+
+# Supported compressed archive extensions for ISO downloads/uploads
+SUPPORTED_ARCHIVE_EXTENSIONS = (
+    ".zip",
+    ".7z",
+    ".rar",  # Common archives
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",  # Tar variants
+    ".gz",
+    ".gzip",
+    ".bz2",
+    ".xz",
+    ".lzma",  # Single-file compression
+)
+
+
+def is_archive_file(path_or_url: str) -> bool:
+    """Check if a file path or URL points to a compressed archive."""
+    lower = path_or_url.lower()
+    # Handle query strings in URLs
+    if "?" in lower:
+        lower = lower.split("?")[0]
+    return any(lower.endswith(ext) for ext in SUPPORTED_ARCHIVE_EXTENSIONS)
+
+
+def get_archive_extension(path_or_url: str) -> Optional[str]:
+    """Get the archive extension from a file path or URL."""
+    lower = path_or_url.lower()
+    if "?" in lower:
+        lower = lower.split("?")[0]
+    # Check for compound extensions first (.tar.gz, .tar.bz2, etc.)
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz"):
+        if lower.endswith(ext):
+            return ext
+    # Then check single extensions
+    for ext in SUPPORTED_ARCHIVE_EXTENSIONS:
+        if lower.endswith(ext):
+            return ext
+    return None
+
+
+def extract_iso_from_archive(archive_path: str, dest_dir: str) -> str:
+    """
+    Extract an archive and find the ISO file inside.
+    Uses 7z which supports most archive formats.
+
+    Args:
+        archive_path: Path to the archive file
+        dest_dir: Directory to extract to
+
+    Returns:
+        Path to the extracted ISO file
+
+    Raises:
+        ValueError: If no ISO found or multiple ISOs found
+        RuntimeError: If extraction fails
+    """
+    import subprocess
+    import shutil
+    import tempfile
+
+    # Create a temporary extraction directory
+    extract_dir = tempfile.mkdtemp(prefix="iso_extract_", dir=dest_dir)
+
+    try:
+        # Use 7z for extraction - it handles most formats
+        # -y: assume Yes on all queries
+        # -o: output directory
+        result = subprocess.run(
+            ["7z", "x", "-y", f"-o{extract_dir}", archive_path],
+            capture_output=True,
+            text=True,
+            timeout=3600,  # 1 hour timeout for large archives
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to extract archive: {result.stderr}")
+
+        # Find all ISO files in the extracted content (recursive)
+        iso_files = []
+        for root, _dirs, files in os.walk(extract_dir):
+            for f in files:
+                if f.lower().endswith(".iso"):
+                    iso_files.append(os.path.join(root, f))
+
+        if not iso_files:
+            raise ValueError("No ISO file found in archive")
+
+        if len(iso_files) > 1:
+            # If multiple ISOs, prefer the largest one (likely the main ISO)
+            iso_files.sort(key=lambda x: os.path.getsize(x), reverse=True)
+            logger.warning(f"Multiple ISO files found in archive, using largest: {iso_files[0]}")
+
+        return iso_files[0]
+
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Archive extraction timed out") from exc
+    except Exception:
+        # Clean up on failure
+        if os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        raise
+
+
+def get_windows_iso_dir() -> str:
+    """Get the Windows ISO cache directory path."""
+    settings = get_settings()
+    return os.path.join(settings.iso_cache_dir, "windows-isos")
+
+
+# Request/Response schemas
+class CacheImageRequest(BaseModel):
+    image: str  # Docker image name (e.g., "ubuntu:22.04")
+
+
+class CachedImageResponse(BaseModel):
+    id: str
+    tags: List[str]
+    size_bytes: int
+    size_gb: float
+    created: Optional[str] = None
+
+
+class CacheStatusResponse(BaseModel):
+    cache_dir: str
+    total_count: int
+
+
+class ISOCacheResponse(CacheStatusResponse):
+    isos: List[dict]
+
+
+class GoldenImageResponse(BaseModel):
+    template_dir: str
+    total_count: int
+    golden_images: List[dict]
+
+
+class CreateGoldenImageRequest(BaseModel):
+    container_id: str
+    name: str
+
+
+class CaptureGoldenImageRequest(BaseModel):
+    """Capture a golden image from a VM inside a range's DinD daemon."""
+
+    vm_id: UUID
+    name: str
+    description: Optional[str] = None
+    os_type: Optional[str] = "windows"
+
+
+class CacheProgressResponse(BaseModel):
+    status: str
+    message: str
+
+
+# Linux image caching endpoints
+
+
+@router.get("/images", response_model=List[CachedImageResponse])
+def list_cached_images(current_user: CurrentUser):
+    """List all cached Docker images."""
+    docker = get_docker_service()
+    images = docker.list_cached_images()
+    return [
+        CachedImageResponse(
+            id=img["id"],
+            tags=img["tags"],
+            size_bytes=img["size_bytes"],
+            size_gb=round(img["size_bytes"] / (1024**3), 2),
+            created=img.get("created"),
+        )
+        for img in images
+    ]
+
+
+@router.post("/images", response_model=CachedImageResponse, status_code=status.HTTP_201_CREATED)
+def cache_image(request: CacheImageRequest, current_user: AdminUser):
+    """
+    Pre-pull and cache a Docker image.
+    Admin only as this downloads potentially large images.
+    """
+    docker = get_docker_service()
+    try:
+        result = docker.cache_linux_image(request.image)
+        return CachedImageResponse(
+            id=result["id"],
+            tags=result["tags"],
+            size_bytes=result["size_bytes"],
+            size_gb=round(result["size_bytes"] / (1024**3), 2),
+            created=result.get("created"),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to cache image: {str(e)}",
+        ) from e
+
+
+@router.post("/images/batch", response_model=CacheProgressResponse)
+def cache_images_batch(
+    images: List[str], background_tasks: BackgroundTasks, current_user: AdminUser
+):
+    """
+    Start batch caching of multiple Docker images in the background.
+    Admin only.
+    """
+
+    def cache_all_images(image_list: List[str]):
+        docker = get_docker_service()
+        for img in image_list:
+            try:
+                docker.cache_linux_image(img)
+            except Exception:
+                # Log but continue with other images
+                pass
+
+    background_tasks.add_task(cache_all_images, images)
+    return CacheProgressResponse(
+        status="started", message=f"Caching {len(images)} images in background"
+    )
+
+
+@router.delete("/images/{image_id}")
+def remove_cached_image(image_id: str, current_user: AdminUser):
+    """Remove a cached Docker image. Admin only."""
+    docker = get_docker_service()
+    try:
+        docker.client.images.remove(image_id, force=True)
+        return {"status": "removed", "image_id": image_id}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to remove image: {str(e)}",
+        ) from e
+
+
+# Async Docker image pull with progress tracking
+
+
+class DockerPullRequest(BaseModel):
+    image: str
+
+
+def _create_base_image_for_build(full_tag: str, image_id: str, image_project_name: str):
+    """
+    Create or update a BaseImage record after a successful Docker build.
+
+    Args:
+        full_tag: The full Docker image tag (e.g., proving_ground/kali-attack:latest)
+        image_id: The Docker image ID (sha256 hash)
+        image_project_name: The Dockerfile project directory name (e.g., kali-attack)
+    """
+    try:
+        from proving_ground.database import get_session_local
+        from proving_ground.models.base_image import BaseImage
+
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            # Check if BaseImage already exists for this tag
+            existing = db.query(BaseImage).filter(BaseImage.docker_image_tag == full_tag).first()
+
+            if existing:
+                # Update existing record with new image ID and project name
+                existing.docker_image_id = image_id
+                existing.image_project_name = image_project_name
+                db.commit()
+                logger.info(
+                    f"Updated BaseImage record for {full_tag} with project_name={image_project_name}"
+                )
+            else:
+                # Create new BaseImage record
+                # Parse image name from tag for display
+                display_name = full_tag.split("/")[-1].split(":")[0]
+                base_image = BaseImage(
+                    name=display_name,
+                    description=f"Container image built from Dockerfile: {image_project_name}",
+                    image_type="container",
+                    docker_image_id=image_id,
+                    docker_image_tag=full_tag,
+                    image_project_name=image_project_name,
+                    os_type="linux",  # Default, can be updated later
+                    vm_type="container",
+                    is_global=True,
+                )
+                db.add(base_image)
+                db.commit()
+                logger.info(
+                    f"Created BaseImage record for {full_tag} with project_name={image_project_name}"
+                )
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"Failed to create/update BaseImage record for {full_tag}: {e}")
+
+
+def _pull_docker_image_async(image: str):
+    """Background task to pull Docker image with progress tracking."""
+
+    # Normalize image name for storage key
+    image_key = image.replace("/", "_").replace(":", "_")
+
+    _active_docker_pulls[image_key] = {
+        "status": "pulling",
+        "image": image,
+        "progress_percent": 0,
+        "current_layer": "",
+        "layers_total": 0,
+        "layers_completed": 0,
+        "cancelled": False,
+        "error": None,
+    }
+
+    try:
+        docker_service = get_docker_service()
+        client = docker_service.client
+
+        # Use low-level API to get streaming progress
+        api_client = client.api
+
+        # Track layer progress
+        layers = {}
+
+        for line in api_client.pull(image, stream=True, decode=True):
+            # Check for cancellation
+            if _active_docker_pulls.get(image_key, {}).get("cancelled"):
+                _active_docker_pulls[image_key]["status"] = "cancelled"
+                return
+
+            if "id" in line and "progressDetail" in line:
+                layer_id = line["id"]
+                progress_detail = line.get("progressDetail", {})
+                status_text = line.get("status", "")
+
+                if progress_detail:
+                    current = progress_detail.get("current", 0)
+                    total = progress_detail.get("total", 0)
+                    layers[layer_id] = {"current": current, "total": total, "status": status_text}
+                elif status_text in ["Pull complete", "Already exists"]:
+                    layers[layer_id] = {"current": 1, "total": 1, "status": status_text}
+
+                # Calculate overall progress
+                total_bytes = sum(l.get("total", 0) for l in layers.values())
+                current_bytes = sum(l.get("current", 0) for l in layers.values())
+                completed_layers = sum(
+                    1
+                    for l in layers.values()
+                    if l.get("status") in ["Pull complete", "Already exists"]
+                )
+
+                if total_bytes > 0:
+                    progress = int((current_bytes / total_bytes) * 100)
+                else:
+                    progress = 0
+
+                _active_docker_pulls[image_key].update(
+                    {
+                        "progress_percent": min(
+                            progress, 99
+                        ),  # Don't show 100 until verified complete
+                        "current_layer": layer_id,
+                        "layers_total": len(layers),
+                        "layers_completed": completed_layers,
+                    }
+                )
+            elif "status" in line:
+                # Handle status messages without layer ID
+                logger.debug(f"Docker pull status: {line.get('status')}")
+
+        # Verify image was pulled
+        try:
+            pulled_image = client.images.get(image)
+            image_id = pulled_image.id
+            size_bytes = pulled_image.attrs.get("Size", 0)
+            _active_docker_pulls[image_key].update(
+                {
+                    "status": "completed",
+                    "progress_percent": 100,
+                    "image_id": image_id,
+                    "size_bytes": size_bytes,
+                }
+            )
+
+            # Auto-create BaseImage record for the Image Library
+            try:
+                from proving_ground.database import get_session_local
+                from proving_ground.models.base_image import BaseImage
+
+                SessionLocal = get_session_local()
+                db = SessionLocal()
+                try:
+                    # Check if BaseImage already exists for this image
+                    existing = (
+                        db.query(BaseImage).filter(BaseImage.docker_image_tag == image).first()
+                    )
+
+                    if not existing:
+                        # Create new BaseImage record
+                        # Parse image name for metadata
+                        image_name = image.split("/")[-1].split(":")[0]
+                        base_image = BaseImage(
+                            name=image_name,
+                            description=f"Container image pulled from registry: {image}",
+                            image_type="container",
+                            docker_image_id=image_id,
+                            docker_image_tag=image,
+                            os_type="linux",  # Default, can be updated later
+                            vm_type="container",
+                            size_bytes=size_bytes,
+                            is_global=True,
+                        )
+                        db.add(base_image)
+                        db.commit()
+                        logger.info(f"Created BaseImage record for {image}")
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.warning(f"Failed to create BaseImage record for {image}: {e}")
+
+            # Auto-push to local registry and cleanup host Docker
+            try:
+                import asyncio
+
+                registry = get_registry_service()
+
+                # Create event loop for async calls in this thread
+                loop = asyncio.new_event_loop()
+                try:
+                    # Check if registry is healthy
+                    is_healthy = loop.run_until_complete(registry.is_healthy())
+                    if not is_healthy:
+                        logger.warning(f"Registry not healthy, skipping push for {image}")
+                        _active_docker_pulls[image_key].update(
+                            {
+                                "pushed_to_registry": False,
+                                "registry_error": "Registry not healthy",
+                            }
+                        )
+                    else:
+                        # Update status to pushing
+                        _active_docker_pulls[image_key].update(
+                            {
+                                "status": "pushing_to_registry",
+                            }
+                        )
+
+                        # Push to registry and cleanup host
+                        loop.run_until_complete(registry.push_and_cleanup(image))
+
+                        _active_docker_pulls[image_key].update(
+                            {
+                                "status": "completed",
+                                "pushed_to_registry": True,
+                            }
+                        )
+                        logger.info(f"Pushed {image} to registry and cleaned up host")
+                finally:
+                    loop.close()
+
+            except RegistryPushError as e:
+                logger.error(f"Failed to push {image} to registry: {e}")
+                _active_docker_pulls[image_key].update(
+                    {
+                        "status": "failed",
+                        "pushed_to_registry": False,
+                        "registry_error": str(e),
+                        "error": f"Registry push failed: {e}",
+                    }
+                )
+                return
+            except Exception as e:
+                logger.error(f"Unexpected error pushing {image} to registry: {e}")
+                _active_docker_pulls[image_key].update(
+                    {
+                        "status": "failed",
+                        "pushed_to_registry": False,
+                        "registry_error": str(e),
+                        "error": f"Registry push failed: {e}",
+                    }
+                )
+                return
+
+        except Exception:
+            _active_docker_pulls[image_key].update(
+                {
+                    "status": "completed",
+                    "progress_percent": 100,
+                }
+            )
+
+    except Exception as e:
+        logger.error(f"Failed to pull Docker image {image}: {e}")
+        _active_docker_pulls[image_key].update(
+            {
+                "status": "failed",
+                "error": str(e),
+            }
+        )
+
+
+@router.post("/images/pull")
+def start_docker_pull(
+    request: DockerPullRequest, background_tasks: BackgroundTasks, current_user: AdminUser
+):
+    """
+    Start an async Docker image pull with progress tracking.
+    Returns immediately and allows polling for status.
+    """
+    image = request.image
+    image_key = image.replace("/", "_").replace(":", "_")
+
+    # Check if already pulling
+    if (
+        image_key in _active_docker_pulls
+        and _active_docker_pulls[image_key].get("status") == "pulling"
+    ):
+        return {
+            "status": "already_pulling",
+            "image": image,
+            "message": "Image is already being pulled",
+        }
+
+    # Check if image already cached
+    docker = get_docker_service()
+    try:
+        existing = docker.client.images.get(image)
+        return {
+            "status": "already_cached",
+            "image": image,
+            "message": "Image is already cached",
+            "image_id": existing.id,
+        }
+    except Exception:
+        pass  # Image not cached, proceed with pull
+
+    # Start background pull
+    background_tasks.add_task(_pull_docker_image_async, image)
+
+    return {
+        "status": "pulling",
+        "image": image,
+        "message": f"Started pulling {image}",
+    }
+
+
+@router.get("/images/pull/{image_key}/status")
+def get_docker_pull_status(image_key: str, current_user: CurrentUser):
+    """Get status of a Docker image pull in progress."""
+    # Check active pulls first
+    if image_key in _active_docker_pulls:
+        pull_info = _active_docker_pulls[image_key]
+        return {
+            "status": pull_info.get("status", "unknown"),
+            "image": pull_info.get("image"),
+            "progress_percent": pull_info.get("progress_percent", 0),
+            "layers_total": pull_info.get("layers_total", 0),
+            "layers_completed": pull_info.get("layers_completed", 0),
+            "error": pull_info.get("error"),
+            "image_id": pull_info.get("image_id"),
+            "size_bytes": pull_info.get("size_bytes"),
+            "pushed_to_registry": pull_info.get("pushed_to_registry"),
+            "registry_error": pull_info.get("registry_error"),
+        }
+
+    # Not in active pulls - check if image exists (completed before tracking started)
+    docker = get_docker_service()
+    try:
+        # Convert key back to image name
+        image_name = image_key.replace("_", "/", 1)  # First underscore is /
+        if "_" in image_name:
+            # Handle tag
+            parts = image_name.rsplit("_", 1)
+            image_name = parts[0] + ":" + parts[1]
+
+        existing = docker.client.images.get(image_name)
+        return {
+            "status": "completed",
+            "image": image_name,
+            "progress_percent": 100,
+            "image_id": existing.id,
+        }
+    except Exception:
+        pass
+
+    return {
+        "status": "not_found",
+        "message": f"No pull found for {image_key}",
+    }
+
+
+@router.post("/images/pull/{image_key}/cancel")
+def cancel_docker_pull(image_key: str, current_user: AdminUser):
+    """Cancel an active Docker image pull."""
+    if image_key not in _active_docker_pulls:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"No active pull found for {image_key}"
+        )
+
+    if _active_docker_pulls[image_key].get("status") != "pulling":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Pull is not in progress"
+        )
+
+    _active_docker_pulls[image_key]["cancelled"] = True
+    return {
+        "status": "cancelling",
+        "image_key": image_key,
+        "message": "Cancellation requested",
+    }
+
+
+@router.get("/images/pulls/active")
+def get_active_docker_pulls(current_user: CurrentUser):
+    """Get all active Docker image pulls."""
+    return {
+        "pulls": [
+            {
+                "image_key": key,
+                "image": info.get("image"),
+                "status": info.get("status"),
+                "progress_percent": info.get("progress_percent", 0),
+                "layers_total": info.get("layers_total", 0),
+                "layers_completed": info.get("layers_completed", 0),
+            }
+            for key, info in _active_docker_pulls.items()
+            if info.get("status") == "pulling"
+        ]
+    }
+
+
+# ============ Docker Image Build Endpoints ============
+
+
+# Path to the images directory containing Dockerfiles
+# In Docker: /data/images, locally: ./data/images or ./images
+def _get_images_dir() -> str:
+    if os.path.exists("/data/images"):
+        return "/data/images"
+    elif os.path.exists("data/images"):
+        return os.path.abspath("data/images")
+    else:
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "images"
+        )
+
+
+IMAGES_DIR = _get_images_dir()
+
+
+class DockerBuildRequest(BaseModel):
+    """Request to build a Docker image."""
+
+    image_name: str  # Directory name in images/ (e.g., "kali-attack", "samba-dc")
+    tag: str = "latest"  # Tag for the built image
+    no_cache: bool = False  # Whether to build without cache
+
+
+class BuildableImage(BaseModel):
+    """Information about a buildable image."""
+
+    name: str
+    path: str
+    has_dockerfile: bool
+    has_readme: bool
+    description: Optional[str] = None
+
+
+def _get_image_description(image_path: str) -> Optional[str]:
+    """Extract description from README.md if available."""
+    readme_path = os.path.join(image_path, "README.md")
+    if os.path.exists(readme_path):
+        try:
+            with open(readme_path, "r") as f:
+                # Read first few lines to extract description
+                lines = f.readlines()[:10]
+                for _i, line in enumerate(lines):
+                    # Skip title line
+                    if line.startswith("# "):
+                        continue
+                    # Return first non-empty, non-header line
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        return line[:200]  # Limit description length
+        except Exception:
+            pass
+    return None
+
+
+@router.get("/images/buildable")
+def list_buildable_images(current_user: CurrentUser):
+    """
+    List available images that can be built from the images/ directory.
+    Each image directory should contain a Dockerfile.
+    """
+    buildable = []
+
+    if not os.path.exists(IMAGES_DIR):
+        return {"images": [], "images_dir": IMAGES_DIR, "exists": False}
+
+    for name in sorted(os.listdir(IMAGES_DIR)):
+        image_path = os.path.join(IMAGES_DIR, name)
+        if not os.path.isdir(image_path):
+            continue
+
+        dockerfile_path = os.path.join(image_path, "Dockerfile")
+        readme_path = os.path.join(image_path, "README.md")
+
+        has_dockerfile = os.path.exists(dockerfile_path)
+        has_readme = os.path.exists(readme_path)
+
+        if has_dockerfile:
+            buildable.append(
+                BuildableImage(
+                    name=name,
+                    path=image_path,
+                    has_dockerfile=has_dockerfile,
+                    has_readme=has_readme,
+                    description=_get_image_description(image_path),
+                )
+            )
+
+    return {
+        "images": buildable,
+        "images_dir": IMAGES_DIR,
+        "exists": True,
+    }
+
+
+def _build_docker_image_async(image_name: str, tag: str, no_cache: bool):
+    """Background task to build a Docker image with progress tracking."""
+    build_key = f"{image_name}_{tag}"
+    image_path = os.path.join(IMAGES_DIR, image_name)
+    full_tag = f"{get_settings().image_namespace}/{image_name}:{tag}"
+
+    _active_docker_builds[build_key] = {
+        "status": "building",
+        "image_name": image_name,
+        "tag": tag,
+        "full_tag": full_tag,
+        "progress_percent": 0,
+        "current_step": 0,
+        "total_steps": 0,
+        "current_step_name": "Starting build...",
+        "logs": [],
+        "cancelled": False,
+    }
+
+    try:
+        docker = get_docker_service()
+        client = docker.client
+
+        # Build the image with streaming output
+        logger.info(f"Building Docker image {full_tag} from {image_path}")
+
+        # Use low-level API to get streaming output
+        build_output = client.api.build(
+            path=image_path,
+            tag=full_tag,
+            rm=True,  # Remove intermediate containers
+            nocache=no_cache,
+            decode=True,  # Decode JSON responses
+        )
+
+        step_pattern = r"Step (\d+)/(\d+)"
+        import re
+
+        for chunk in build_output:
+            # Check for cancellation
+            if _active_docker_builds[build_key].get("cancelled"):
+                _active_docker_builds[build_key].update(
+                    {
+                        "status": "cancelled",
+                        "current_step_name": "Build cancelled by user",
+                    }
+                )
+                return
+
+            if "stream" in chunk:
+                stream_line = chunk["stream"].strip()
+                if stream_line:
+                    # Add to logs (keep last 100 lines)
+                    logs = _active_docker_builds[build_key].get("logs", [])
+                    logs.append(stream_line)
+                    if len(logs) > 100:
+                        logs = logs[-100:]
+                    _active_docker_builds[build_key]["logs"] = logs
+
+                    # Parse step progress
+                    match = re.match(step_pattern, stream_line)
+                    if match:
+                        current_step = int(match.group(1))
+                        total_steps = int(match.group(2))
+                        progress = int((current_step / total_steps) * 100)
+
+                        _active_docker_builds[build_key].update(
+                            {
+                                "current_step": current_step,
+                                "total_steps": total_steps,
+                                "progress_percent": min(progress, 99),
+                                "current_step_name": stream_line,
+                            }
+                        )
+
+            elif "error" in chunk:
+                error_msg = chunk.get("error", "Unknown build error")
+                _active_docker_builds[build_key].update(
+                    {
+                        "status": "failed",
+                        "error": error_msg,
+                        "current_step_name": f"Error: {error_msg}",
+                    }
+                )
+                logger.error(f"Docker build failed: {error_msg}")
+                return
+
+            elif "message" in chunk:
+                # Docker returns parse errors and other messages in 'message' key
+                msg = chunk.get("message", "")
+                if "error" in msg.lower() or "unknown instruction" in msg.lower():
+                    _active_docker_builds[build_key].update(
+                        {
+                            "status": "failed",
+                            "error": msg,
+                            "current_step_name": f"Error: {msg}",
+                        }
+                    )
+                    logger.error(f"Docker build failed: {msg}")
+                    return
+                else:
+                    # Log non-error messages
+                    logs = _active_docker_builds[build_key].get("logs", [])
+                    logs.append(msg)
+                    _active_docker_builds[build_key]["logs"] = logs[-100:]
+
+            elif "aux" in chunk:
+                # Build complete - aux contains the image ID
+                image_id = chunk.get("aux", {}).get("ID", "")
+                _active_docker_builds[build_key].update(
+                    {
+                        "status": "completed",
+                        "progress_percent": 100,
+                        "image_id": image_id,
+                        "current_step_name": "Build complete!",
+                    }
+                )
+                logger.info(f"Docker build completed: {full_tag} ({image_id})")
+
+                # Create/update BaseImage record with image_project_name
+                _create_base_image_for_build(full_tag, image_id, image_name)
+
+                # Auto-push to local registry and cleanup host Docker
+                try:
+                    import asyncio
+
+                    registry = get_registry_service()
+
+                    # Create event loop for async calls in this thread
+                    loop = asyncio.new_event_loop()
+                    try:
+                        # Check if registry is healthy
+                        is_healthy = loop.run_until_complete(registry.is_healthy())
+                        if not is_healthy:
+                            logger.warning(f"Registry not healthy, skipping push for {full_tag}")
+                            _active_docker_builds[build_key].update(
+                                {
+                                    "status": "failed",
+                                    "pushed_to_registry": False,
+                                    "error": "Registry not healthy - image built but not pushed",
+                                    "current_step_name": "Error: Registry not healthy",
+                                }
+                            )
+                            return
+
+                        # Update status to pushing
+                        _active_docker_builds[build_key].update(
+                            {
+                                "current_step_name": "Pushing to registry...",
+                            }
+                        )
+
+                        # Push to registry and cleanup host
+                        loop.run_until_complete(registry.push_and_cleanup(full_tag))
+
+                        _active_docker_builds[build_key].update(
+                            {
+                                "pushed_to_registry": True,
+                                "current_step_name": "Build complete and pushed to registry!",
+                            }
+                        )
+                        logger.info(f"Pushed {full_tag} to registry and cleaned up host")
+                    finally:
+                        loop.close()
+
+                except RegistryPushError as e:
+                    logger.error(f"Failed to push {full_tag} to registry: {e}")
+                    _active_docker_builds[build_key].update(
+                        {
+                            "status": "failed",
+                            "pushed_to_registry": False,
+                            "error": f"Registry push failed: {e}",
+                            "current_step_name": f"Error: Registry push failed - {e}",
+                        }
+                    )
+                    return
+                except Exception as e:
+                    logger.error(f"Unexpected error pushing {full_tag} to registry: {e}")
+                    _active_docker_builds[build_key].update(
+                        {
+                            "status": "failed",
+                            "pushed_to_registry": False,
+                            "error": f"Registry push failed: {e}",
+                            "current_step_name": f"Error: Registry push failed - {e}",
+                        }
+                    )
+                    return
+
+                return
+
+        # If we get here without aux, check if image exists
+        try:
+            built_image = client.images.get(full_tag)
+            _active_docker_builds[build_key].update(
+                {
+                    "status": "completed",
+                    "progress_percent": 100,
+                    "image_id": built_image.id,
+                    "current_step_name": "Build complete!",
+                }
+            )
+            # Create/update BaseImage record with image_project_name
+            _create_base_image_for_build(full_tag, built_image.id, image_name)
+
+            # Auto-push to local registry and cleanup host Docker
+            try:
+                import asyncio
+
+                registry = get_registry_service()
+
+                # Create event loop for async calls in this thread
+                loop = asyncio.new_event_loop()
+                try:
+                    # Check if registry is healthy
+                    is_healthy = loop.run_until_complete(registry.is_healthy())
+                    if not is_healthy:
+                        logger.warning(f"Registry not healthy, skipping push for {full_tag}")
+                        _active_docker_builds[build_key].update(
+                            {
+                                "status": "failed",
+                                "pushed_to_registry": False,
+                                "error": "Registry not healthy - image built but not pushed",
+                                "current_step_name": "Error: Registry not healthy",
+                            }
+                        )
+                        return
+
+                    # Update status to pushing
+                    _active_docker_builds[build_key].update(
+                        {
+                            "current_step_name": "Pushing to registry...",
+                        }
+                    )
+
+                    # Push to registry and cleanup host
+                    loop.run_until_complete(registry.push_and_cleanup(full_tag))
+
+                    _active_docker_builds[build_key].update(
+                        {
+                            "pushed_to_registry": True,
+                            "current_step_name": "Build complete and pushed to registry!",
+                        }
+                    )
+                    logger.info(f"Pushed {full_tag} to registry and cleaned up host")
+                finally:
+                    loop.close()
+
+            except RegistryPushError as e:
+                logger.error(f"Failed to push {full_tag} to registry: {e}")
+                _active_docker_builds[build_key].update(
+                    {
+                        "status": "failed",
+                        "pushed_to_registry": False,
+                        "error": f"Registry push failed: {e}",
+                        "current_step_name": f"Error: Registry push failed - {e}",
+                    }
+                )
+                return
+            except Exception as e:
+                logger.error(f"Unexpected error pushing {full_tag} to registry: {e}")
+                _active_docker_builds[build_key].update(
+                    {
+                        "status": "failed",
+                        "pushed_to_registry": False,
+                        "error": f"Registry push failed: {e}",
+                        "current_step_name": f"Error: Registry push failed - {e}",
+                    }
+                )
+                return
+
+        except Exception as e:
+            # Image doesn't exist - build failed silently or was never completed
+            logger.error(f"Build verification failed for {full_tag}: {e}")
+            _active_docker_builds[build_key].update(
+                {
+                    "status": "failed",
+                    "error": f"Build failed - image not found: {e}",
+                    "current_step_name": "Error: Build failed - image not created",
+                }
+            )
+
+    except Exception as e:
+        logger.error(f"Failed to build Docker image {image_name}: {e}")
+        _active_docker_builds[build_key].update(
+            {
+                "status": "failed",
+                "error": str(e),
+                "current_step_name": f"Error: {str(e)}",
+            }
+        )
+
+
+@router.post("/images/build")
+def start_docker_build(
+    request: DockerBuildRequest, background_tasks: BackgroundTasks, current_user: AdminUser
+):
+    """
+    Start an async Docker image build with progress tracking.
+    Returns immediately and allows polling for status.
+    """
+    image_name = request.image_name
+    tag = request.tag
+    build_key = f"{image_name}_{tag}"
+
+    # Validate image exists
+    image_path = os.path.join(IMAGES_DIR, image_name)
+    dockerfile_path = os.path.join(image_path, "Dockerfile")
+
+    if not os.path.exists(dockerfile_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"No Dockerfile found at {image_path}"
+        )
+
+    # Check if already building
+    if (
+        build_key in _active_docker_builds
+        and _active_docker_builds[build_key].get("status") == "building"
+    ):
+        return {
+            "status": "already_building",
+            "image_name": image_name,
+            "tag": tag,
+            "message": "Image is already being built",
+        }
+
+    full_tag = f"{get_settings().image_namespace}/{image_name}:{tag}"
+
+    # Initialize build status BEFORE starting background task to prevent race condition
+    # where frontend polls and gets stale "completed" status from a previous build
+    _active_docker_builds[build_key] = {
+        "status": "building",
+        "image_name": image_name,
+        "tag": tag,
+        "full_tag": full_tag,
+        "progress_percent": 0,
+        "current_step": 0,
+        "total_steps": 0,
+        "current_step_name": "Starting build...",
+        "logs": [],
+        "cancelled": False,
+    }
+
+    # Start background build
+    background_tasks.add_task(_build_docker_image_async, image_name, tag, request.no_cache)
+
+    return {
+        "status": "building",
+        "image_name": image_name,
+        "tag": tag,
+        "build_key": build_key,
+        "message": f"Started building {full_tag}",
+    }
+
+
+@router.get("/images/build/{build_key}/status")
+def get_docker_build_status(build_key: str, current_user: CurrentUser):
+    """Get status of a Docker image build in progress."""
+    if build_key in _active_docker_builds:
+        build_info = _active_docker_builds[build_key]
+        return {
+            "status": build_info.get("status", "unknown"),
+            "image_name": build_info.get("image_name"),
+            "tag": build_info.get("tag"),
+            "full_tag": build_info.get("full_tag"),
+            "progress_percent": build_info.get("progress_percent", 0),
+            "current_step": build_info.get("current_step", 0),
+            "total_steps": build_info.get("total_steps", 0),
+            "current_step_name": build_info.get("current_step_name", ""),
+            "error": build_info.get("error"),
+            "image_id": build_info.get("image_id"),
+            "pushed_to_registry": build_info.get("pushed_to_registry"),
+            "logs": build_info.get("logs", [])[-20:],  # Last 20 log lines
+        }
+
+    return {
+        "status": "not_found",
+        "message": f"No build found for {build_key}",
+    }
+
+
+@router.post("/images/build/{build_key}/cancel")
+def cancel_docker_build(build_key: str, current_user: AdminUser):
+    """Cancel an active Docker image build."""
+    if build_key not in _active_docker_builds:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"No active build found for {build_key}"
+        )
+
+    if _active_docker_builds[build_key].get("status") != "building":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Build is not in progress"
+        )
+
+    _active_docker_builds[build_key]["cancelled"] = True
+    return {
+        "status": "cancelling",
+        "build_key": build_key,
+        "message": "Cancellation requested",
+    }
+
+
+@router.get("/images/builds/active")
+def get_active_docker_builds(current_user: CurrentUser):
+    """Get all active Docker image builds."""
+    return {
+        "builds": [
+            {
+                "build_key": key,
+                "image_name": info.get("image_name"),
+                "tag": info.get("tag"),
+                "full_tag": info.get("full_tag"),
+                "status": info.get("status"),
+                "progress_percent": info.get("progress_percent", 0),
+                "current_step": info.get("current_step", 0),
+                "total_steps": info.get("total_steps", 0),
+                "current_step_name": info.get("current_step_name", ""),
+            }
+            for key, info in _active_docker_builds.items()
+            if info.get("status") == "building"
+        ]
+    }
+
+
+# Windows ISO caching endpoints
+
+
+@router.get("/isos", response_model=ISOCacheResponse)
+def get_iso_cache_status(current_user: CurrentUser):
+    """Get status of cached Windows ISOs."""
+    docker = get_docker_service()
+    return docker.get_windows_iso_cache_status()
+
+
+# Golden image endpoints (Windows pre-installed templates)
+
+
+@router.get("/golden-images", response_model=GoldenImageResponse)
+def get_golden_images_status(current_user: CurrentUser):
+    """Get status of Windows golden images (pre-installed templates)."""
+    docker = get_docker_service()
+    return docker.get_golden_images_status()
+
+
+@router.post("/golden-images", status_code=status.HTTP_201_CREATED)
+def create_golden_image(request: CreateGoldenImageRequest, current_user: AdminUser):
+    """
+    Create a Windows golden image from a running dockur/windows container.
+    This saves the /storage directory for reuse as a template.
+    Admin only as this involves significant disk operations.
+
+    For Linux containers, use POST /snapshots with snapshot_type="docker".
+    """
+    docker = get_docker_service()
+    try:
+        result = docker.create_golden_image(request.container_id, request.name)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create golden image: {str(e)}",
+        ) from e
+
+
+@router.post("/ranges/{range_id}/golden-images", status_code=status.HTTP_201_CREATED)
+def capture_golden_image_from_range(
+    range_id: UUID,
+    request: CaptureGoldenImageRequest,
+    db: DBSession,
+    current_user: AdminUser,
+):
+    """
+    Capture a golden image from a VM running inside a range.
+
+    POST /cache/golden-images cannot reach a VM in a DinD range: it resolves the
+    container on the host daemon and reads /storage off the host filesystem, and
+    under range isolation neither exists. This talks to the range's own daemon.
+
+    It also registers a GoldenImage row. The file copy alone is not enough --
+    the VM builder lists golden images from the database (GET /images/golden),
+    so a captured image with no row never appears as a boot source.
+    """
+    from proving_ground.models.range import Range
+    from proving_ground.models.vm import VM
+    from proving_ground.models.golden_image import GoldenImage
+
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Range not found")
+
+    vm = db.query(VM).filter(VM.id == request.vm_id, VM.range_id == range_id).first()
+    if not vm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="VM not found in this range"
+        )
+    if not vm.container_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VM has no container; deploy the range before capturing",
+        )
+
+    docker = get_docker_service()
+    docker_url = range_obj.dind_docker_url
+    if not docker_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Range has no active DinD daemon",
+        )
+
+    try:
+        result = docker.create_golden_image_from_range(
+            range_id=str(range_id),
+            docker_url=docker_url,
+            container_id=vm.container_id,
+            golden_image_name=request.name,
+            os_type=request.os_type or "windows",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to capture golden image: {str(e)}",
+        ) from e
+
+    golden = GoldenImage(
+        name=result["name"],
+        description=request.description or f"Captured from {vm.hostname} in range {range_obj.name}",
+        source="snapshot",
+        source_vm_id=vm.id,
+        base_image_id=vm.base_image_id,
+        disk_image_path=result["path"],
+        os_type=result["os_type"],
+        vm_type="windows_vm" if result["os_type"] == "windows" else "linux_vm",
+        native_arch=vm.arch or "x86_64",
+        default_cpu=vm.cpu or 2,
+        default_ram_mb=vm.ram_mb or 4096,
+        default_disk_gb=vm.disk_gb or 64,
+        size_bytes=result["size_bytes"],
+        runtime_image_digest=result.get("runtime_image_digest"),
+    )
+    db.add(golden)
+    db.commit()
+    db.refresh(golden)
+
+    return {**result, "golden_image_id": str(golden.id)}
+
+
+@router.delete("/golden-images/{name}")
+def delete_golden_image(name: str, current_user: AdminUser):
+    """Delete a Windows golden image. Admin only."""
+    import os
+    import shutil
+    from proving_ground.config import get_settings
+
+    settings = get_settings()
+    golden_dir = os.path.join(settings.template_storage_dir, name)
+
+    if not os.path.exists(golden_dir):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Golden image not found")
+
+    try:
+        shutil.rmtree(golden_dir)
+        return {"status": "deleted", "name": name}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete golden image: {str(e)}",
+        ) from e
+
+
+# System cache info
+
+
+@router.get("/stats")
+def get_cache_stats(current_user: CurrentUser):
+    """Get overall cache statistics."""
+    docker = get_docker_service()
+
+    images = docker.list_cached_images()
+    isos = docker.get_windows_iso_cache_status()
+    golden = docker.get_golden_images_status()
+
+    total_image_size = sum(img["size_bytes"] for img in images)
+    total_iso_size = sum(iso["size_bytes"] for iso in isos["isos"])
+    total_golden_size = sum(g["size_bytes"] for g in golden["golden_images"])
+
+    return {
+        "docker_images": {
+            "count": len(images),
+            "total_size_bytes": total_image_size,
+            "total_size_gb": round(total_image_size / (1024**3), 2),
+        },
+        "windows_isos": {
+            "count": isos["total_count"],
+            "total_size_bytes": total_iso_size,
+            "total_size_gb": round(total_iso_size / (1024**3), 2),
+            "cache_dir": isos["cache_dir"],
+        },
+        "golden_images": {
+            "count": golden["total_count"],
+            "total_size_bytes": total_golden_size,
+            "total_size_gb": round(total_golden_size / (1024**3), 2),
+            "storage_dir": golden["template_dir"],
+        },
+        "total_cache_size_gb": round(
+            (total_image_size + total_iso_size + total_golden_size) / (1024**3), 2
+        ),
+    }
+
+
+@router.post("/prune", status_code=status.HTTP_200_OK)
+def prune_unused_images(current_user: CurrentUser):
+    """
+    Prune unused Docker images (dangling images and unreferenced images).
+
+    This removes:
+    - Dangling images (untagged layers)
+    - Images not used by any container
+
+    Returns the amount of space reclaimed.
+    """
+    require_role(current_user, ["admin"])
+    docker = get_docker_service()
+
+    try:
+        result = docker.prune_images()
+        return {
+            "status": "success",
+            "images_deleted": result.get("images_deleted", 0),
+            "space_reclaimed_bytes": result.get("space_reclaimed", 0),
+            "space_reclaimed_gb": round(result.get("space_reclaimed", 0) / (1024**3), 2),
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to prune images: {str(e)}",
+        ) from e
+
+
+# Dockur/Windows supported versions
+# These are auto-downloaded by dockur/windows when the container starts
+# See: https://github.com/dockur/windows
+#
+# Download sources (from dockur/windows):
+# - Primary: dl.bobpony.com/windows (MSDN ISOs)
+# - Primary: files.dog/MSDN (community mirror)
+# - Fallback: archive.org (legacy versions)
+# - Microsoft: Evaluation Center for server editions (official, 180-day eval)
+#
+# Note: dl.bobpony.com was previously used but now returns 403 Forbidden.
+# The download_urls list supports fallback - first working URL is used.
+
+# Windows ISO download URLs
+# Sources (in order of preference):
+# 1. Microsoft official (software-static.download.prss.microsoft.com, software-download.microsoft.com)
+# 2. Internet Archive (archive.org) - verified working copies
+# 3. files.dog MSDN mirror (intermittent availability)
+# 4. Buzzheavier (massgrave.dev mirror) - verified hashes
+DOCKUR_WINDOWS_VERSIONS = [
+    # Desktop versions - Windows 11 (Microsoft official - stable)
+    {
+        "version": "11",
+        "name": "Windows 11 Pro",
+        "size_gb": 6.5,
+        "category": "desktop",
+        "download_url": "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso",
+        "download_urls": [
+            "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso",
+        ],
+    },
+    {
+        "version": "11e",
+        "name": "Windows 11 Enterprise",
+        "size_gb": 6.5,
+        "category": "desktop",
+        # Buzzheavier mirror (massgrave.dev) - verified hash
+        "download_url": "https://buzzheavier.com/mwg5iewuuudq",
+        "download_urls": [
+            "https://buzzheavier.com/mwg5iewuuudq",
+        ],
+    },
+    # Desktop versions - Windows 10 (archive.org verified copies)
+    {
+        "version": "10",
+        "name": "Windows 10 Pro",
+        "size_gb": 4.6,
+        "category": "desktop",
+        # Archive.org - Consumer editions (includes Pro)
+        "download_url": "https://archive.org/download/windows-10-22h2-en-us/Windows%2010%2022H2%20x64%20en-us.iso",
+        "download_urls": [
+            "https://archive.org/download/windows-10-22h2-en-us/Windows%2010%2022H2%20x64%20en-us.iso",
+        ],
+    },
+    {
+        "version": "10e",
+        "name": "Windows 10 Enterprise",
+        "size_gb": 6.5,
+        "category": "desktop",
+        # Archive.org - Business editions (includes Enterprise)
+        "download_url": "https://archive.org/download/Windows-10-22H2-August-2024-64-bit-DVD-English/en-us_windows_10_business_editions_version_22h2_updated_aug_2024_x64_dvd_633dcd07.iso",
+        "download_urls": [
+            "https://archive.org/download/Windows-10-22H2-August-2024-64-bit-DVD-English/en-us_windows_10_business_editions_version_22h2_updated_aug_2024_x64_dvd_633dcd07.iso",
+        ],
+    },
+    {
+        "version": "10l",
+        "name": "Windows 10 LTSC 2021",
+        "size_gb": 4.6,
+        "category": "desktop",
+        # Archive.org - Enterprise LTSC 2021
+        "download_url": "https://archive.org/download/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso",
+        "download_urls": [
+            "https://archive.org/download/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso",
+        ],
+    },
+    # Desktop versions - Windows 8.1
+    {
+        "version": "81",
+        "name": "Windows 8.1 Pro",
+        "size_gb": 3.7,
+        "category": "desktop",
+        "download_url": "https://files.dog/MSDN/Windows%208.1%20with%20Update/en_windows_8.1_with_update_x64_dvd_6051480.iso",
+        "download_urls": [
+            "https://files.dog/MSDN/Windows%208.1%20with%20Update/en_windows_8.1_with_update_x64_dvd_6051480.iso",
+        ],
+    },
+    # Desktop versions - Legacy (archive.org verified copies)
+    {
+        "version": "7",
+        "name": "Windows 7 Ultimate SP1",
+        "size_gb": 3.1,
+        "category": "legacy",
+        # Archive.org - unmodified SP1 ISO
+        "download_url": "https://archive.org/download/windows-7-ultimate-sp1-x86-x64/Windows%207%20Ultimate%20SP1%20x64.iso",
+        "download_urls": [
+            "https://archive.org/download/windows-7-ultimate-sp1-x86-x64/Windows%207%20Ultimate%20SP1%20x64.iso",
+        ],
+    },
+    {
+        "version": "vista",
+        "name": "Windows Vista Ultimate SP2",
+        "size_gb": 3.0,
+        "category": "legacy",
+        "download_url": "https://files.dog/MSDN/Windows%20Vista/en_windows_vista_sp2_x64_dvd_342267.iso",
+        "download_urls": [
+            "https://files.dog/MSDN/Windows%20Vista/en_windows_vista_sp2_x64_dvd_342267.iso",
+        ],
+    },
+    {
+        "version": "xp",
+        "name": "Windows XP Professional SP3",
+        "size_gb": 0.6,
+        "category": "legacy",
+        "download_url": "https://files.dog/MSDN/Windows%20XP/en_windows_xp_professional_with_service_pack_3_x86_cd_x14-80428.iso",
+        "download_urls": [
+            "https://files.dog/MSDN/Windows%20XP/en_windows_xp_professional_with_service_pack_3_x86_cd_x14-80428.iso",
+        ],
+    },
+    {
+        "version": "2k",
+        "name": "Windows 2000 Professional SP4",
+        "size_gb": 0.4,
+        "category": "legacy",
+        # Archive.org - SP4 Retail Full Install
+        "download_url": "https://archive.org/download/enwin2000prosp4_202001/EN_WIN2000_PRO_SP4.ISO",
+        "download_urls": [
+            "https://archive.org/download/enwin2000prosp4_202001/EN_WIN2000_PRO_SP4.ISO",
+        ],
+    },
+    # Server versions - Modern (Microsoft Evaluation Center - 180-day eval)
+    {
+        "version": "2025",
+        "name": "Windows Server 2025 (Eval)",
+        "size_gb": 5.5,
+        "category": "server",
+        "download_url": "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso",
+        "download_urls": [
+            "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso",
+        ],
+    },
+    {
+        "version": "2022",
+        "name": "Windows Server 2022 (Eval)",
+        "size_gb": 5.3,
+        "category": "server",
+        "download_url": "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso",
+        "download_urls": [
+            "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso",
+        ],
+    },
+    {
+        "version": "2019",
+        "name": "Windows Server 2019 (Eval)",
+        "size_gb": 5.0,
+        "category": "server",
+        "download_url": "https://software-download.microsoft.com/download/pr/17763.737.190906-2324.rs5_release_svc_refresh_SERVER_EVAL_x64FRE_en-us_1.iso",
+        "download_urls": [
+            "https://software-download.microsoft.com/download/pr/17763.737.190906-2324.rs5_release_svc_refresh_SERVER_EVAL_x64FRE_en-us_1.iso",
+        ],
+    },
+    {
+        "version": "2016",
+        "name": "Windows Server 2016 (Eval)",
+        "size_gb": 6.0,
+        "category": "server",
+        "download_url": "https://software-static.download.prss.microsoft.com/pr/download/Windows_Server_2016_Datacenter_EVAL_en-us_14393_refresh.ISO",
+        "download_urls": [
+            "https://software-static.download.prss.microsoft.com/pr/download/Windows_Server_2016_Datacenter_EVAL_en-us_14393_refresh.ISO",
+        ],
+    },
+    # Server versions - Legacy (Microsoft and archive.org)
+    {
+        "version": "2012",
+        "name": "Windows Server 2012 R2 (Eval)",
+        "size_gb": 4.4,
+        "category": "server",
+        # Microsoft Download Center - Evaluation ISO
+        "download_url": "http://download.microsoft.com/download/6/2/A/62A76ABB-9990-4EFC-A4FE-C7D698DAEB96/9600.17050.WINBLUE_REFRESH.140317-1640_X64FRE_SERVER_EVAL_EN-US-IR3_SSS_X64FREE_EN-US_DV9.ISO",
+        "download_urls": [
+            "http://download.microsoft.com/download/6/2/A/62A76ABB-9990-4EFC-A4FE-C7D698DAEB96/9600.17050.WINBLUE_REFRESH.140317-1640_X64FRE_SERVER_EVAL_EN-US-IR3_SSS_X64FREE_EN-US_DV9.ISO",
+        ],
+    },
+    {
+        "version": "2008",
+        "name": "Windows Server 2008 R2 SP1",
+        "size_gb": 2.9,
+        "category": "server",
+        # Archive.org - Standard/Enterprise/Datacenter SP1
+        "download_url": "https://archive.org/download/english-windows-server-2008-r-2-standard-enterprise-datacenter-sp-1-x-64/English_windows_server_2008_r2_standard_enterprise_datacenter_sp1_x64.iso",
+        "download_urls": [
+            "https://archive.org/download/english-windows-server-2008-r-2-standard-enterprise-datacenter-sp-1-x-64/English_windows_server_2008_r2_standard_enterprise_datacenter_sp1_x64.iso",
+        ],
+    },
+    {
+        "version": "2003",
+        "name": "Windows Server 2003 R2 Enterprise",
+        "size_gb": 0.6,
+        "category": "legacy",
+        # Archive.org - Enterprise x64 with SP2 (CD1 of 2)
+        "download_url": "https://archive.org/download/en_win_srv_2003_r2_enterprise_x64_with_sp2_vl/en_win_srv_2003_r2_enterprise_x64_with_sp2_vl_cd1_x13-48614.iso",
+        "download_urls": [
+            "https://archive.org/download/en_win_srv_2003_r2_enterprise_x64_with_sp2_vl/en_win_srv_2003_r2_enterprise_x64_with_sp2_vl_cd1_x13-48614.iso",
+        ],
+    },
+]
+
+
+# Windows ARM64 versions (for dockur/windows-arm)
+# Only Windows 11 ARM64 has direct download URLs from Microsoft
+# Windows 10 ARM64 requires UUP build at runtime (not pre-cacheable)
+# See: https://github.com/dockur/windows-arm
+DOCKUR_WINDOWS_ARM64_VERSIONS = {
+    "11": {
+        "name": "Windows 11 Pro ARM64",
+        "size_gb": 7.3,
+        "download_url": "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_a64fre_en-us.iso",
+    },
+    "11e": {
+        "name": "Windows 11 Enterprise ARM64",
+        "size_gb": 4.3,
+        "download_url": "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1.240331-1435.ge_release_CLIENTENTERPRISEEVAL_OEMRET_A64FRE_en-us.iso",
+    },
+    "11l": {
+        "name": "Windows 11 LTSC ARM64",
+        "size_gb": 5.0,
+        "download_url": "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1.240331-1435.ge_release_CLIENT_IOT_LTSC_EVAL_A64FRE_en-us.iso",
+    },
+}
+
+# Windows versions with ARM64 ISO pre-cache support (Win11 only)
+WINDOWS_ARM64_VERSIONS = {"11", "11e", "11l"}
+
+
+def get_windows_arm64_info(version: str) -> dict | None:
+    """Get ARM64 Windows version info if available."""
+    return DOCKUR_WINDOWS_ARM64_VERSIONS.get(version)
+
+
+def has_windows_arm64_support(version: str) -> bool:
+    """Check if a Windows version has ARM64 support."""
+    return version in WINDOWS_ARM64_VERSIONS
+
+
+# ============================================================================
+# macOS ISOs (dockur/macos) - x86_64 ONLY
+# ============================================================================
+# macOS versions supported by dockur/macos
+# NOTE: macOS VMs only work on x86_64 hosts (KVM-based virtualization)
+# dockur/macos downloads images at runtime if not pre-cached
+# Source: https://github.com/dockur/macos
+DOCKUR_MACOS_VERSIONS = [
+    {
+        "version": "15",
+        "name": "macOS Sequoia",
+        "size_gb": 14.0,
+        "category": "desktop",
+        "download_url": None,  # dockur downloads at runtime
+        "note": "Latest - Apple Account sign-in not working yet",
+    },
+    {
+        "version": "14",
+        "name": "macOS Sonoma",
+        "size_gb": 14.0,
+        "category": "desktop",
+        "download_url": None,
+        "note": "Recommended - most stable",
+    },
+    {
+        "version": "13",
+        "name": "macOS Ventura",
+        "size_gb": 12.0,
+        "category": "desktop",
+        "download_url": None,
+    },
+    {
+        "version": "12",
+        "name": "macOS Monterey",
+        "size_gb": 12.0,
+        "category": "desktop",
+        "download_url": None,
+    },
+    {
+        "version": "11",
+        "name": "macOS Big Sur",
+        "size_gb": 12.0,
+        "category": "desktop",
+        "download_url": None,
+    },
+]
+
+
+def get_macos_iso_dir() -> str:
+    """Get the macOS ISO cache directory path."""
+    settings = get_settings()
+    return os.path.join(settings.iso_cache_dir, "macos-isos")
+
+
+# Track active macOS ISO downloads
+_active_macos_downloads: Dict[str, Dict[str, Any]] = {}
+
+
+# qemux/qemu supported Linux distributions
+# These are auto-downloaded by qemux/qemu when the container starts
+# Download URLs sourced from: https://github.com/qemux/qemu-docker/blob/master/src/define.sh
+QEMU_LINUX_VERSIONS = [
+    # Popular desktop distributions
+    {
+        "version": "ubuntu",
+        "name": "Ubuntu Desktop",
+        "size_gb": 6.0,
+        "category": "desktop",
+        "description": "Ubuntu Desktop 24.04 LTS - Popular and user-friendly",
+        "download_url": "https://releases.ubuntu.com/noble/ubuntu-24.04.3-desktop-amd64.iso",
+    },
+    {
+        "version": "ubuntus",
+        "name": "Ubuntu Server",
+        "size_gb": 3.0,
+        "category": "server",
+        "description": "Ubuntu Server 24.04 LTS - Minimal server install",
+        "download_url": "https://releases.ubuntu.com/noble/ubuntu-24.04.3-live-server-amd64.iso",
+    },
+    {
+        "version": "debian",
+        "name": "Debian",
+        "size_gb": 3.3,
+        "category": "desktop",
+        "description": "Debian 13 Trixie - Stable and reliable",
+        "download_url": "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.3.0-amd64-gnome.iso",
+    },
+    {
+        "version": "fedora",
+        "name": "Fedora",
+        "size_gb": 2.3,
+        "category": "desktop",
+        "description": "Fedora Workstation - Cutting-edge features",
+        "download_url": "https://download.fedoraproject.org/pub/fedora/linux/releases/41/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64-41-1.4.iso",
+    },
+    {
+        "version": "alpine",
+        "name": "Alpine Linux",
+        "size_gb": 0.06,
+        "category": "server",
+        "description": "Alpine Linux - Minimal and security-focused (60 MB)",
+        "download_url": "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-virt-3.23.2-x86_64.iso",
+    },
+    {
+        "version": "arch",
+        "name": "Arch Linux",
+        "size_gb": 1.2,
+        "category": "desktop",
+        "description": "Arch Linux - Rolling release, highly customizable",
+        "download_url": "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso",
+    },
+    {
+        "version": "manjaro",
+        "name": "Manjaro",
+        "size_gb": 4.1,
+        "category": "desktop",
+        "description": "Manjaro - User-friendly Arch-based distro",
+        "download_url": "https://sourceforge.net/projects/manjarolinux/files/gnome/26.0/manjaro-gnome-26.0-260104-linux618.iso/download",
+    },
+    {
+        "version": "suse",
+        "name": "OpenSUSE",
+        "size_gb": 1.0,
+        "category": "desktop",
+        "description": "OpenSUSE Leap - Stable enterprise-grade",
+        "download_url": "https://download.opensuse.org/distribution/leap/15.6/iso/openSUSE-Leap-15.6-DVD-x86_64-Media.iso",
+    },
+    {
+        "version": "mint",
+        "name": "Linux Mint",
+        "size_gb": 2.8,
+        "category": "desktop",
+        "description": "Linux Mint - Windows-like experience",
+        "download_url": "https://mirrors.kernel.org/linuxmint/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso",
+    },
+    {
+        "version": "zorin",
+        "name": "Zorin OS",
+        "size_gb": 3.8,
+        "category": "desktop",
+        "description": "Zorin OS - Beautiful and familiar interface",
+        "download_url": "https://mirrors.edge.kernel.org/zorinos-isos/17/Zorin-OS-17.3-Core-64-bit-r2.iso",
+    },
+    {
+        "version": "kubuntu",
+        "name": "Kubuntu",
+        "size_gb": 4.4,
+        "category": "desktop",
+        "description": "Kubuntu - Ubuntu with KDE Plasma desktop",
+        "download_url": "https://cdimages.ubuntu.com/kubuntu/releases/noble/release/kubuntu-24.04.3-desktop-amd64.iso",
+    },
+    {
+        "version": "xubuntu",
+        "name": "Xubuntu",
+        "size_gb": 4.0,
+        "category": "desktop",
+        "description": "Xubuntu - Ubuntu with lightweight XFCE desktop",
+        "download_url": "https://cdimages.ubuntu.com/xubuntu/releases/noble/release/xubuntu-24.04.3-desktop-amd64.iso",
+    },
+    # Security-focused distributions (for cyber range training)
+    {
+        "version": "kali",
+        "name": "Kali Linux",
+        "size_gb": 3.8,
+        "category": "security",
+        "description": "Kali Linux - Penetration testing and security auditing",
+        "download_url": "https://cdimage.kali.org/kali-2025.4/kali-linux-2025.4-installer-amd64.iso",
+    },
+    {
+        "version": "tails",
+        "name": "Tails",
+        "size_gb": 1.9,
+        "category": "security",
+        "description": "Tails - Privacy-focused, runs from memory",
+        "download_url": "https://download.tails.net/tails/stable/tails-amd64-7.3.1/tails-amd64-7.3.1.iso",
+    },
+    # Enterprise/server distributions
+    {
+        "version": "rocky",
+        "name": "Rocky Linux",
+        "size_gb": 2.1,
+        "category": "server",
+        "description": "Rocky Linux 9 - RHEL compatible enterprise OS",
+        "download_url": "https://dl.rockylinux.org/pub/rocky/9/live/x86_64/Rocky-9-Workstation-x86_64-latest.iso",
+    },
+    {
+        "version": "alma",
+        "name": "Alma Linux",
+        "size_gb": 2.2,
+        "category": "server",
+        "description": "Alma Linux 9 - RHEL compatible enterprise OS",
+        "download_url": "https://repo.almalinux.org/almalinux/9/live/x86_64/AlmaLinux-9-latest-x86_64-Live-GNOME.iso",
+    },
+    {
+        "version": "centos",
+        "name": "CentOS Stream",
+        "size_gb": 7.0,
+        "category": "server",
+        "description": "CentOS Stream 9 - RHEL upstream development",
+        "download_url": "https://mirrors.centos.org/mirrorlist?path=/9-stream/BaseOS/x86_64/iso/CentOS-Stream-9-latest-x86_64-dvd1.iso&redirect=1&protocol=https",
+    },
+    # Other distributions
+    {
+        "version": "gentoo",
+        "name": "Gentoo",
+        "size_gb": 3.6,
+        "category": "desktop",
+        "description": "Gentoo - Source-based, highly customizable",
+        "download_url": "https://distfiles.gentoo.org/releases/amd64/autobuilds/current-livegui-amd64/livegui-amd64-20260111T160052Z.iso",
+    },
+    {
+        "version": "nixos",
+        "name": "NixOS",
+        "size_gb": 2.4,
+        "category": "desktop",
+        "description": "NixOS - Declarative and reproducible",
+        "download_url": "https://channels.nixos.org/nixos-25.11/latest-nixos-gnome-x86_64-linux.iso",
+    },
+    {
+        "version": "mx",
+        "name": "MX Linux",
+        "size_gb": 2.2,
+        "category": "desktop",
+        "description": "MX Linux - Lightweight and fast",
+        "download_url": "https://sourceforge.net/projects/mx-linux/files/Final/Xfce/MX-25_Xfce_x64.iso/download",
+    },
+    {
+        "version": "cachy",
+        "name": "CachyOS",
+        "size_gb": 2.6,
+        "category": "desktop",
+        "description": "CachyOS - Performance-optimized Arch-based",
+        "download_url": "https://sourceforge.net/projects/cachyos-arch/files/gui-installer/desktop/251129/cachyos-desktop-linux-251129.iso/download",
+    },
+    {
+        "version": "slack",
+        "name": "Slackware",
+        "size_gb": 3.7,
+        "category": "server",
+        "description": "Slackware - One of the oldest Linux distributions",
+        "download_url": "https://slackware.nl/slackware-live/slackware64-current-live/slackware64-live-current.iso",
+    },
+]
+
+
+# ARM64 ISO URLs for supported distributions
+# These are used when running on ARM64 hosts (Apple Silicon, etc.)
+QEMU_LINUX_ARM64_ISOS = {
+    # Ubuntu ARM64 is on cdimage.ubuntu.com, not releases.ubuntu.com
+    "ubuntu": "https://cdimage.ubuntu.com/releases/24.04/release/ubuntu-24.04.3-desktop-arm64.iso",
+    "ubuntus": "https://cdimage.ubuntu.com/releases/24.04/release/ubuntu-24.04.3-live-server-arm64.iso",
+    "debian": "https://cdimage.debian.org/debian-cd/current/arm64/iso-cd/debian-13.3.0-arm64-netinst.iso",
+    "fedora": "https://download.fedoraproject.org/pub/fedora/linux/releases/41/Server/aarch64/iso/Fedora-Server-dvd-aarch64-41-1.4.iso",
+    "alpine": "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/alpine-virt-3.23.2-aarch64.iso",
+    "rocky": "https://download.rockylinux.org/pub/rocky/9/isos/aarch64/Rocky-9-latest-aarch64-minimal.iso",
+    "alma": "https://repo.almalinux.org/almalinux/9/isos/aarch64/AlmaLinux-9-latest-aarch64-minimal.iso",
+    "kali": "https://cdimage.kali.org/kali-2025.4/kali-linux-2025.4-installer-arm64.iso",
+}
+
+# Distributions with native ARM64 support
+ARM64_NATIVE_DISTROS = {"ubuntu", "ubuntus", "debian", "fedora", "alpine", "rocky", "alma", "kali"}
+
+
+def get_arm64_iso_url(distro_version: str) -> str | None:
+    """
+    Get the ARM64 ISO URL for a distribution if available.
+
+    Args:
+        distro_version: The version code (e.g., "ubuntu", "debian", "fedora")
+
+    Returns:
+        The ARM64 ISO URL if available, None otherwise
+    """
+    return QEMU_LINUX_ARM64_ISOS.get(distro_version)
+
+
+def has_arm64_support(distro_version: str) -> bool:
+    """
+    Check if a distribution has native ARM64 support.
+
+    Args:
+        distro_version: The version code (e.g., "ubuntu", "debian", "fedora")
+
+    Returns:
+        True if the distribution has ARM64 support, False otherwise
+    """
+    return distro_version in ARM64_NATIVE_DISTROS
+
+
+def get_linux_iso_dir() -> str:
+    """Get the Linux ISO cache directory path."""
+    settings = get_settings()
+    return os.path.join(settings.iso_cache_dir, "linux-isos")
+
+
+@router.get("/linux-versions")
+def get_linux_versions(current_user: CurrentUser):
+    """
+    Get all supported Linux distributions for qemux/qemu with cached status.
+
+    These distributions are automatically downloaded by qemux/qemu
+    when a container is started - no manual ISO download needed.
+    Returns cached status for each version, including architecture availability.
+    """
+    from proving_ground.utils.arch import HOST_ARCH
+
+    linux_iso_dir = get_linux_iso_dir()
+
+    # Get list of cached ISO files and calculate total size
+    cached_isos = set()
+    total_size_bytes = 0
+    if os.path.exists(linux_iso_dir):
+        for filename in os.listdir(linux_iso_dir):
+            if filename.endswith((".iso", ".img", ".qcow2")):
+                cached_isos.add(filename.lower())
+                filepath = os.path.join(linux_iso_dir, filename)
+                try:
+                    total_size_bytes += os.path.getsize(filepath)
+                except OSError:
+                    pass
+
+    # Add cached status and architecture info to each version
+    def add_cached_status(version_list):
+        result = []
+        for v in version_list:
+            version_info = dict(v)
+            version_code = v["version"]
+
+            # Check for architecture-specific cached ISOs
+            x86_cached = any(
+                f"linux-{version_code}-x86_64.iso".lower() in iso_name or
+                # Legacy format (backwards compat)
+                (f"linux-{version_code}.iso".lower() == iso_name)
+                for iso_name in cached_isos
+            )
+            arm64_cached = any(
+                f"linux-{version_code}-arm64.iso".lower() in iso_name for iso_name in cached_isos
+            )
+
+            # Backwards compat: "cached" = cached for current host architecture
+            version_info["cached"] = arm64_cached if HOST_ARCH == "arm64" else x86_cached
+            version_info["cached_x86_64"] = x86_cached
+            version_info["cached_arm64"] = arm64_cached
+
+            # ARM64 availability (from our defined list)
+            version_info["arm64_available"] = has_arm64_support(version_code)
+            version_info["arm64_url"] = get_arm64_iso_url(version_code)
+
+            result.append(version_info)
+        return result
+
+    all_versions = add_cached_status(QEMU_LINUX_VERSIONS)
+    desktop = [v for v in all_versions if v["category"] == "desktop"]
+    server = [v for v in all_versions if v["category"] == "server"]
+    security = [v for v in all_versions if v["category"] == "security"]
+
+    # Count cached for current host architecture
+    cached_count = sum(1 for v in all_versions if v["cached"])
+
+    return {
+        "desktop": desktop,
+        "server": server,
+        "security": security,
+        "all": all_versions,
+        "cache_dir": linux_iso_dir,
+        "cached_count": cached_count,
+        "total_count": len(all_versions),
+        "total_size_bytes": total_size_bytes,
+        "total_size_gb": round(total_size_bytes / (1024**3), 2),
+        "host_arch": HOST_ARCH,
+        "arm64_supported_distros": list(ARM64_NATIVE_DISTROS),
+        "note": "ISOs are automatically downloaded by qemux/qemu when the VM starts. Pre-caching is optional but speeds up first boot.",
+    }
+
+
+@router.get("/linux-isos")
+def get_linux_iso_cache_status(current_user: CurrentUser):
+    """Get status of cached Linux ISOs."""
+    docker = get_docker_service()
+    return docker.get_linux_iso_cache_status()
+
+
+# Linux ISO Download endpoints
+
+
+class LinuxISODownloadRequest(BaseModel):
+    version: str
+    arch: Optional[str] = None  # x86_64 or arm64, defaults to host architecture
+    url: Optional[str] = None  # Custom URL, or use default for version
+
+
+# Track active Linux ISO downloads
+_active_linux_downloads: dict = {}
+
+
+@router.post("/linux-isos/download", status_code=status.HTTP_202_ACCEPTED)
+def download_linux_iso(
+    request: LinuxISODownloadRequest, background_tasks: BackgroundTasks, current_user: AdminUser
+):
+    """
+    Download a Linux ISO from the official source or custom URL.
+    Admin only as this downloads large files.
+
+    If no URL is provided, uses the default download URL for the distribution.
+    Architecture can be specified (x86_64 or arm64), defaults to host architecture.
+    Some distributions don't have static download URLs and require manual download.
+    """
+    import os
+    from proving_ground.utils.arch import HOST_ARCH
+
+    # Validate and default architecture
+    arch = request.arch or HOST_ARCH
+    if arch not in ("x86_64", "arm64"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid architecture '{arch}'. Must be 'x86_64' or 'arm64'.",
+        )
+
+    # Validate version
+    version_info = None
+    for v in QEMU_LINUX_VERSIONS:
+        if v["version"] == request.version:
+            version_info = v
+            break
+
+    if not version_info:
+        valid_versions = [v["version"] for v in QEMU_LINUX_VERSIONS]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid version '{request.version}'. Valid versions: {', '.join(valid_versions)}",
+        )
+
+    # Determine download URL based on architecture
+    download_url = request.url  # Custom URL takes priority
+
+    if not download_url:
+        if arch == "arm64":
+            # Try ARM64 URL first
+            download_url = QEMU_LINUX_ARM64_ISOS.get(request.version)
+            if not download_url:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"No ARM64 ISO available for '{request.version}'. "
+                    f"ARM64 supported distros: {', '.join(QEMU_LINUX_ARM64_ISOS.keys())}",
+                )
+        else:
+            # Use x86_64 URL (default)
+            download_url = version_info.get("download_url")
+
+    if not download_url:
+        # No direct download URL available
+        download_note = version_info.get("download_note", "No direct download available")
+
+        response = {
+            "status": "no_direct_download",
+            "version": request.version,
+            "arch": arch,
+            "name": version_info["name"],
+            "message": download_note,
+            "instructions": "Provide a custom URL or upload the ISO manually.",
+        }
+
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=response)
+
+    linux_iso_dir = get_linux_iso_dir()
+    os.makedirs(linux_iso_dir, exist_ok=True)
+
+    # Include architecture in filename for clarity
+    filename = f"linux-{request.version}-{arch}.iso"
+    filepath = os.path.join(linux_iso_dir, filename)
+
+    # Check if already exists
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO for '{request.version}' ({arch}) already exists. Delete it first to re-download.",
+        )
+
+    # Track by version+arch to allow parallel downloads of different architectures
+    download_key = f"{request.version}-{arch}"
+
+    # Check if already downloading
+    if (
+        download_key in _active_linux_downloads
+        and _active_linux_downloads[download_key].get("status") == "downloading"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Download already in progress for '{request.version}' ({arch})",
+        )
+
+    # Start download
+    _active_linux_downloads[download_key] = {
+        "status": "downloading",
+        "filename": filename,
+        "arch": arch,
+        "progress_bytes": 0,
+        "total_bytes": None,
+        "error": None,
+    }
+
+    def download_iso(url: str, dest_path: str, key: str):
+        """Download ISO in background with progress tracking."""
+        import requests
+        import time
+
+        try:
+            # Use streaming download with progress
+            response = requests.get(url, stream=True, timeout=3600, allow_redirects=True)
+            response.raise_for_status()
+
+            # Get total size if available
+            total_size = response.headers.get("content-length")
+            if total_size:
+                total_size = int(total_size)
+                _active_linux_downloads[key]["total_bytes"] = total_size
+
+            # Download with progress tracking
+            downloaded = 0
+            with open(dest_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                    # Check if download was cancelled
+                    if key not in _active_linux_downloads or _active_linux_downloads[key].get(
+                        "cancelled"
+                    ):
+                        if os.path.exists(dest_path):
+                            os.remove(dest_path)
+                        if key in _active_linux_downloads:
+                            del _active_linux_downloads[key]
+                        return
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        _active_linux_downloads[key]["progress_bytes"] = downloaded
+
+            _active_linux_downloads[key]["status"] = "completed"
+            _active_linux_downloads[key]["progress_bytes"] = os.path.getsize(dest_path)
+
+            # Clear from active downloads after a delay (allow frontend to see completion)
+            time.sleep(3)
+            if key in _active_linux_downloads:
+                del _active_linux_downloads[key]
+
+        except Exception as e:
+            # Clean up partial download
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            if key in _active_linux_downloads:
+                _active_linux_downloads[key]["status"] = "failed"
+                _active_linux_downloads[key]["error"] = str(e)
+                # Clear failed downloads after a delay
+                time.sleep(5)
+                if key in _active_linux_downloads:
+                    del _active_linux_downloads[key]
+
+    background_tasks.add_task(download_iso, download_url, filepath, download_key)
+
+    return {
+        "status": "downloading",
+        "version": request.version,
+        "arch": arch,
+        "name": version_info["name"],
+        "filename": filename,
+        "destination": filepath,
+        "source_url": download_url,
+        "expected_size_gb": version_info.get("size_gb"),
+        "message": f"Downloading {version_info['name']} ({arch}) ISO...",
+    }
+
+
+@router.get("/linux-isos/download/{version}/status")
+def get_linux_iso_download_status(
+    version: str,
+    arch: Optional[str] = Query(None, description="Architecture (x86_64 or arm64)"),
+    current_user: CurrentUser = None,
+):
+    """Check the status of a Linux ISO download."""
+    from proving_ground.utils.arch import HOST_ARCH
+
+    linux_iso_dir = get_linux_iso_dir()
+
+    # If arch specified, check that specific file
+    if arch:
+        download_key = f"{version}-{arch}"
+        filename = f"linux-{version}-{arch}.iso"
+    else:
+        # Check both architectures, prefer host arch
+        download_key = f"{version}-{HOST_ARCH}"
+        filename = f"linux-{version}-{HOST_ARCH}.iso"
+
+        # Also check old-style filename for backward compatibility
+        old_filename = f"linux-{version}.iso"
+        old_filepath = os.path.join(linux_iso_dir, old_filename)
+        if os.path.exists(old_filepath):
+            size = os.path.getsize(old_filepath)
+            return {
+                "status": "completed",
+                "version": version,
+                "arch": "x86_64",  # Old files are assumed x86_64
+                "filename": old_filename,
+                "path": old_filepath,
+                "size_bytes": size,
+                "size_gb": round(size / (1024**3), 2),
+            }
+
+    filepath = os.path.join(linux_iso_dir, filename)
+
+    # IMPORTANT: Check active downloads FIRST (file exists during download)
+    if download_key in _active_linux_downloads:
+        info = _active_linux_downloads[download_key]
+        response = {
+            "status": info["status"],
+            "version": version,
+            "arch": info.get("arch", arch or HOST_ARCH),
+            "filename": info.get("filename"),
+        }
+
+        if info.get("progress_bytes") is not None:
+            response["progress_bytes"] = info["progress_bytes"]
+            response["progress_gb"] = round(info["progress_bytes"] / (1024**3), 2)
+
+        if info.get("total_bytes") is not None:
+            response["total_bytes"] = info["total_bytes"]
+            response["total_gb"] = round(info["total_bytes"] / (1024**3), 2)
+            if info["progress_bytes"]:
+                response["progress_percent"] = round(
+                    info["progress_bytes"] / info["total_bytes"] * 100, 1
+                )
+
+        if info.get("error"):
+            response["error"] = info["error"]
+
+        return response
+
+    # Only check file if NOT in active downloads (truly completed)
+    if os.path.exists(filepath):
+        size = os.path.getsize(filepath)
+        return {
+            "status": "completed",
+            "version": version,
+            "arch": arch or HOST_ARCH,
+            "filename": filename,
+            "path": filepath,
+            "size_bytes": size,
+            "size_gb": round(size / (1024**3), 2),
+        }
+
+    return {
+        "status": "not_found",
+        "version": version,
+        "arch": arch or HOST_ARCH,
+        "message": "No download in progress and ISO not found in cache",
+    }
+
+
+@router.post("/linux-isos/download/{version}/cancel")
+def cancel_linux_iso_download(
+    version: str,
+    arch: Optional[str] = Query(None, description="Architecture (x86_64 or arm64)"),
+    current_user: AdminUser = None,
+):
+    """Cancel an in-progress Linux ISO download. Admin only."""
+    from proving_ground.utils.arch import HOST_ARCH
+
+    download_key = f"{version}-{arch}" if arch else f"{version}-{HOST_ARCH}"
+
+    if download_key not in _active_linux_downloads:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active download found for '{version}' ({arch or HOST_ARCH})",
+        )
+
+    if _active_linux_downloads[download_key].get("status") != "downloading":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Download for '{version}' ({arch or HOST_ARCH}) is not in progress",
+        )
+
+    # Mark as cancelled - the download loop will detect this and clean up
+    _active_linux_downloads[download_key]["cancelled"] = True
+    _active_linux_downloads[download_key]["status"] = "cancelled"
+
+    return {
+        "status": "cancelled",
+        "version": version,
+        "arch": arch or HOST_ARCH,
+        "message": f"Download for '{version}' ({arch or HOST_ARCH}) has been cancelled",
+    }
+
+
+@router.delete("/linux-isos/{version}")
+def delete_linux_iso(
+    version: str,
+    arch: Optional[str] = Query(None, description="Architecture (x86_64 or arm64)"),
+    current_user: AdminUser = None,
+):
+    """Delete a cached Linux ISO. Admin only."""
+    from proving_ground.utils.arch import HOST_ARCH
+
+    linux_iso_dir = get_linux_iso_dir()
+
+    # If arch specified, delete that specific file
+    if arch:
+        download_key = f"{version}-{arch}"
+        filename = f"linux-{version}-{arch}.iso"
+    else:
+        # Try new-style filename with host arch first
+        download_key = f"{version}-{HOST_ARCH}"
+        filename = f"linux-{version}-{HOST_ARCH}.iso"
+
+        # Also check old-style filename for backward compatibility
+        old_filename = f"linux-{version}.iso"
+        old_filepath = os.path.join(linux_iso_dir, old_filename)
+        if os.path.exists(old_filepath) and not os.path.exists(
+            os.path.join(linux_iso_dir, filename)
+        ):
+            filename = old_filename
+            download_key = version  # Old key format
+
+    filepath = os.path.join(linux_iso_dir, filename)
+
+    # Clear any active download entry
+    if download_key in _active_linux_downloads:
+        del _active_linux_downloads[download_key]
+
+    if not os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"ISO for '{version}' ({arch or 'any'}) not found",
+        )
+
+    try:
+        os.remove(filepath)
+        return {"status": "deleted", "version": version, "arch": arch, "filename": filename}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete ISO: {str(e)}",
+        ) from e
+
+
+# ============================================================================
+# macOS ISO Endpoints (dockur/macos) - x86_64 ONLY
+# ============================================================================
+
+
+@router.get("/macos-versions")
+def get_macos_versions(current_user: CurrentUser):
+    """
+    Get all supported macOS versions for dockur/macos with cached status.
+
+    NOTE: macOS VMs only work on x86_64 hosts. dockur/macos downloads
+    images at runtime if not pre-cached.
+    """
+    from proving_ground.utils.arch import HOST_ARCH
+
+    macos_dir = get_macos_iso_dir()
+    os.makedirs(macos_dir, exist_ok=True)
+
+    # Get list of cached ISO files and calculate total size
+    cached_isos = set()
+    total_size_bytes = 0
+    if os.path.exists(macos_dir):
+        for filename in os.listdir(macos_dir):
+            if filename.endswith(".iso"):
+                cached_isos.add(filename.lower())
+                filepath = os.path.join(macos_dir, filename)
+                try:
+                    total_size_bytes += os.path.getsize(filepath)
+                except OSError:
+                    pass
+
+    versions = []
+    cached_count = 0
+
+    for v in DOCKUR_MACOS_VERSIONS:
+        version_code = v["version"]
+        filename = f"macos-{version_code}.iso"
+        is_cached = filename.lower() in cached_isos
+
+        if is_cached:
+            cached_count += 1
+
+        versions.append(
+            {
+                **v,
+                "cached": is_cached,
+                "precache_available": v.get("download_url") is not None,
+            }
+        )
+
+    return {
+        "versions": versions,
+        "cache_dir": macos_dir,
+        "cached_count": cached_count,
+        "total_count": len(DOCKUR_MACOS_VERSIONS),
+        "total_size_bytes": total_size_bytes,
+        "total_size_gb": round(total_size_bytes / (1024**3), 2),
+        "host_arch": HOST_ARCH,
+        "x86_64_only": True,
+        "note": "macOS VMs only work on x86_64 hosts. dockur/macos downloads images at runtime if not pre-cached.",
+    }
+
+
+class MacOSISODownloadRequest(BaseModel):
+    version: str
+    url: Optional[str] = None
+
+
+@router.post("/macos-isos/download", status_code=status.HTTP_202_ACCEPTED)
+def download_macos_iso(
+    request: MacOSISODownloadRequest, background_tasks: BackgroundTasks, current_user: AdminUser
+):
+    """
+    Download a macOS ISO from a provided URL.
+    Admin only.
+
+    NOTE: Most macOS ISOs don't have direct download URLs available.
+    dockur/macos downloads images at runtime. This endpoint is for
+    manually providing a custom URL or pre-caching from a known source.
+    """
+    # Validate version
+    valid_versions = {v["version"] for v in DOCKUR_MACOS_VERSIONS}
+    if request.version not in valid_versions:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid version '{request.version}'. Valid versions: {', '.join(sorted(valid_versions))}",
+        )
+
+    # Check if already downloading
+    if request.version in _active_macos_downloads:
+        if _active_macos_downloads[request.version].get("status") == "downloading":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Download already in progress for this version",
+            )
+
+    macos_dir = get_macos_iso_dir()
+    os.makedirs(macos_dir, exist_ok=True)
+    filename = f"macos-{request.version}.iso"
+    filepath = os.path.join(macos_dir, filename)
+
+    # Get download URL
+    version_info = next((v for v in DOCKUR_MACOS_VERSIONS if v["version"] == request.version), None)
+    download_url = request.url or (version_info.get("download_url") if version_info else None)
+
+    if not download_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No download URL available. macOS images are typically downloaded by dockur at runtime. Provide a custom URL or upload the ISO manually.",
+        )
+
+    # Initialize tracking
+    _active_macos_downloads[request.version] = {
+        "status": "downloading",
+        "filename": filename,
+        "progress_bytes": 0,
+        "total_bytes": None,
+        "error": None,
+    }
+
+    def download_macos_iso_task(url: str, dest_path: str, version: str):
+        """Download macOS ISO in background with progress tracking."""
+        import requests
+        import time
+
+        try:
+            response = requests.get(url, stream=True, timeout=7200, allow_redirects=True)
+            response.raise_for_status()
+
+            total_size = response.headers.get("content-length")
+            if total_size:
+                total_size = int(total_size)
+                _active_macos_downloads[version]["total_bytes"] = total_size
+
+            downloaded = 0
+            with open(dest_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    # Check if cancelled
+                    if version not in _active_macos_downloads or _active_macos_downloads[
+                        version
+                    ].get("cancelled"):
+                        if os.path.exists(dest_path):
+                            os.remove(dest_path)
+                        if version in _active_macos_downloads:
+                            del _active_macos_downloads[version]
+                        return
+
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        _active_macos_downloads[version]["progress_bytes"] = downloaded
+
+            _active_macos_downloads[version]["status"] = "completed"
+            _active_macos_downloads[version]["progress_bytes"] = os.path.getsize(dest_path)
+
+            time.sleep(3)
+            if version in _active_macos_downloads:
+                del _active_macos_downloads[version]
+
+        except Exception as e:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            if version in _active_macos_downloads:
+                _active_macos_downloads[version]["status"] = "failed"
+                _active_macos_downloads[version]["error"] = str(e)
+                time.sleep(5)
+                if version in _active_macos_downloads:
+                    del _active_macos_downloads[version]
+
+    background_tasks.add_task(download_macos_iso_task, download_url, filepath, request.version)
+
+    return {
+        "status": "downloading",
+        "version": request.version,
+        "name": version_info["name"] if version_info else f"macOS {request.version}",
+        "filename": filename,
+        "destination": filepath,
+        "source_url": download_url,
+        "message": f"Downloading macOS {request.version} ISO...",
+    }
+
+
+@router.get("/macos-isos/download/{version}/status")
+def get_macos_iso_download_status(version: str, current_user: CurrentUser):
+    """Check macOS ISO download status."""
+    if version in _active_macos_downloads:
+        info = _active_macos_downloads[version]
+        response = {
+            "status": info["status"],
+            "version": version,
+            "filename": info.get("filename"),
+        }
+
+        if info.get("progress_bytes") is not None:
+            response["progress_bytes"] = info["progress_bytes"]
+            response["progress_gb"] = round(info["progress_bytes"] / (1024**3), 2)
+
+        if info.get("total_bytes") is not None:
+            response["total_bytes"] = info["total_bytes"]
+            response["total_gb"] = round(info["total_bytes"] / (1024**3), 2)
+            if info["progress_bytes"]:
+                response["progress_percent"] = round(
+                    info["progress_bytes"] / info["total_bytes"] * 100, 1
+                )
+
+        if info.get("error"):
+            response["error"] = info["error"]
+
+        return response
+
+    # Check if already cached
+    macos_dir = get_macos_iso_dir()
+    filepath = os.path.join(macos_dir, f"macos-{version}.iso")
+    if os.path.exists(filepath):
+        size = os.path.getsize(filepath)
+        return {
+            "status": "completed",
+            "version": version,
+            "filename": f"macos-{version}.iso",
+            "path": filepath,
+            "size_bytes": size,
+            "size_gb": round(size / (1024**3), 2),
+        }
+
+    return {"status": "not_found", "version": version}
+
+
+@router.post("/macos-isos/upload", status_code=status.HTTP_201_CREATED)
+async def upload_macos_iso(
+    file: UploadFile = File(...),
+    version: str = Form(...),
+    current_user: AdminUser = None,
+):
+    """
+    Upload a macOS ISO file to the cache.
+    The version should match a supported macOS version (e.g., '14', '15').
+    Admin only.
+    """
+    import aiofiles
+
+    valid_versions = {v["version"] for v in DOCKUR_MACOS_VERSIONS}
+    if version not in valid_versions:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid version '{version}'. Valid versions: {', '.join(sorted(valid_versions))}",
+        )
+
+    if not file.filename or not file.filename.lower().endswith(".iso"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an ISO file"
+        )
+
+    macos_dir = get_macos_iso_dir()
+    os.makedirs(macos_dir, exist_ok=True)
+
+    filename = f"macos-{version}.iso"
+    filepath = os.path.join(macos_dir, filename)
+
+    # Check if already exists
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO for version '{version}' already exists. Delete it first to replace.",
+        )
+
+    try:
+        async with aiofiles.open(filepath, "wb") as out_file:
+            while content := await file.read(1024 * 1024):
+                await out_file.write(content)
+
+        size = os.path.getsize(filepath)
+        return {
+            "status": "uploaded",
+            "version": version,
+            "filename": filename,
+            "path": filepath,
+            "size_bytes": size,
+            "size_gb": round(size / (1024**3), 2),
+        }
+    except Exception as e:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload ISO: {str(e)}",
+        ) from e
+
+
+# Simplified ISO upload endpoints with category + name (no version validation)
+
+
+@router.post("/macos-isos/upload-custom", status_code=status.HTTP_201_CREATED)
+async def upload_macos_iso_custom(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    current_user: AdminUser = None,
+):
+    """
+    Upload a macOS ISO file with a custom name.
+    No version validation - just stores with the given name.
+    Admin only.
+    """
+    import re
+    import aiofiles
+
+    if not file.filename or not file.filename.lower().endswith(".iso"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an ISO file"
+        )
+
+    macos_dir = get_macos_iso_dir()
+    os.makedirs(macos_dir, exist_ok=True)
+
+    # Sanitize name for filename
+    safe_name = re.sub(r"[^\w\-.]", "_", name)
+    filename = f"macos-custom-{safe_name}.iso"
+    filepath = os.path.join(macos_dir, filename)
+
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO '{name}' already exists. Delete it first to replace.",
+        )
+
+    try:
+        async with aiofiles.open(filepath, "wb") as out_file:
+            while content := await file.read(1024 * 1024):
+                await out_file.write(content)
+
+        size = os.path.getsize(filepath)
+        return {
+            "status": "uploaded",
+            "name": name,
+            "filename": filename,
+            "path": filepath,
+            "size_bytes": size,
+            "size_gb": round(size / (1024**3), 2),
+        }
+    except Exception as e:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload ISO: {str(e)}",
+        ) from e
+
+
+@router.delete("/macos-isos/{version}")
+def delete_macos_iso(version: str, current_user: AdminUser):
+    """Delete a cached macOS ISO. Admin only."""
+    macos_dir = get_macos_iso_dir()
+    filepath = os.path.join(macos_dir, f"macos-{version}.iso")
+
+    # Clear any active download entry
+    if version in _active_macos_downloads:
+        del _active_macos_downloads[version]
+
+    if not os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"macOS ISO for version '{version}' not found",
+        )
+
+    try:
+        os.remove(filepath)
+        return {"status": "deleted", "version": version, "filename": f"macos-{version}.iso"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete ISO: {str(e)}",
+        ) from e
+
+
+@router.post("/macos-isos/download/{version}/cancel")
+def cancel_macos_iso_download(version: str, current_user: AdminUser):
+    """Cancel macOS ISO download. Admin only."""
+    if version not in _active_macos_downloads:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active download found for version '{version}'",
+        )
+
+    if _active_macos_downloads[version].get("status") != "downloading":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Download for version '{version}' is not in progress",
+        )
+
+    _active_macos_downloads[version]["cancelled"] = True
+    _active_macos_downloads[version]["status"] = "cancelled"
+
+    return {
+        "status": "cancelled",
+        "version": version,
+        "message": f"Download for macOS {version} has been cancelled",
+    }
+
+
+@router.get("/windows-versions")
+def get_windows_versions(current_user: CurrentUser):
+    """
+    Get all supported Windows versions for dockur/windows with cached status.
+
+    These versions are automatically downloaded by dockur/windows
+    when a container is started - no manual ISO download needed.
+    Returns cached status for each version, including ARM64 availability.
+    """
+    from proving_ground.utils.arch import HOST_ARCH
+
+    windows_iso_dir = get_windows_iso_dir()
+
+    # Get list of cached ISO files
+    cached_isos = set()
+    if os.path.exists(windows_iso_dir):
+        for filename in os.listdir(windows_iso_dir):
+            if filename.endswith(".iso"):
+                cached_isos.add(filename.lower())
+
+    # Add cached status to each version
+    def add_cached_status(version_list):
+        result = []
+        for v in version_list:
+            version_info = dict(v)
+            version_code = v["version"]
+
+            # Check x86_64 cached status
+            x86_cached = f"windows-{version_code}.iso".lower() in cached_isos
+
+            # Check ARM64 cached status
+            arm64_cached = f"windows-{version_code}-arm64.iso".lower() in cached_isos
+
+            # Check if ARM64 is available for this version
+            arm64_available = has_windows_arm64_support(version_code)
+            arm64_info = get_windows_arm64_info(version_code) if arm64_available else None
+
+            # Check if pre-caching is available (has a download URL)
+            x86_download_url = v.get("download_url")
+            precache_available = x86_download_url is not None and x86_download_url != ""
+
+            version_info["cached"] = x86_cached  # Backwards compatibility
+            version_info["cached_x86_64"] = x86_cached
+            version_info["cached_arm64"] = arm64_cached
+            version_info["arm64_available"] = arm64_available
+            version_info["precache_available"] = precache_available
+            if arm64_info:
+                version_info["arm64_name"] = arm64_info.get("name")
+                version_info["arm64_size_gb"] = arm64_info.get("size_gb")
+                arm64_url = arm64_info.get("download_url")
+                version_info["arm64_has_url"] = arm64_url is not None and arm64_url != ""
+            result.append(version_info)
+        return result
+
+    all_versions = add_cached_status(DOCKUR_WINDOWS_VERSIONS)
+    desktop = [v for v in all_versions if v["category"] == "desktop"]
+    server = [v for v in all_versions if v["category"] == "server"]
+    legacy = [v for v in all_versions if v["category"] == "legacy"]
+
+    cached_count = sum(1 for v in all_versions if v["cached_x86_64"])
+    cached_arm64_count = sum(1 for v in all_versions if v["cached_arm64"])
+
+    return {
+        "desktop": desktop,
+        "server": server,
+        "legacy": legacy,
+        "all": all_versions,
+        "cache_dir": windows_iso_dir,
+        "cached_count": cached_count,
+        "cached_arm64_count": cached_arm64_count,
+        "total_count": len(all_versions),
+        "host_arch": HOST_ARCH,
+        "note": "ISOs are automatically downloaded by dockur/windows when the VM starts. Pre-caching is optional but speeds up first boot.",
+        "arm64_note": "ARM64 pre-caching available for Windows 11 only. Server/legacy editions require x86_64.",
+    }
+
+
+# Custom ISO cache endpoints
+
+# Track active custom ISO downloads
+_active_custom_downloads: dict = {}
+
+
+class CustomISORequest(BaseModel):
+    name: str  # Display name for the ISO
+    url: str  # URL to download ISO from
+
+
+class CustomISOResponse(BaseModel):
+    name: str
+    filename: str
+    path: str
+    url: str
+    size_bytes: int
+    size_gb: float
+    downloaded_at: str
+
+
+@router.get("/custom-isos")
+def list_custom_isos(current_user: CurrentUser):
+    """List all custom ISOs in the cache."""
+    import os
+    import json
+    from proving_ground.config import get_settings
+
+    settings = get_settings()
+    custom_iso_dir = os.path.join(settings.iso_cache_dir, "custom-isos")
+    metadata_file = os.path.join(custom_iso_dir, "metadata.json")
+
+    # Ensure directory exists
+    os.makedirs(custom_iso_dir, exist_ok=True)
+
+    # Load metadata
+    metadata = {}
+    if os.path.exists(metadata_file):
+        try:
+            with open(metadata_file, "r") as f:
+                metadata = json.load(f)
+        except:
+            metadata = {}
+
+    isos = []
+    total_size_bytes = 0
+    for filename in os.listdir(custom_iso_dir):
+        if filename.endswith(".iso"):
+            filepath = os.path.join(custom_iso_dir, filename)
+            try:
+                size = os.path.getsize(filepath)
+                total_size_bytes += size
+            except OSError:
+                size = 0
+            iso_metadata = metadata.get(filename, {})
+            isos.append(
+                {
+                    "name": iso_metadata.get("name", filename.replace(".iso", "")),
+                    "filename": filename,
+                    "path": filepath,
+                    "url": iso_metadata.get("url", ""),
+                    "size_bytes": size,
+                    "size_gb": round(size / (1024**3), 2),
+                    "downloaded_at": iso_metadata.get("downloaded_at", ""),
+                }
+            )
+
+    return {
+        "cache_dir": custom_iso_dir,
+        "total_count": len(isos),
+        "total_size_bytes": total_size_bytes,
+        "total_size_gb": round(total_size_bytes / (1024**3), 2),
+        "isos": isos,
+    }
+
+
+@router.post("/custom-isos", status_code=status.HTTP_201_CREATED)
+def download_custom_iso(
+    request: CustomISORequest, background_tasks: BackgroundTasks, current_user: AdminUser
+):
+    """
+    Download a custom ISO from a URL to the cache.
+    Admin only as this downloads potentially large files.
+    """
+    import os
+    import re
+    from proving_ground.config import get_settings
+
+    settings = get_settings()
+    custom_iso_dir = os.path.join(settings.iso_cache_dir, "custom-isos")
+    os.makedirs(custom_iso_dir, exist_ok=True)
+
+    # Sanitize filename from name
+    safe_name = re.sub(r"[^\w\-.]", "_", request.name)
+    if not safe_name.endswith(".iso"):
+        safe_name += ".iso"
+
+    filepath = os.path.join(custom_iso_dir, safe_name)
+
+    # Check if already exists
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO '{safe_name}' already exists in cache",
+        )
+
+    # Check if already downloading
+    if (
+        safe_name in _active_custom_downloads
+        and _active_custom_downloads[safe_name].get("status") == "downloading"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Download already in progress for '{request.name}'",
+        )
+
+    # Start download with progress tracking
+    _active_custom_downloads[safe_name] = {
+        "status": "downloading",
+        "name": request.name,
+        "filename": safe_name,
+        "url": request.url,
+        "progress_bytes": 0,
+        "total_bytes": None,
+        "error": None,
+    }
+
+    def download_iso(url: str, dest_path: str, name: str, filename: str, iso_dir: str):
+        """Download ISO in background with progress tracking. Supports compressed archives."""
+        import requests
+        import json
+        import time
+        import shutil
+        from datetime import datetime
+
+        metadata_file = os.path.join(iso_dir, "metadata.json")
+        is_archive = is_archive_file(url)
+        temp_archive_path = None
+        extract_dir = None
+
+        try:
+            # Determine download path (temp file for archives, final path for ISOs)
+            if is_archive:
+                archive_ext = get_archive_extension(url) or ".archive"
+                temp_archive_path = os.path.join(iso_dir, f".tmp_{filename}{archive_ext}")
+                download_path = temp_archive_path
+                _active_custom_downloads[filename]["is_archive"] = True
+                _active_custom_downloads[filename]["archive_status"] = "downloading"
+            else:
+                download_path = dest_path
+
+            # Use streaming download with progress
+            response = requests.get(url, stream=True, timeout=3600, allow_redirects=True)
+            response.raise_for_status()
+
+            # Get total size if available
+            total_size = response.headers.get("content-length")
+            if total_size:
+                total_size = int(total_size)
+                _active_custom_downloads[filename]["total_bytes"] = total_size
+
+            # Download with progress tracking
+            downloaded = 0
+            with open(download_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                    # Check if download was cancelled
+                    if filename not in _active_custom_downloads or _active_custom_downloads[
+                        filename
+                    ].get("cancelled"):
+                        if os.path.exists(download_path):
+                            os.remove(download_path)
+                        if filename in _active_custom_downloads:
+                            del _active_custom_downloads[filename]
+                        return
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        _active_custom_downloads[filename]["progress_bytes"] = downloaded
+
+            # If it's an archive, extract and find the ISO
+            if is_archive:
+                _active_custom_downloads[filename]["archive_status"] = "extracting"
+                logger.info(f"Extracting ISO from archive: {temp_archive_path}")
+
+                try:
+                    iso_path = extract_iso_from_archive(temp_archive_path, iso_dir)
+                    extract_dir = os.path.dirname(iso_path)
+
+                    # Move extracted ISO to final destination
+                    shutil.move(iso_path, dest_path)
+                    logger.info(f"Extracted ISO moved to: {dest_path}")
+
+                finally:
+                    # Clean up temp archive and extraction directory
+                    if temp_archive_path and os.path.exists(temp_archive_path):
+                        os.remove(temp_archive_path)
+                    if extract_dir and os.path.exists(extract_dir):
+                        shutil.rmtree(extract_dir, ignore_errors=True)
+
+            # Update metadata
+            metadata = {}
+            if os.path.exists(metadata_file):
+                try:
+                    with open(metadata_file, "r") as f:
+                        metadata = json.load(f)
+                except:
+                    metadata = {}
+
+            metadata[filename] = {
+                "name": name,
+                "url": url,
+                "downloaded_at": datetime.utcnow().isoformat(),
+                "extracted_from_archive": is_archive,
+            }
+            with open(metadata_file, "w") as f:
+                json.dump(metadata, f, indent=2)
+
+            _active_custom_downloads[filename]["status"] = "completed"
+            _active_custom_downloads[filename]["progress_bytes"] = os.path.getsize(dest_path)
+
+            # Clear from active downloads after a delay (allow frontend to see completion)
+            time.sleep(3)
+            if filename in _active_custom_downloads:
+                del _active_custom_downloads[filename]
+
+        except Exception as e:
+            # Clean up partial download and temp files
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            if temp_archive_path and os.path.exists(temp_archive_path):
+                os.remove(temp_archive_path)
+            if extract_dir and os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+            if filename in _active_custom_downloads:
+                _active_custom_downloads[filename]["status"] = "failed"
+                _active_custom_downloads[filename]["error"] = str(e)
+                # Clear failed downloads after a delay
+                time.sleep(5)
+                if filename in _active_custom_downloads:
+                    del _active_custom_downloads[filename]
+
+    background_tasks.add_task(
+        download_iso, request.url, filepath, request.name, safe_name, custom_iso_dir
+    )
+
+    return {
+        "status": "downloading",
+        "message": f"Downloading {request.name} from {request.url}",
+        "filename": safe_name,
+        "name": request.name,
+        "destination": filepath,
+    }
+
+
+@router.get("/custom-isos/{filename}/status")
+def get_custom_iso_download_status(filename: str, current_user: CurrentUser):
+    """Check the status of a custom ISO download."""
+    import os
+    import json
+    from proving_ground.config import get_settings
+
+    settings = get_settings()
+    custom_iso_dir = os.path.join(settings.iso_cache_dir, "custom-isos")
+    filepath = os.path.join(custom_iso_dir, filename)
+    metadata_file = os.path.join(custom_iso_dir, "metadata.json")
+
+    # IMPORTANT: Check active downloads FIRST (file exists during download)
+    if filename in _active_custom_downloads:
+        info = _active_custom_downloads[filename]
+        response = {
+            "status": info["status"],
+            "filename": filename,
+            "name": info.get("name"),
+        }
+
+        if info.get("progress_bytes") is not None:
+            response["progress_bytes"] = info["progress_bytes"]
+            response["progress_gb"] = round(info["progress_bytes"] / (1024**3), 2)
+
+        if info.get("total_bytes") is not None:
+            response["total_bytes"] = info["total_bytes"]
+            response["total_gb"] = round(info["total_bytes"] / (1024**3), 2)
+            if info["progress_bytes"]:
+                response["progress_percent"] = round(
+                    info["progress_bytes"] / info["total_bytes"] * 100, 1
+                )
+
+        if info.get("error"):
+            response["error"] = info["error"]
+
+        return response
+
+    # Only check file if NOT in active downloads (truly completed)
+    if os.path.exists(filepath):
+        size = os.path.getsize(filepath)
+
+        # Load metadata
+        metadata = {}
+        if os.path.exists(metadata_file):
+            try:
+                with open(metadata_file, "r") as f:
+                    metadata = json.load(f)
+            except:
+                pass
+
+        iso_metadata = metadata.get(filename, {})
+
+        return {
+            "status": "completed",
+            "filename": filename,
+            "name": iso_metadata.get("name", filename.replace(".iso", "")),
+            "path": filepath,
+            "size_bytes": size,
+            "size_gb": round(size / (1024**3), 2),
+            "downloaded_at": iso_metadata.get("downloaded_at", ""),
+        }
+
+    return {
+        "status": "not_found",
+        "filename": filename,
+        "message": "No download in progress and ISO not found in cache",
+    }
+
+
+@router.post("/custom-isos/{filename}/cancel")
+def cancel_custom_iso_download(filename: str, current_user: AdminUser):
+    """Cancel an in-progress custom ISO download. Admin only."""
+    if filename not in _active_custom_downloads:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active download found for '{filename}'",
+        )
+
+    if _active_custom_downloads[filename].get("status") != "downloading":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Download for '{filename}' is not in progress (status: {_active_custom_downloads[filename].get('status')})",
+        )
+
+    # Mark as cancelled - the download loop will detect this and clean up
+    _active_custom_downloads[filename]["cancelled"] = True
+    _active_custom_downloads[filename]["status"] = "cancelled"
+
+    return {
+        "status": "cancelled",
+        "filename": filename,
+        "message": f"Download for '{filename}' has been cancelled",
+    }
+
+
+@router.delete("/custom-isos/{filename}")
+def delete_custom_iso(filename: str, current_user: AdminUser):
+    """Delete a custom ISO from the cache. Admin only."""
+    import os
+    import json
+    from proving_ground.config import get_settings
+
+    settings = get_settings()
+    custom_iso_dir = os.path.join(settings.iso_cache_dir, "custom-isos")
+    filepath = os.path.join(custom_iso_dir, filename)
+    metadata_file = os.path.join(custom_iso_dir, "metadata.json")
+
+    # Clear any active download entry for this filename
+    if filename in _active_custom_downloads:
+        del _active_custom_downloads[filename]
+
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom ISO not found")
+
+    try:
+        os.remove(filepath)
+
+        # Update metadata
+        if os.path.exists(metadata_file):
+            try:
+                with open(metadata_file, "r") as f:
+                    metadata = json.load(f)
+                if filename in metadata:
+                    del metadata[filename]
+                    with open(metadata_file, "w") as f:
+                        json.dump(metadata, f, indent=2)
+            except:
+                pass
+
+        return {"status": "deleted", "filename": filename}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete ISO: {str(e)}",
+        ) from e
+
+
+# Recommended images for cyber ranges - categorized
+#
+# Categories:
+# - desktop: Images with GUI desktop environment (VNC/web accessible)
+# - server: Headless server/CLI images
+# - services: Purpose-built service containers
+
+RECOMMENDED_DOCKER_IMAGES = {
+    "desktop": [
+        # Desktop images with built-in VNC/web access
+        {
+            "name": "Ubuntu Desktop (XFCE)",
+            "image": "linuxserver/webtop:ubuntu-xfce",
+            "description": "Full Ubuntu desktop with XFCE, accessible via web browser",
+            "category": "desktop",
+            "access": "web",
+        },
+        {
+            "name": "Debian Desktop (KDE)",
+            "image": "linuxserver/webtop:debian-kde",
+            "description": "Full Debian desktop with KDE Plasma, accessible via web browser",
+            "category": "desktop",
+            "access": "web",
+        },
+        {
+            "name": "Fedora Desktop (XFCE)",
+            "image": "linuxserver/webtop:fedora-xfce",
+            "description": "Full Fedora desktop with XFCE, accessible via web browser",
+            "category": "desktop",
+            "access": "web",
+        },
+        {
+            "name": "Arch Linux Desktop (XFCE)",
+            "image": "linuxserver/webtop:arch-xfce",
+            "description": "Full Arch Linux desktop with XFCE, accessible via web browser",
+            "category": "desktop",
+            "access": "web",
+        },
+        {
+            "name": "Ubuntu 22.04 Desktop (Kasm)",
+            "image": "kasmweb/ubuntu-jammy-desktop:1.14.0",
+            "description": "Ubuntu 22.04 with full desktop environment via KasmVNC",
+            "category": "desktop",
+            "access": "vnc",
+        },
+        {
+            "name": "Kali Linux Desktop (Kasm)",
+            "image": "kasmweb/kali-rolling-desktop:1.14.0",
+            "description": "Kali Linux with full desktop and security tools via KasmVNC",
+            "category": "desktop",
+            "access": "vnc",
+        },
+        {
+            "name": "Ubuntu Desktop (XFCE/VNC)",
+            "image": "consol/ubuntu-xfce-vnc",
+            "description": "Ubuntu with XFCE desktop accessible via VNC",
+            "category": "desktop",
+            "access": "vnc",
+        },
+        {
+            "name": "Ubuntu Desktop (LXDE/VNC)",
+            "image": "dorowu/ubuntu-desktop-lxde-vnc",
+            "description": "Lightweight Ubuntu with LXDE desktop accessible via VNC",
+            "category": "desktop",
+            "access": "vnc",
+        },
+    ],
+    "server": [
+        # Headless server/CLI images
+        {
+            "name": "Ubuntu Server 22.04 LTS",
+            "image": "ubuntu:22.04",
+            "description": "Ubuntu 22.04 LTS (Jammy Jellyfish) - Long-term support",
+            "category": "server",
+        },
+        {
+            "name": "Ubuntu Server 20.04 LTS",
+            "image": "ubuntu:20.04",
+            "description": "Ubuntu 20.04 LTS (Focal Fossa) - Stable release",
+            "category": "server",
+        },
+        {
+            "name": "Debian 12 (Bookworm)",
+            "image": "debian:12",
+            "description": "Debian 12 Bookworm - Current stable release",
+            "category": "server",
+        },
+        {
+            "name": "Debian 11 (Bullseye)",
+            "image": "debian:11",
+            "description": "Debian 11 Bullseye - Previous stable release",
+            "category": "server",
+        },
+        {
+            "name": "Fedora Server 39",
+            "image": "fedora:39",
+            "description": "Fedora 39 - Latest features and packages",
+            "category": "server",
+        },
+        {
+            "name": "Rocky Linux 9",
+            "image": "rockylinux:9",
+            "description": "Rocky Linux 9 - RHEL-compatible enterprise Linux",
+            "category": "server",
+        },
+        {
+            "name": "CentOS 7",
+            "image": "centos:7",
+            "description": "CentOS 7 - Legacy enterprise Linux support",
+            "category": "server",
+        },
+        {
+            "name": "Alpine Linux 3.19",
+            "image": "alpine:3.19",
+            "description": "Alpine Linux - Minimal, security-focused distribution",
+            "category": "server",
+        },
+        {
+            "name": "Kali Linux (CLI)",
+            "image": "kalilinux/kali-rolling",
+            "description": "Kali Linux rolling release - Security and pentesting tools",
+            "category": "server",
+        },
+    ],
+    "services": [
+        {
+            "name": "Nginx",
+            "image": "nginx:latest",
+            "description": "High-performance HTTP server and reverse proxy",
+            "category": "services",
+        },
+        {
+            "name": "Apache HTTP Server",
+            "image": "httpd:latest",
+            "description": "The Apache HTTP Server Project",
+            "category": "services",
+        },
+        {
+            "name": "MySQL 8",
+            "image": "mysql:8",
+            "description": "MySQL 8 - Popular open-source relational database",
+            "category": "services",
+        },
+        {
+            "name": "PostgreSQL 16",
+            "image": "postgres:16",
+            "description": "PostgreSQL 16 - Advanced open-source database",
+            "category": "services",
+        },
+        {
+            "name": "Redis 7",
+            "image": "redis:7",
+            "description": "Redis 7 - In-memory data structure store and cache",
+            "category": "services",
+        },
+        {
+            "name": "MongoDB 7",
+            "image": "mongo:7",
+            "description": "MongoDB 7 - Document-oriented NoSQL database",
+            "category": "services",
+        },
+        {
+            "name": "MariaDB 11",
+            "image": "mariadb:11",
+            "description": "MariaDB 11 - MySQL-compatible database server",
+            "category": "services",
+        },
+        {
+            "name": "Elasticsearch 8",
+            "image": "elasticsearch:8.11.0",
+            "description": "Elasticsearch - Distributed search and analytics engine",
+            "category": "services",
+        },
+    ],
+    "proving_ground": [
+        # PROVING GROUND platform infrastructure images (from GitHub Container Registry)
+        {
+            "name": "PROVING GROUND Proxy",
+            "image": "ghcr.io/jongodb/cyroid-proxy:latest",
+            "description": "Traefik reverse proxy for routing and SSL termination",
+            "category": "proving_ground",
+        },
+        {
+            "name": "PROVING GROUND DinD",
+            "image": "ghcr.io/jongodb/cyroid-dind:latest",
+            "description": "Docker-in-Docker for range network isolation",
+            "category": "proving_ground",
+        },
+        {
+            "name": "PROVING GROUND Storage",
+            "image": "ghcr.io/jongodb/cyroid-storage:latest",
+            "description": "MinIO S3-compatible object storage for artifacts",
+            "category": "proving_ground",
+        },
+        {
+            "name": "PROVING GROUND Database",
+            "image": "ghcr.io/jongodb/cyroid-db:latest",
+            "description": "PostgreSQL database for range and user data",
+            "category": "proving_ground",
+        },
+        {
+            "name": "PROVING GROUND Redis",
+            "image": "ghcr.io/jongodb/cyroid-redis:latest",
+            "description": "Redis for caching and task queue",
+            "category": "proving_ground",
+        },
+        {
+            "name": "PROVING GROUND API",
+            "image": "ghcr.io/jongodb/cyroid-api:latest",
+            "description": "FastAPI backend for range orchestration",
+            "category": "proving_ground",
+        },
+        {
+            "name": "PROVING GROUND Frontend",
+            "image": "ghcr.io/jongodb/cyroid-frontend:latest",
+            "description": "React web interface",
+            "category": "proving_ground",
+        },
+        {
+            "name": "PROVING GROUND Worker",
+            "image": "ghcr.io/jongodb/cyroid-worker:latest",
+            "description": "Dramatiq task worker for async operations",
+            "category": "proving_ground",
+        },
+    ],
+}
+
+
+@router.get("/recommended-images")
+def get_recommended_images(current_user: CurrentUser):
+    """
+    Get a list of recommended Docker images for cyber range templates.
+    These are commonly used images that can be pre-cached.
+
+    Categories:
+    - desktop: Images with GUI desktop environment (VNC/web accessible)
+    - server: Headless server/CLI images
+    - services: Purpose-built service containers
+    """
+    # Get cached images to mark which are already cached
+    docker = get_docker_service()
+    cached_images = docker.list_cached_images()
+    cached_tags = set()
+    for img in cached_images:
+        cached_tags.update(img.get("tags", []))
+
+    def add_cached_status(image_list):
+        result = []
+        for img in image_list:
+            img_info = dict(img)
+            img_info["cached"] = img["image"] in cached_tags
+            result.append(img_info)
+        return result
+
+    return {
+        "desktop": add_cached_status(RECOMMENDED_DOCKER_IMAGES["desktop"]),
+        "server": add_cached_status(RECOMMENDED_DOCKER_IMAGES["server"]),
+        "services": add_cached_status(RECOMMENDED_DOCKER_IMAGES["services"]),
+        "proving_ground": add_cached_status(RECOMMENDED_DOCKER_IMAGES["proving_ground"]),
+        "linux": add_cached_status(RECOMMENDED_DOCKER_IMAGES["server"]),  # Backwards compat
+        "windows": DOCKUR_WINDOWS_VERSIONS,
+    }
+
+
+# ISO Upload endpoints
+
+
+@router.post("/isos/upload-custom", status_code=status.HTTP_201_CREATED)
+async def upload_windows_iso_custom(
+    file: UploadFile = File(...),
+    category: str = Form(...),
+    name: str = Form(...),
+    current_user: AdminUser = None,
+):
+    """
+    Upload a Windows ISO file with a custom name and category.
+    Categories: desktop, server, legacy
+    Admin only.
+    """
+    import re
+    import aiofiles
+
+    valid_categories = ["desktop", "server", "legacy"]
+    if category not in valid_categories:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid category '{category}'. Valid categories: {', '.join(valid_categories)}",
+        )
+
+    if not file.filename or not file.filename.lower().endswith(".iso"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an ISO file"
+        )
+
+    windows_iso_dir = get_windows_iso_dir()
+    os.makedirs(windows_iso_dir, exist_ok=True)
+
+    # Sanitize name for filename
+    safe_name = re.sub(r"[^\w\-.]", "_", name)
+    filename = f"windows-custom-{category}-{safe_name}.iso"
+    filepath = os.path.join(windows_iso_dir, filename)
+
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO '{name}' already exists. Delete it first to replace.",
+        )
+
+    try:
+        async with aiofiles.open(filepath, "wb") as out_file:
+            while content := await file.read(1024 * 1024):
+                await out_file.write(content)
+
+        file_size = os.path.getsize(filepath)
+        return {
+            "status": "uploaded",
+            "category": category,
+            "name": name,
+            "filename": filename,
+            "path": filepath,
+            "size_bytes": file_size,
+            "size_gb": round(file_size / (1024**3), 2),
+        }
+    except Exception as e:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload ISO: {str(e)}",
+        ) from e
+
+
+@router.post("/isos/upload", status_code=status.HTTP_201_CREATED)
+async def upload_windows_iso(
+    file: UploadFile = File(...),
+    version: str = Form(...),
+    current_user: AdminUser = None,
+):
+    """
+    Upload a Windows ISO file to the cache.
+    The version should match a supported Windows version code (e.g., '11', '2022').
+    Admin only.
+    """
+    import os
+    import aiofiles
+
+    # Validate version
+    valid_versions = [v["version"] for v in DOCKUR_WINDOWS_VERSIONS]
+    if version not in valid_versions:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid version '{version}'. Valid versions: {', '.join(valid_versions)}",
+        )
+
+    # Validate file type
+    if not file.filename or not file.filename.lower().endswith(".iso"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an ISO file"
+        )
+
+    windows_iso_dir = get_windows_iso_dir()
+    os.makedirs(windows_iso_dir, exist_ok=True)
+
+    # Save with standardized name
+    filename = f"windows-{version}.iso"
+    filepath = os.path.join(windows_iso_dir, filename)
+
+    # Check if already exists
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO for version '{version}' already exists. Delete it first to replace.",
+        )
+
+    try:
+        async with aiofiles.open(filepath, "wb") as out_file:
+            while content := await file.read(1024 * 1024):  # 1MB chunks
+                await out_file.write(content)
+
+        file_size = os.path.getsize(filepath)
+        return {
+            "status": "uploaded",
+            "version": version,
+            "filename": filename,
+            "path": filepath,
+            "size_bytes": file_size,
+            "size_gb": round(file_size / (1024**3), 2),
+        }
+    except Exception as e:
+        # Clean up on failure
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload ISO: {str(e)}",
+        ) from e
+
+
+@router.post("/linux-isos/upload-custom", status_code=status.HTTP_201_CREATED)
+async def upload_linux_iso_custom(
+    file: UploadFile = File(...),
+    category: str = Form(...),
+    name: str = Form(...),
+    current_user: AdminUser = None,
+):
+    """
+    Upload a Linux ISO file with a custom name and category.
+    Categories: desktop, security, server
+    Admin only.
+    """
+    import re
+    import aiofiles
+    from proving_ground.utils.arch import HOST_ARCH
+
+    valid_categories = ["desktop", "security", "server"]
+    if category not in valid_categories:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid category '{category}'. Valid categories: {', '.join(valid_categories)}",
+        )
+
+    if not file.filename or not file.filename.lower().endswith(".iso"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an ISO file"
+        )
+
+    linux_iso_dir = get_linux_iso_dir()
+    os.makedirs(linux_iso_dir, exist_ok=True)
+
+    # Sanitize name for filename
+    safe_name = re.sub(r"[^\w\-.]", "_", name)
+    arch_suffix = HOST_ARCH
+    filename = f"linux-custom-{category}-{safe_name}-{arch_suffix}.iso"
+    filepath = os.path.join(linux_iso_dir, filename)
+
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO '{name}' already exists. Delete it first to replace.",
+        )
+
+    try:
+        async with aiofiles.open(filepath, "wb") as out_file:
+            while content := await file.read(1024 * 1024):
+                await out_file.write(content)
+
+        file_size = os.path.getsize(filepath)
+        return {
+            "status": "uploaded",
+            "category": category,
+            "name": name,
+            "arch": arch_suffix,
+            "filename": filename,
+            "path": filepath,
+            "size_bytes": file_size,
+            "size_gb": round(file_size / (1024**3), 2),
+        }
+    except Exception as e:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload ISO: {str(e)}",
+        ) from e
+
+
+@router.post("/linux-isos/upload", status_code=status.HTTP_201_CREATED)
+async def upload_linux_iso(
+    file: UploadFile = File(...),
+    distro: str = Form(...),
+    current_user: AdminUser = None,
+):
+    """
+    Upload a Linux ISO file to the cache.
+    The distro should match a supported Linux distribution code (e.g., 'ubuntu', 'kali', 'debian').
+    Admin only.
+    """
+    import os
+    import aiofiles
+    from proving_ground.utils.arch import HOST_ARCH
+
+    # Validate distro
+    valid_distros = [v["version"] for v in QEMU_LINUX_VERSIONS]
+    if distro not in valid_distros:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid distro '{distro}'. Valid distros: {', '.join(valid_distros)}",
+        )
+
+    # Validate file type
+    if not file.filename or not file.filename.lower().endswith(".iso"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an ISO file"
+        )
+
+    linux_iso_dir = get_linux_iso_dir()
+    os.makedirs(linux_iso_dir, exist_ok=True)
+
+    # Save with standardized name including architecture
+    arch_suffix = HOST_ARCH  # Use host architecture
+    filename = f"linux-{distro}-{arch_suffix}.iso"
+    filepath = os.path.join(linux_iso_dir, filename)
+
+    # Check if already exists
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO for distro '{distro}' ({arch_suffix}) already exists. Delete it first to replace.",
+        )
+
+    try:
+        async with aiofiles.open(filepath, "wb") as out_file:
+            while content := await file.read(1024 * 1024):  # 1MB chunks
+                await out_file.write(content)
+
+        file_size = os.path.getsize(filepath)
+        return {
+            "status": "uploaded",
+            "distro": distro,
+            "arch": arch_suffix,
+            "filename": filename,
+            "path": filepath,
+            "size_bytes": file_size,
+            "size_gb": round(file_size / (1024**3), 2),
+        }
+    except Exception as e:
+        # Clean up on failure
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload ISO: {str(e)}",
+        ) from e
+
+
+@router.post("/custom-isos/upload", status_code=status.HTTP_201_CREATED)
+async def upload_custom_iso(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    current_user: AdminUser = None,
+):
+    """
+    Upload a custom ISO file or compressed archive containing an ISO to the cache.
+    Supports: .iso, .zip, .7z, .rar, .tar, .tar.gz, .tgz, .tar.bz2, .gz, .bz2, .xz
+    Admin only.
+    """
+    import os
+    import re
+    import json
+    import shutil
+    import aiofiles
+    from datetime import datetime
+    from proving_ground.config import get_settings
+
+    if not file.filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file provided")
+
+    # Check if file is an ISO or supported archive
+    filename_lower = file.filename.lower()
+    is_iso = filename_lower.endswith(".iso")
+    is_archive = is_archive_file(file.filename)
+
+    if not is_iso and not is_archive:
+        supported_formats = ".iso, " + ", ".join(SUPPORTED_ARCHIVE_EXTENSIONS)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File must be an ISO or compressed archive. Supported formats: {supported_formats}",
+        )
+
+    settings = get_settings()
+    custom_iso_dir = os.path.join(settings.iso_cache_dir, "custom-isos")
+    os.makedirs(custom_iso_dir, exist_ok=True)
+
+    # Sanitize filename from name
+    safe_name = re.sub(r"[^\w\-.]", "_", name)
+    if not safe_name.endswith(".iso"):
+        safe_name += ".iso"
+
+    filepath = os.path.join(custom_iso_dir, safe_name)
+    metadata_file = os.path.join(custom_iso_dir, "metadata.json")
+
+    # Check if already exists
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO '{safe_name}' already exists. Delete it first to replace.",
+        )
+
+    temp_archive_path = None
+    extract_dir = None
+
+    try:
+        if is_archive:
+            # Save archive to temp file first
+            archive_ext = get_archive_extension(file.filename) or ".archive"
+            temp_archive_path = os.path.join(
+                custom_iso_dir, f".tmp_upload_{safe_name}{archive_ext}"
+            )
+
+            async with aiofiles.open(temp_archive_path, "wb") as out_file:
+                while content := await file.read(1024 * 1024):  # 1MB chunks
+                    await out_file.write(content)
+
+            # Extract ISO from archive
+            logger.info(f"Extracting ISO from uploaded archive: {temp_archive_path}")
+            iso_path = extract_iso_from_archive(temp_archive_path, custom_iso_dir)
+            extract_dir = os.path.dirname(iso_path)
+
+            # Move extracted ISO to final destination
+            shutil.move(iso_path, filepath)
+            logger.info(f"Extracted ISO moved to: {filepath}")
+
+            # Clean up
+            if os.path.exists(temp_archive_path):
+                os.remove(temp_archive_path)
+            if extract_dir and os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+        else:
+            # Direct ISO upload
+            async with aiofiles.open(filepath, "wb") as out_file:
+                while content := await file.read(1024 * 1024):  # 1MB chunks
+                    await out_file.write(content)
+
+        file_size = os.path.getsize(filepath)
+
+        # Update metadata
+        metadata = {}
+        if os.path.exists(metadata_file):
+            try:
+                with open(metadata_file, "r") as f:
+                    metadata = json.load(f)
+            except:
+                metadata = {}
+
+        metadata[safe_name] = {
+            "name": name,
+            "url": f"uploaded:{file.filename}",
+            "downloaded_at": datetime.utcnow().isoformat(),
+            "extracted_from_archive": is_archive,
+        }
+        with open(metadata_file, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        return {
+            "status": "uploaded",
+            "name": name,
+            "filename": safe_name,
+            "path": filepath,
+            "size_bytes": file_size,
+            "size_gb": round(file_size / (1024**3), 2),
+            "extracted_from_archive": is_archive,
+        }
+    except ValueError as e:
+        # Clean up on failure (e.g., no ISO found in archive)
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        if temp_archive_path and os.path.exists(temp_archive_path):
+            os.remove(temp_archive_path)
+        if extract_dir and os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except Exception as e:
+        # Clean up on failure
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        if temp_archive_path and os.path.exists(temp_archive_path):
+            os.remove(temp_archive_path)
+        if extract_dir and os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload ISO: {str(e)}",
+        ) from e
+
+
+@router.post("/docker-images/upload", status_code=status.HTTP_201_CREATED)
+async def upload_docker_image(
+    file: UploadFile = File(...),
+    current_user: AdminUser = None,
+):
+    """
+    Upload a Docker image tar archive to load into host Docker daemon.
+    Supports: .tar, .tar.gz, .tgz
+    Admin only.
+    """
+    import tempfile
+
+    if not file.filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file provided")
+
+    # Validate file type
+    filename_lower = file.filename.lower()
+    valid_extensions = (".tar", ".tar.gz", ".tgz")
+    if not any(filename_lower.endswith(ext) for ext in valid_extensions):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File must be a Docker image archive ({', '.join(valid_extensions)})",
+        )
+
+    docker = get_docker_service()
+    temp_path = None
+
+    try:
+        # Stream uploaded file to temp file (docker.images.load needs file handle)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tar") as tmp:
+            temp_path = tmp.name
+            while content := await file.read(1024 * 1024):  # 1MB chunks
+                tmp.write(content)
+
+        # Load image into Docker daemon
+        with open(temp_path, "rb") as f:
+            loaded_images = docker.client.images.load(f)
+
+        # Collect info about loaded images
+        image_tags = []
+        total_size = 0
+        for img in loaded_images:
+            image_tags.extend(img.tags or [f"<untagged>:{img.short_id}"])
+            total_size += img.attrs.get("Size", 0)
+
+        logger.info(f"Loaded {len(loaded_images)} Docker image(s): {image_tags}")
+
+        return {
+            "status": "loaded",
+            "images": image_tags,
+            "count": len(loaded_images),
+            "size_bytes": total_size,
+            "size_gb": round(total_size / (1024**3), 2),
+        }
+    except Exception as e:
+        logger.error(f"Failed to load Docker image: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load Docker image: {str(e)}",
+        ) from e
+    finally:
+        # Clean up temp file
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+@router.post("/isos/download/{version}/cancel")
+def cancel_windows_iso_download(
+    version: str,
+    arch: Optional[str] = Query(None, description="Architecture (x86_64 or arm64)"),
+    current_user: AdminUser = None,
+):
+    """Cancel an in-progress Windows ISO download. Admin only."""
+    # Build download key (with arch suffix for ARM64)
+    download_key = f"{version}-{arch}" if arch == "arm64" else version
+
+    if download_key not in _active_downloads:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active download found for '{version}'" + (f" ({arch})" if arch else ""),
+        )
+
+    if _active_downloads[download_key].get("status") != "downloading":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Download for '{version}'"
+            + (f" ({arch})" if arch else "")
+            + f" is not in progress (status: {_active_downloads[download_key].get('status')})",
+        )
+
+    # Mark as cancelled - the download loop will detect this and clean up
+    _active_downloads[download_key]["cancelled"] = True
+    _active_downloads[download_key]["status"] = "cancelled"
+
+    return {
+        "status": "cancelled",
+        "version": version,
+        "arch": arch,
+        "message": f"Download for '{version}'"
+        + (f" ({arch})" if arch else "")
+        + " has been cancelled",
+    }
+
+
+@router.delete("/isos/{version}")
+def delete_windows_iso(
+    version: str,
+    arch: Optional[str] = Query(None, description="Architecture (x86_64 or arm64)"),
+    current_user: AdminUser = None,
+):
+    """Delete a cached Windows ISO. Admin only."""
+    windows_iso_dir = get_windows_iso_dir()
+
+    # Build filename based on architecture
+    if arch == "arm64":
+        filename = f"windows-{version}-arm64.iso"
+        download_key = f"{version}-arm64"
+    else:
+        filename = f"windows-{version}.iso"
+        download_key = version
+
+    filepath = os.path.join(windows_iso_dir, filename)
+
+    # Clear any active download entry for this version
+    if download_key in _active_downloads:
+        del _active_downloads[download_key]
+
+    if not os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"ISO for version '{version}'" + (f" ({arch})" if arch else "") + " not found",
+        )
+
+    try:
+        os.remove(filepath)
+        return {"status": "deleted", "version": version, "arch": arch, "filename": filename}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete ISO: {str(e)}",
+        ) from e
+
+
+@router.get("/isos/upload-info")
+def get_iso_upload_info(current_user: CurrentUser):
+    """Get information about ISO upload locations and requirements."""
+    settings = get_settings()
+    windows_iso_dir = get_windows_iso_dir()
+    return {
+        "windows_iso_dir": windows_iso_dir,
+        "custom_iso_dir": f"{settings.iso_cache_dir}/custom-isos",
+        "instructions": [
+            "ISOs can be uploaded via the web interface or copied directly to the cache directories.",
+            "Windows ISOs should be named to match the version code (e.g., windows-11.iso, windows-2022.iso).",
+            "Custom ISOs can have any name ending in .iso.",
+            "Maximum recommended file size: 10GB per ISO.",
+        ],
+        "supported_versions": [v["version"] for v in DOCKUR_WINDOWS_VERSIONS],
+    }
+
+
+# Windows ISO Download endpoint
+
+
+class WindowsISODownloadRequest(BaseModel):
+    version: str
+    url: Optional[str] = None  # Custom URL, or use default for version
+    arch: Optional[str] = "x86_64"  # x86_64 or arm64
+
+
+class WindowsISODownloadStatusResponse(BaseModel):
+    status: str  # 'downloading', 'completed', 'failed', 'not_found'
+    version: str
+    filename: Optional[str] = None
+    progress_bytes: Optional[int] = None
+    progress_gb: Optional[float] = None
+    total_bytes: Optional[int] = None
+    total_gb: Optional[float] = None
+    error: Optional[str] = None
+
+
+# Track active downloads
+_active_downloads: dict = {}
+
+
+@router.post("/isos/download", status_code=status.HTTP_202_ACCEPTED)
+def download_windows_iso(
+    request: WindowsISODownloadRequest, background_tasks: BackgroundTasks, current_user: AdminUser
+):
+    """
+    Download a Windows ISO from Microsoft or custom URL.
+    Admin only as this downloads large files.
+
+    If no URL is provided, uses the default download URL for the version.
+    Some versions (consumer editions) don't have direct download URLs
+    and require manual download from Microsoft's website.
+
+    Supports both x86_64 and arm64 architectures (arm64 only for Win 10/11).
+    """
+    import os
+
+    arch = request.arch or "x86_64"
+
+    # Handle ARM64 downloads
+    if arch == "arm64":
+        if not has_windows_arm64_support(request.version):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Windows version '{request.version}' is not available for ARM64. "
+                f"ARM64 supported versions: {', '.join(WINDOWS_ARM64_VERSIONS)}",
+            )
+
+        arm64_info = get_windows_arm64_info(request.version)
+        if not arm64_info:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"ARM64 info not found for version '{request.version}'",
+            )
+
+        # Check if ARM64 has a download URL
+        download_urls = []
+        if request.url:
+            download_urls = [request.url]
+        else:
+            arm64_url = arm64_info.get("download_url")
+            if arm64_url:
+                download_urls = [arm64_url]
+
+        if not download_urls:
+            download_note = arm64_info.get(
+                "download_note", "No direct download available for ARM64"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "status": "no_direct_download",
+                    "version": request.version,
+                    "arch": "arm64",
+                    "name": arm64_info["name"],
+                    "message": download_note,
+                    "instructions": "Provide a custom URL or let dockur/windows-arm download at runtime.",
+                },
+            )
+
+        version_info = {
+            "name": arm64_info["name"],
+            "size_gb": arm64_info.get("size_gb", 0),
+        }
+        primary_download_url = download_urls[0]
+
+    else:
+        # x86_64 download (original logic)
+        version_info = None
+        for v in DOCKUR_WINDOWS_VERSIONS:
+            if v["version"] == request.version:
+                version_info = v
+                break
+
+        if not version_info:
+            valid_versions = [v["version"] for v in DOCKUR_WINDOWS_VERSIONS]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid version '{request.version}'. Valid versions: {', '.join(valid_versions)}",
+            )
+
+        # Determine download URLs (support multiple fallbacks)
+        download_urls = []
+        if request.url:
+            download_urls = [request.url]
+        else:
+            # Try download_urls list first, then fall back to single download_url
+            download_urls = version_info.get("download_urls", [])
+            if not download_urls:
+                single_url = version_info.get("download_url")
+                if single_url:
+                    download_urls = [single_url]
+
+        if not download_urls:
+            # No direct download URL available
+            download_page = version_info.get("download_page")
+            download_note = version_info.get("download_note", "No direct download available")
+
+            response = {
+                "status": "no_direct_download",
+                "version": request.version,
+                "name": version_info["name"],
+                "message": download_note,
+            }
+            if download_page:
+                response["download_page"] = download_page
+                response["instructions"] = (
+                    f"Visit {download_page} to download the ISO manually, then upload it."
+                )
+            else:
+                response["instructions"] = "Provide a custom URL or upload the ISO manually."
+
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=response)
+
+        primary_download_url = download_urls[0]
+
+    windows_iso_dir = get_windows_iso_dir()
+    os.makedirs(windows_iso_dir, exist_ok=True)
+
+    # Use architecture-specific filename
+    if arch == "arm64":
+        filename = f"windows-{request.version}-arm64.iso"
+    else:
+        filename = f"windows-{request.version}.iso"
+    filepath = os.path.join(windows_iso_dir, filename)
+
+    # Check if already exists
+    if os.path.exists(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"ISO for version '{request.version}' already exists. Delete it first to re-download.",
+        )
+
+    # Check if already downloading
+    if (
+        request.version in _active_downloads
+        and _active_downloads[request.version].get("status") == "downloading"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Download already in progress for version '{request.version}'",
+        )
+
+    # Start download
+    _active_downloads[request.version] = {
+        "status": "downloading",
+        "filename": filename,
+        "progress_bytes": 0,
+        "total_bytes": None,
+        "error": None,
+    }
+
+    def download_iso(urls: list, dest_path: str, version: str):
+        """Download ISO in background with progress tracking and fallback URL support."""
+        import requests
+        import time
+
+        last_error = None
+
+        for url_index, url in enumerate(urls):
+            try:
+                # Update status with current URL being tried
+                if url_index > 0:
+                    _active_downloads[version]["fallback_attempt"] = url_index + 1
+                    _active_downloads[version]["progress_bytes"] = 0
+
+                # Use streaming download with progress
+                response = requests.get(url, stream=True, timeout=3600, allow_redirects=True)
+                response.raise_for_status()
+
+                # Get total size if available
+                total_size = response.headers.get("content-length")
+                if total_size:
+                    total_size = int(total_size)
+                    _active_downloads[version]["total_bytes"] = total_size
+
+                # Download with progress tracking
+                downloaded = 0
+                with open(dest_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                        # Check if download was cancelled
+                        if version not in _active_downloads or _active_downloads[version].get(
+                            "cancelled"
+                        ):
+                            if os.path.exists(dest_path):
+                                os.remove(dest_path)
+                            if version in _active_downloads:
+                                del _active_downloads[version]
+                            return
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            _active_downloads[version]["progress_bytes"] = downloaded
+
+                _active_downloads[version]["status"] = "completed"
+                _active_downloads[version]["progress_bytes"] = os.path.getsize(dest_path)
+
+                # Clear from active downloads after a delay (allow frontend to see completion)
+                time.sleep(3)
+                if version in _active_downloads:
+                    del _active_downloads[version]
+                return  # Success!
+
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                # Clean up partial download before trying next URL
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+
+                # Only try next URL for 403/404 errors
+                if e.response is not None and e.response.status_code in [403, 404]:
+                    if url_index < len(urls) - 1:
+                        # More URLs to try
+                        continue
+                # For other HTTP errors or no more URLs, fail
+                raise
+
+            except Exception as e:
+                last_error = e
+                # Clean up partial download
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+                # Try next URL
+                if url_index < len(urls) - 1:
+                    continue
+                raise
+
+        # All URLs failed
+        if version in _active_downloads:
+            _active_downloads[version]["status"] = "failed"
+            _active_downloads[version][
+                "error"
+            ] = f"All download mirrors failed. Last error: {last_error}"
+            # Clear failed downloads after a delay
+            time.sleep(5)
+            if version in _active_downloads:
+                del _active_downloads[version]
+
+    background_tasks.add_task(download_iso, download_urls, filepath, request.version)
+
+    return {
+        "status": "downloading",
+        "version": request.version,
+        "name": version_info["name"],
+        "filename": filename,
+        "destination": filepath,
+        "source_url": primary_download_url,
+        "expected_size_gb": version_info.get("size_gb"),
+        "message": f"Downloading {version_info['name']} ISO...",
+    }
+
+
+@router.get("/isos/download/{version}/status")
+def get_windows_iso_download_status(version: str, current_user: CurrentUser):
+    """Check the status of a Windows ISO download."""
+    windows_iso_dir = get_windows_iso_dir()
+    filename = f"windows-{version}.iso"
+    filepath = os.path.join(windows_iso_dir, filename)
+
+    # IMPORTANT: Check active downloads FIRST (file exists during download)
+    if version in _active_downloads:
+        info = _active_downloads[version]
+        response = {
+            "status": info["status"],
+            "version": version,
+            "filename": info.get("filename"),
+        }
+
+        if info.get("progress_bytes") is not None:
+            response["progress_bytes"] = info["progress_bytes"]
+            response["progress_gb"] = round(info["progress_bytes"] / (1024**3), 2)
+
+        if info.get("total_bytes") is not None:
+            response["total_bytes"] = info["total_bytes"]
+            response["total_gb"] = round(info["total_bytes"] / (1024**3), 2)
+            if info["progress_bytes"]:
+                response["progress_percent"] = round(
+                    info["progress_bytes"] / info["total_bytes"] * 100, 1
+                )
+
+        if info.get("error"):
+            response["error"] = info["error"]
+
+        return response
+
+    # Only check file if NOT in active downloads (truly completed)
+    if os.path.exists(filepath):
+        size = os.path.getsize(filepath)
+        return {
+            "status": "completed",
+            "version": version,
+            "filename": filename,
+            "path": filepath,
+            "size_bytes": size,
+            "size_gb": round(size / (1024**3), 2),
+        }
+
+    return {
+        "status": "not_found",
+        "version": version,
+        "message": "No download in progress and ISO not found in cache",
+    }

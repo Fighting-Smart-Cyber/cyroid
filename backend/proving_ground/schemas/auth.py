@@ -1,0 +1,17 @@
+# backend/proving_ground/schemas/auth.py
+from pydantic import BaseModel
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    password_reset_required: bool = False
+
+
+class PasswordChangeResponse(BaseModel):
+    message: str

@@ -1,0 +1,129 @@
+# docker-compose.prod.yml
+#
+# Production overrides for PROVING GROUND deployment
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Or use the deploy script:
+#   ./scripts/deploy.sh
+#
+# Key differences from development:
+# - Uses environment variables from .env.prod for secrets
+# - Restart policies for reliability
+# - Production Traefik config with HTTPS redirect
+# - No debug mode
+# - Secure database credentials
+
+services:
+  db:
+    image: ghcr.io/jongodb/cyroid-db:${VERSION:-latest}
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    restart: always
+    # Inherit port bindings from base compose (internal services accessible via Docker network)
+    # Note: localhost-only bindings (127.0.0.1:port) cause issues on Docker Desktop macOS
+
+  redis:
+    image: ghcr.io/jongodb/cyroid-redis:${VERSION:-latest}
+    restart: always
+    # Inherit port bindings from base compose (internal services accessible via Docker network)
+
+  minio:
+    image: ghcr.io/jongodb/cyroid-storage:${VERSION:-latest}
+    environment:
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    restart: always
+    # Inherit port bindings from base compose (internal services accessible via Docker network)
+
+  api:
+    image: ghcr.io/jongodb/cyroid-api:${VERSION:-latest}
+    environment:
+      DATABASE_URL: postgresql://proving_ground:${POSTGRES_PASSWORD}@172.30.0.11:5432/proving_ground
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      DEBUG: "false"
+      CORS_ORIGINS: "*"
+      # Use production data directory
+      ISO_CACHE_DIR: ${PROVING_GROUND_DATA_DIR}/iso-cache
+      TEMPLATE_STORAGE_DIR: ${PROVING_GROUND_DATA_DIR}/template-storage
+      VM_STORAGE_DIR: ${PROVING_GROUND_DATA_DIR}/vm-storage
+      GLOBAL_SHARED_DIR: ${PROVING_GROUND_DATA_DIR}/shared
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PROVING_GROUND_DATA_DIR}/iso-cache:${PROVING_GROUND_DATA_DIR}/iso-cache
+      - ${PROVING_GROUND_DATA_DIR}/template-storage:${PROVING_GROUND_DATA_DIR}/template-storage
+      - ${PROVING_GROUND_DATA_DIR}/vm-storage:${PROVING_GROUND_DATA_DIR}/vm-storage
+      - ${PROVING_GROUND_DATA_DIR}/shared:${PROVING_GROUND_DATA_DIR}/shared
+      - ${PROVING_GROUND_DATA_DIR}/catalogs:${PROVING_GROUND_DATA_DIR}/catalogs
+      # Runtime directories for catalog-installed content
+      - ${PROVING_GROUND_DATA_DIR}/scenarios:/data/scenarios
+      - ${PROVING_GROUND_DATA_DIR}/images:/data/images
+      - ./traefik/dynamic:/app/traefik/dynamic
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)\" || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      # Add TLS configuration for Let's Encrypt (when SSL_MODE=letsencrypt)
+      - "traefik.http.routers.api-secure.tls.certresolver=${SSL_RESOLVER:-}"
+      - "traefik.http.routers.ws-secure.tls.certresolver=${SSL_RESOLVER:-}"
+
+  worker:
+    image: ghcr.io/jongodb/cyroid-worker:${VERSION:-latest}
+    environment:
+      DATABASE_URL: postgresql://proving_ground:${POSTGRES_PASSWORD}@172.30.0.11:5432/proving_ground
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      DEBUG: "false"
+      ISO_CACHE_DIR: ${PROVING_GROUND_DATA_DIR}/iso-cache
+      TEMPLATE_STORAGE_DIR: ${PROVING_GROUND_DATA_DIR}/template-storage
+      VM_STORAGE_DIR: ${PROVING_GROUND_DATA_DIR}/vm-storage
+      GLOBAL_SHARED_DIR: ${PROVING_GROUND_DATA_DIR}/shared
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PROVING_GROUND_DATA_DIR}/iso-cache:${PROVING_GROUND_DATA_DIR}/iso-cache
+      - ${PROVING_GROUND_DATA_DIR}/template-storage:${PROVING_GROUND_DATA_DIR}/template-storage
+      - ${PROVING_GROUND_DATA_DIR}/vm-storage:${PROVING_GROUND_DATA_DIR}/vm-storage
+      - ${PROVING_GROUND_DATA_DIR}/shared:${PROVING_GROUND_DATA_DIR}/shared
+      - ${PROVING_GROUND_DATA_DIR}/catalogs:${PROVING_GROUND_DATA_DIR}/catalogs
+      # Runtime directories for catalog-installed content
+      - ${PROVING_GROUND_DATA_DIR}/scenarios:/data/scenarios
+      - ${PROVING_GROUND_DATA_DIR}/images:/data/images
+      - ./traefik/dynamic:/app/traefik/dynamic
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if any('dramatiq' in open(f'/proc/{p}/cmdline').read() for p in os.listdir('/proc') if p.isdigit() and os.path.exists(f'/proc/{p}/cmdline')) else 1)\""]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    image: ghcr.io/jongodb/cyroid-frontend:${VERSION:-latest}
+    restart: always
+    labels:
+      # Add TLS configuration for Let's Encrypt
+      - "traefik.http.routers.frontend-secure.tls.certresolver=${SSL_RESOLVER:-}"
+
+  traefik:
+    image: ghcr.io/jongodb/cyroid-proxy:${VERSION:-latest}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./traefik-prod.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic
+      - ./certs:/etc/traefik/certs:ro
+      # ACME certificate storage (persisted for Let's Encrypt)
+      - ./acme:/etc/traefik/acme
+      - traefik-logs:/var/log/traefik
+    restart: always
+    # Only expose HTTP/HTTPS in production (no dashboard)
+    ports:
+      - "80:80"
+      - "443:443"
+
+volumes:
+  traefik-logs:

@@ -1,0 +1,350 @@
+# docker-compose.yml
+#
+# PROVING GROUND Docker Compose Configuration (Production)
+#
+# For development with local builds and hot-reload, use with docker-compose.override.yml:
+#   docker-compose up
+#
+# For production with pre-built GHCR images:
+#   docker-compose -f docker-compose.yml up
+#
+# Networks:
+#   - pg-mgmt (172.30.0.0/24): PROVING GROUND infrastructure services
+#   - pg-ranges (172.30.1.0/24): Range DinD containers
+#
+
+# Compose project name: pg (renamed from the default "proving-ground" directory-derived
+# name). This determines container name prefixes, locally-built image tags, and
+# named volume names.
+name: pg
+services:
+  db:
+    image: ghcr.io/jongodb/cyroid-db:latest
+    environment:
+      POSTGRES_USER: proving_ground
+      POSTGRES_PASSWORD: proving_ground
+      POSTGRES_DB: proving_ground
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Loopback only. Docker publishes to 0.0.0.0 by default and writes its
+      # own iptables rules, which bypass ufw -- so a host firewall does not
+      # reliably cover a published port. Nothing outside this host needs
+      # Postgres: the services reach it over the pg-mgmt network, not here.
+      - "127.0.0.1:5432:5432"
+    networks:
+      pg-mgmt:
+        ipv4_address: 172.30.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proving_ground"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: ghcr.io/jongodb/cyroid-redis:latest
+    ports:
+      # Loopback only -- see the note on the db service. Redis has no
+      # authentication configured, so a published port is an open database.
+      - "127.0.0.1:6379:6379"
+    networks:
+      pg-mgmt:
+        ipv4_address: 172.30.0.12
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: ghcr.io/jongodb/cyroid-storage:latest
+    environment:
+      MINIO_ROOT_USER: proving_ground
+      MINIO_ROOT_PASSWORD: proving_ground123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      # Loopback only. The API reaches MinIO over pg-mgmt; the console on
+      # 9001 is an operator tool, reachable through an SSH tunnel when it
+      # is wanted.
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    networks:
+      pg-mgmt:
+        ipv4_address: 172.30.0.13
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    image: ghcr.io/jongodb/cyroid-api:latest
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)\" || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    environment:
+      DATABASE_URL: postgresql://proving_ground:proving_ground@172.30.0.11:5432/proving_ground
+      REDIS_URL: redis://172.30.0.12:6379/0
+      MINIO_ENDPOINT: 172.30.0.13:9000
+      MINIO_ACCESS_KEY: proving_ground
+      MINIO_SECRET_KEY: proving_ground123
+      ISO_CACHE_DIR: ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache
+      TEMPLATE_STORAGE_DIR: ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage
+      VM_STORAGE_DIR: ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage
+      GLOBAL_SHARED_DIR: ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared
+      # DinD Configuration (all ranges run in isolated DinD containers)
+      DIND_IMAGE: ${DIND_IMAGE:-ghcr.io/jongodb/cyroid-dind:latest}
+      DIND_STARTUP_TIMEOUT: ${DIND_STARTUP_TIMEOUT:-60}
+      DIND_DOCKER_PORT: ${DIND_DOCKER_PORT:-2375}
+      # Per-range DinD caps. A guest sized AT the memory cap OOM-kills the DinD
+      # dockerd and takes the whole range down, so leave headroom above the
+      # guest. Under TCG emulation the CPU cap is the binding constraint --
+      # a 10-vCPU guest inside a 4.0 cap is still only worth four cores.
+      RANGE_DEFAULT_MEMORY: ${RANGE_DEFAULT_MEMORY:-8g}
+      RANGE_DEFAULT_CPU: ${RANGE_DEFAULT_CPU:-4.0}
+      PROVING_GROUND_MGMT_NETWORK: pg-mgmt
+      PROVING_GROUND_MGMT_SUBNET: 172.30.0.0/24
+      PROVING_GROUND_RANGES_NETWORK: pg-ranges
+      PROVING_GROUND_RANGES_SUBNET: 172.30.1.0/24
+      # Traefik dynamic config directory (shared with Traefik for DinD VNC routing)
+      TRAEFIK_VNC_ROUTES_DIR: /app/traefik/dynamic
+    volumes:
+      # Mount Docker socket to manage DinD containers on host
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Use bind mounts so spawned VM containers can access these paths
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/catalogs:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/catalogs
+      # Runtime directories for catalog-installed content
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/scenarios:/data/scenarios
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/images:/data/images
+      # Shared directory for Traefik dynamic config (VNC routes)
+      - ./traefik/dynamic:/app/traefik/dynamic
+    expose:
+      - "8000"
+    networks:
+      pg-mgmt:
+        ipv4_address: 172.30.0.10
+      pg-ranges:  # Needs access to range DinD containers
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: bash -c "until python -c \"import psycopg2; psycopg2.connect('$${DATABASE_URL}')\" 2>/dev/null; do echo 'Waiting for database...'; sleep 2; done && alembic upgrade head && uvicorn proving_ground.main:app --host 0.0.0.0 --port 8000 --workers 4"
+    labels:
+      - "traefik.enable=true"
+      # API service
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+      # HTTP router for /api
+      - "traefik.http.routers.api.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.api.entrypoints=web"
+      - "traefik.http.routers.api.service=api"
+      # HTTPS router for /api
+      - "traefik.http.routers.api-secure.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.api-secure.entrypoints=websecure"
+      - "traefik.http.routers.api-secure.tls=true"
+      - "traefik.http.routers.api-secure.service=api"
+      # HTTP router for /ws (WebSocket endpoints for console, VNC proxy, etc.)
+      - "traefik.http.routers.ws.rule=PathPrefix(`/ws`)"
+      - "traefik.http.routers.ws.entrypoints=web"
+      - "traefik.http.routers.ws.service=api"
+      # HTTPS router for /ws
+      - "traefik.http.routers.ws-secure.rule=PathPrefix(`/ws`)"
+      - "traefik.http.routers.ws-secure.entrypoints=websecure"
+      - "traefik.http.routers.ws-secure.tls=true"
+      - "traefik.http.routers.ws-secure.service=api"
+
+  worker: &worker_base
+    image: ghcr.io/jongodb/cyroid-worker:latest
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if any('dramatiq' in open(f'/proc/{p}/cmdline').read() for p in os.listdir('/proc') if p.isdigit() and os.path.exists(f'/proc/{p}/cmdline')) else 1)\""]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    environment:
+      DATABASE_URL: postgresql://proving_ground:proving_ground@172.30.0.11:5432/proving_ground
+      REDIS_URL: redis://172.30.0.12:6379/0
+      MINIO_ENDPOINT: 172.30.0.13:9000
+      MINIO_ACCESS_KEY: proving_ground
+      MINIO_SECRET_KEY: proving_ground123
+      ISO_CACHE_DIR: ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache
+      TEMPLATE_STORAGE_DIR: ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage
+      VM_STORAGE_DIR: ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage
+      GLOBAL_SHARED_DIR: ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared
+      # DinD Configuration (all ranges run in isolated DinD containers)
+      DIND_IMAGE: ${DIND_IMAGE:-ghcr.io/jongodb/cyroid-dind:latest}
+      DIND_STARTUP_TIMEOUT: ${DIND_STARTUP_TIMEOUT:-60}
+      DIND_DOCKER_PORT: ${DIND_DOCKER_PORT:-2375}
+      # Per-range DinD caps. A guest sized AT the memory cap OOM-kills the DinD
+      # dockerd and takes the whole range down, so leave headroom above the
+      # guest. Under TCG emulation the CPU cap is the binding constraint --
+      # a 10-vCPU guest inside a 4.0 cap is still only worth four cores.
+      RANGE_DEFAULT_MEMORY: ${RANGE_DEFAULT_MEMORY:-8g}
+      RANGE_DEFAULT_CPU: ${RANGE_DEFAULT_CPU:-4.0}
+      PROVING_GROUND_MGMT_NETWORK: pg-mgmt
+      PROVING_GROUND_MGMT_SUBNET: 172.30.0.0/24
+      PROVING_GROUND_RANGES_NETWORK: pg-ranges
+      PROVING_GROUND_RANGES_SUBNET: 172.30.1.0/24
+      # Traefik dynamic config directory (shared with Traefik for DinD VNC routing)
+      TRAEFIK_VNC_ROUTES_DIR: /app/traefik/dynamic
+    volumes:
+      # Mount Docker socket to manage DinD containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Use bind mounts so spawned VM containers can access these paths
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/catalogs:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/catalogs
+      # Runtime directories for catalog-installed content
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/scenarios:/data/scenarios
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/images:/data/images
+      # Shared directory for Traefik dynamic config (VNC routes)
+      - ./traefik/dynamic:/app/traefik/dynamic
+    networks:
+      pg-mgmt:
+        ipv4_address: 172.30.0.15
+      pg-ranges:  # Needs access to range DinD containers
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: bash -c "until python -c \"import psycopg2; psycopg2.connect('$${DATABASE_URL}')\" 2>/dev/null; do echo 'Waiting for database...'; sleep 2; done && dramatiq proving_ground.tasks --processes 4 --threads 8 --queues default"
+
+  # Range deploys ONLY. Inherits the worker service wholesale via a YAML merge
+  # key, overriding just the command and the network block. Two reasons:
+  #  - the two services were ~50 lines of duplicated env, volumes and mounts,
+  #    which had already drifted once (a stale /data/cyroid path);
+  #  - it avoids a second `image:` reference to the SAME image, which the
+  #    guard:image-pinning ratchet counts as a new unpinned reference.
+  #
+  # The thread count IS the concurrency limit - see the rationale above the
+  # command for the measurements behind the chosen value.
+  # Range deploys and pool refill. The thread count IS the concurrency limit.
+  #
+  # Re-measured 2026-08-27 after EBS throughput was raised on the host. The
+  # original cap of 3 assumed a 110-140 MB/s disk ceiling at 99.8% utilisation,
+  # where 4 concurrent deploys each took 175s. That ceiling is gone: the same
+  # 4-concurrent test now runs 58.8s each, and the constraint is mixed disk/CPU
+  # rather than pure disk (at 6 concurrent: disk 49% avg utilisation, queue
+  # 10.7, w_await 3.2ms; CPU peaking 97% busy).
+  #
+  # Measured scaling, boot+pull per range (solo pull was 38.4s):
+  #   4 concurrent -> 58.8s each   pull 42.1s   ~10% over solo
+  #   6 concurrent -> 77.2s each   pull 60.1s   throughput plateau
+  #   8 concurrent -> 101.4s each  pull 83.5s   throughput flat, latency up
+  #
+  # 6 sits at the plateau (~0.078 ranges/s). Latency matters less than it did:
+  # the warm pool means a user rarely waits on a deploy, and refill is
+  # background work. Drop to 4 if per-deploy latency becomes the priority.
+  worker-deploy:
+    <<: *worker_base
+    # No static ipv4_address: nothing connects TO a worker (it is a pure
+    # Redis/Docker-socket/DB client), and reusing worker's would collide.
+    networks:
+      pg-mgmt:
+      pg-ranges:
+    command: bash -c "until python -c \"import psycopg2; psycopg2.connect('$${DATABASE_URL}')\" 2>/dev/null; do echo 'Waiting for database...'; sleep 2; done && dramatiq proving_ground.tasks --processes 1 --threads 6 --queues deploys pool"
+
+  registry:
+    image: registry:2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5000:5000"  # Expose on localhost for host Docker to push images
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/registry:/var/lib/registry
+      - ./config/registry-config.yml:/etc/docker/registry/config.yml:ro
+    networks:
+      pg-mgmt:
+        ipv4_address: 172.30.0.16
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5000/v2/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    image: ghcr.io/jongodb/cyroid-frontend:latest
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    expose:
+      - "80"
+    networks:
+      pg-mgmt:
+        ipv4_address: 172.30.0.20
+    labels:
+      - "traefik.enable=true"
+      # Frontend service (production uses nginx on port 80)
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+      # HTTP router (lowest priority, catch-all)
+      - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend.entrypoints=web"
+      - "traefik.http.routers.frontend.priority=1"
+      - "traefik.http.routers.frontend.service=frontend"
+      # HTTPS router (lowest priority, catch-all)
+      - "traefik.http.routers.frontend-secure.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend-secure.entrypoints=websecure"
+      - "traefik.http.routers.frontend-secure.tls=true"
+      - "traefik.http.routers.frontend-secure.priority=1"
+      - "traefik.http.routers.frontend-secure.service=frontend"
+
+  traefik:
+    image: ghcr.io/jongodb/cyroid-proxy:latest
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    # Use static config file instead of command line args
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      # Dynamic config directory (base.yml + VNC routes written by API)
+      - ./traefik/dynamic:/etc/traefik/dynamic
+      - ./certs:/etc/traefik/certs:ro
+      # Access logs. On the host so they survive a container recreate -- a log
+      # that only exists inside the container is gone exactly when it is needed.
+      - ./traefik/logs:/var/log/traefik
+    ports:
+      # 80 and 443 are the product; they stay public.
+      - "80:80"
+      - "443:443"
+      # The internal entrypoint: /ping for the healthcheck and, since
+      # api.insecure went false, /dashboard/ too. Loopback only -- reach
+      # it through an SSH tunnel:
+      #   ssh -L 8082:127.0.0.1:8082 pg-ec2
+      - "127.0.0.1:8082:8082"
+    networks:
+      pg-mgmt:
+        ipv4_address: 172.30.0.14
+      pg-ranges:  # Needs to route to range DinD containers for VNC
+
+# Network definitions (external - created by scripts/init-networks.sh)
+networks:
+  # Network for PROVING GROUND infrastructure services
+  pg-mgmt:
+    external: true
+
+  # Network for range DinD containers
+  pg-ranges:
+    external: true
+
+volumes:
+  postgres_data:
+  minio_data:
+  frontend_node_modules:

@@ -1,0 +1,37 @@
+# Backend tooling configuration.
+#
+# This file exists because there was none: no pytest config, no lint config, and
+# nothing in CI enforcing either. `CICD-1` adds the gates; this gives them
+# something to read.
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+# Deliberately narrow to start. The codebase has never been linted, so a wide
+# rule set produces thousands of findings and the gate gets switched off within
+# a week. Start with the rules that catch real defects, widen once green.
+select = [
+    "E9",   # syntax / IO errors
+    "F",    # pyflakes — undefined names, unused imports, f-string bugs
+    "B",    # bugbear — mutable defaults, unused loop vars, except-pass
+]
+ignore = [
+    "B008",  # function call in argument default — FastAPI Depends() idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401", "F811"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Two files under tests/ are `print()`-driven __main__ scripts against a live
+# server rather than pytest modules. They are excluded until rewritten.
+addopts = "--ignore=tests/test_live_multi_range.py --ignore=tests/test_multi_range_isolation.py"
+asyncio_mode = "auto"

@@ -1,0 +1,42 @@
+# Serve the frontend the way it is meant to be served in front of real users:
+# a Vite production build behind nginx, not the dev server.
+#
+# The dev server is a development tool. It transforms modules on request, which
+# is why a stray request for a directory produced an internal server error
+# overlay, and why path-traversal probes (/etc/passwd, /proc/self/environ) reach
+# a module resolver at all rather than a static file server. Vite's allow list
+# refused all 27 of them, but the right answer to "is the dev server's file
+# access safe enough to expose" is not to keep testing it.
+#
+# Apply LAST, after the dev overlay, when the host faces anyone but a developer:
+#
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.dev.yml \
+#                  -f docker-compose.override.yml \
+#                  -f docker-compose.serve.yml up -d --build
+#
+# It deliberately keeps the dev overlay's api and worker settings, so the
+# backend still builds from local source. Only the frontend changes.
+#
+# Two leftovers from the dev overlay are harmless and not worth fighting
+# Compose's merge rules over: `volumes` and `expose` concatenate rather than
+# replace, so the nginx container still carries a /app bind mount it never
+# reads and an exposed 5173 nothing listens on. `labels` and `healthcheck` are
+# maps, so those do get replaced.
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    image: pg-frontend-serve:latest
+    # nginx serves the built assets from /usr/share/nginx/html; no source, no
+    # watcher, no module transformation at request time.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"

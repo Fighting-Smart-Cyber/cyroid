@@ -1,0 +1,106 @@
+# docker-compose.dev.yml
+#
+# Development configuration for PROVING GROUND
+#
+# This file provides local builds and hot-reload for development.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+#   docker-compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Or copy to docker-compose.override.yml for automatic loading:
+#   cp docker-compose.dev.yml docker-compose.override.yml
+#   docker-compose up
+#
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: pg-api:latest
+    environment:
+      # Unset APP_VERSION so it reads from mounted VERSION file
+      APP_VERSION: ""
+      # Use GHCR DinD image (same as production)
+      DIND_IMAGE: ${DIND_IMAGE:-ghcr.io/jongodb/cyroid-dind:latest}
+    volumes:
+      # Mount source code for hot-reload
+      - ./backend:/app
+      # Mount VERSION file for version display (separate path to avoid conflict)
+      - ./VERSION:/etc/proving-ground-version:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/catalogs:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/catalogs
+      # Runtime directories for catalog-installed content
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/scenarios:/data/scenarios
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/images:/data/images
+      - ./traefik/dynamic:/app/traefik/dynamic
+    # Enable hot-reload in development
+    command: bash -c "alembic upgrade head && uvicorn proving_ground.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  worker: &dev_worker
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: pg-worker:latest
+    environment:
+      # Unset APP_VERSION so it reads from mounted VERSION file
+      APP_VERSION: ""
+      # Use GHCR DinD image (same as production)
+      DIND_IMAGE: ${DIND_IMAGE:-ghcr.io/jongodb/cyroid-dind:latest}
+      # Traefik dynamic config directory (shared with Traefik for DinD VNC routing)
+      TRAEFIK_VNC_ROUTES_DIR: /app/traefik/dynamic
+    volumes:
+      # Mount source code for hot-reload
+      - ./backend:/app
+      # Mount VERSION file for version display (separate path to avoid conflict)
+      - ./VERSION:/etc/proving-ground-version:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/iso-cache
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/template-storage
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/vm-storage
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/shared
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/catalogs:${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/catalogs
+      # Runtime directories for catalog-installed content
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/scenarios:/data/scenarios
+      - ${PROVING_GROUND_DATA_DIR:-/data/proving-ground}/images:/data/images
+      # Shared directory for Traefik dynamic config (VNC routes)
+      - ./traefik/dynamic:/app/traefik/dynamic
+
+  # worker-deploy inherits worker via a YAML merge key in the BASE compose
+  # file, but anchors resolve within a single file - that inheritance does NOT
+  # carry this dev override across. Without re-stating it here, worker would
+  # run the locally built image while worker-deploy silently stayed on the
+  # published one.
+  #
+  # Anchored off the dev worker rather than repeating build/image, so the two
+  # cannot drift and no second literal `image:` reference is added (the
+  # guard:image-pinning ratchet counts those).
+  worker-deploy:
+    <<: *dev_worker
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    image: pg-frontend:latest
+    expose:
+      - "5173"
+    volumes:
+      # Mount source code for hot-reload
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    # Override healthcheck for dev (Vite on 5173, not nginx on 80)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5173/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    labels:
+      # Override port for development (Vite dev server on 5173)
+      - "traefik.http.services.frontend.loadbalancer.server.port=5173"

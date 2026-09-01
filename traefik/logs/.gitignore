@@ -1,0 +1,3 @@
+# Traefik access logs land here. Kept out of git; the directory must exist
+# because the compose file bind-mounts it.
+*.log

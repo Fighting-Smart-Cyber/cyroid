@@ -1,0 +1,6095 @@
+#!/bin/bash
+# PROVING GROUND Production Deployment Script
+#
+# Full TUI for deploying and managing PROVING GROUND in production.
+# Uses 'gum' for beautiful terminal interfaces (auto-installs on macOS).
+#
+# This script works TWO ways:
+#   1. From git clone: git clone https://github.com/JongoDB/PROVING GROUND && cd PROVING GROUND && ./scripts/deploy.sh
+#   2. Standalone:     curl -fsSL https://raw.githubusercontent.com/JongoDB/PROVING GROUND/master/scripts/deploy.sh -o deploy.sh && bash deploy.sh
+#
+# Usage:
+#   ./scripts/deploy.sh                                    # Interactive TUI setup
+#   ./scripts/deploy.sh --domain example.com              # Domain with Let's Encrypt
+#   ./scripts/deploy.sh --ip 192.168.1.100                # IP with self-signed cert
+#   ./scripts/deploy.sh --update                          # Update (choose version)
+#   ./scripts/deploy.sh --update --version v0.30.0        # Update to specific version
+#   ./scripts/deploy.sh --start                           # Start stopped deployment
+#   ./scripts/deploy.sh --stop                            # Stop all services
+#   ./scripts/deploy.sh --restart                         # Restart all services
+#   ./scripts/deploy.sh --status                          # Show service status
+#   ./scripts/deploy.sh --backup [name]                   # Backup Docker images
+#   ./scripts/deploy.sh --restore [name]                  # Restore Docker images
+#   ./scripts/deploy.sh --self-update                     # Update deploy.sh itself
+#
+# Options:
+#   --domain DOMAIN    Domain name for the server
+#   --ip IP            IP address for the server
+#   --email EMAIL      Email for Let's Encrypt (optional with --domain)
+#   --ssl MODE         SSL mode: letsencrypt, selfsigned, manual (default: auto)
+#   --version VER      PROVING GROUND version to deploy/update to (default: interactive)
+#   --update           Update deployment (interactive version selection)
+#   --start            Start a stopped deployment
+#   --stop             Stop all services
+#   --restart          Stop and start all services
+#   --status           Show service status and health
+#   --backup [NAME]    Backup Docker images to disk (optional name)
+#   --restore [NAME]   Restore Docker images from backup (optional name)
+#   --self-update      Update this script to the latest version
+#   --help             Show this help message
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
+
+# Get script directory and project root
+# Handle both normal execution and piped execution (curl | bash)
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]:-}" != "/dev/stdin" ] && [ -f "${BASH_SOURCE[0]:-}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    # Check if script is in a "scripts/" subdirectory (standard repo layout)
+    PARENT_DIR="$(dirname "$SCRIPT_DIR")"
+    SCRIPT_BASENAME="$(basename "$SCRIPT_DIR")"
+
+    if [ "$SCRIPT_BASENAME" = "scripts" ] && [ -f "$PARENT_DIR/docker-compose.yml" ]; then
+        # Script is at PROJECT_ROOT/scripts/deploy.sh
+        PROJECT_ROOT="$PARENT_DIR"
+    elif [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
+        # Script is at PROJECT_ROOT/deploy.sh (same dir has docker-compose.yml)
+        PROJECT_ROOT="$SCRIPT_DIR"
+    else
+        # Standalone mode - script dir becomes project root, will bootstrap files
+        PROJECT_ROOT="$SCRIPT_DIR"
+    fi
+else
+    # Running via curl | bash or similar - use current directory or home
+    if [ -f "./docker-compose.yml" ]; then
+        PROJECT_ROOT="$(pwd)"
+    else
+        PROJECT_ROOT="$HOME/proving_ground"
+    fi
+    SCRIPT_DIR="$PROJECT_ROOT/scripts"
+fi
+ENV_FILE="$PROJECT_ROOT/.env.prod"
+
+# Default values
+DOMAIN=""
+IP=""
+EMAIL=""
+SSL_MODE=""
+VERSION="latest"
+ACTION="deploy"
+DATA_DIR=""  # Set after OS detection
+BACKUP_NAME=""  # For --backup/--restore
+
+# Admin user credentials (set during create_initial_admin)
+ADMIN_USERNAME=""
+ADMIN_EMAIL=""
+ADMIN_PASSWORD=""
+
+# CLI flags for non-interactive mode
+NON_INTERACTIVE=false
+CLI_ADMIN_USER=""
+CLI_ADMIN_PASSWORD=""
+CLI_ADMIN_EMAIL=""
+
+# GitHub repository for downloading files
+GITHUB_REPO="JongoDB/PROVING GROUND"
+GITHUB_BRANCH="master"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}"
+
+# Script version for self-update mechanism
+# Format: YYYYMMDD.N where N is revision number for same day
+SCRIPT_VERSION="20260202.1"
+
+# =============================================================================
+# Platform Detection (for multi-arch image pulls)
+# =============================================================================
+
+detect_platform() {
+    local arch
+    arch=$(uname -m)
+
+    case "$arch" in
+        x86_64|amd64)
+            DOCKER_PLATFORM="linux/amd64"
+            ;;
+        arm64|aarch64)
+            DOCKER_PLATFORM="linux/arm64"
+            ;;
+        *)
+            echo -e "${YELLOW}[WARN]${NC} Unknown architecture: $arch - defaulting to linux/amd64"
+            DOCKER_PLATFORM="linux/amd64"
+            ;;
+    esac
+
+    # Export for docker compose and docker pull
+    export DOCKER_DEFAULT_PLATFORM="$DOCKER_PLATFORM"
+}
+
+# Detect platform immediately
+detect_platform
+
+# =============================================================================
+# Bootstrap Functions (for standalone script mode)
+# =============================================================================
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+    local desc="${3:-file}"
+
+    mkdir -p "$(dirname "$dest")"
+
+    if command -v curl &> /dev/null; then
+        if curl -fsSL "$url" -o "$dest" 2>/dev/null; then
+            return 0
+        fi
+    elif command -v wget &> /dev/null; then
+        if wget -q "$url" -O "$dest" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    echo -e "${RED}[ERROR]${NC} Failed to download $desc"
+    return 1
+}
+
+bootstrap_standalone() {
+    # Check if we're in a proper PROVING GROUND directory with required files
+    # If not, download them from GitHub
+
+    local missing_files=()
+
+    # Check for required compose files
+    if [ ! -f "$PROJECT_ROOT/docker-compose.yml" ]; then
+        missing_files+=("docker-compose.yml")
+    fi
+    if [ ! -f "$PROJECT_ROOT/docker-compose.prod.yml" ]; then
+        missing_files+=("docker-compose.prod.yml")
+    fi
+
+    # If no files are missing, we're in a proper repo - continue normally
+    if [ ${#missing_files[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo -e "${CYAN}"
+    echo "  ██████╗██╗   ██╗██████╗  ██████╗ ██╗██████╗ "
+    echo " ██╔════╝╚██╗ ██╔╝██╔══██╗██╔═══██╗██║██╔══██╗"
+    echo " ██║      ╚████╔╝ ██████╔╝██║   ██║██║██║  ██║"
+    echo " ██║       ╚██╔╝  ██╔══██╗██║   ██║██║██║  ██║"
+    echo " ╚██████╗   ██║   ██║  ██║╚██████╔╝██║██████╔╝"
+    echo "  ╚═════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝╚═════╝ "
+    echo -e "${NC}"
+    echo -e "${BOLD}Cyber Range Orchestrator In Docker${NC}"
+    echo ""
+    echo -e "${YELLOW}Standalone mode detected - downloading required files...${NC}"
+    echo ""
+
+    # Check for curl or wget
+    if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then
+        echo -e "${RED}[ERROR]${NC} Neither curl nor wget found. Please install one of them."
+        exit 1
+    fi
+
+    # Create PROVING GROUND directory if running from arbitrary location
+    if [ ! -d "$PROJECT_ROOT" ] || [ "$PROJECT_ROOT" = "/" ]; then
+        PROJECT_ROOT="$HOME/proving_ground"
+        SCRIPT_DIR="$PROJECT_ROOT/scripts"
+        ENV_FILE="$PROJECT_ROOT/.env.prod"
+        echo -e "${GREEN}[INFO]${NC} Creating PROVING GROUND directory at: $PROJECT_ROOT"
+        mkdir -p "$PROJECT_ROOT/scripts"
+    fi
+
+    # Download required files
+    local files_to_download=(
+        "docker-compose.yml"
+        "docker-compose.prod.yml"
+        "traefik/dynamic/base.yml"
+        "traefik/dynamic/production.yml"
+        "config/registry-config.yml"
+    )
+
+    for file in "${files_to_download[@]}"; do
+        local dest="$PROJECT_ROOT/$file"
+        if [ ! -f "$dest" ]; then
+            echo -e "${GREEN}[INFO]${NC} Downloading $file..."
+            if ! download_file "${GITHUB_RAW_BASE}/$file" "$dest" "$file"; then
+                echo -e "${RED}[ERROR]${NC} Failed to download $file"
+                echo -e "${YELLOW}[HINT]${NC} Try: git clone https://github.com/${GITHUB_REPO}.git"
+                exit 1
+            fi
+        fi
+    done
+
+    # Copy this script to the project if not already there
+    if [ ! -f "$PROJECT_ROOT/scripts/deploy.sh" ] && [ -n "${BASH_SOURCE[0]:-}" ]; then
+        cp "${BASH_SOURCE[0]}" "$PROJECT_ROOT/scripts/deploy.sh" 2>/dev/null || true
+        chmod +x "$PROJECT_ROOT/scripts/deploy.sh" 2>/dev/null || true
+    fi
+
+    echo ""
+    echo -e "${GREEN}[INFO]${NC} Required files downloaded to: $PROJECT_ROOT"
+    echo -e "${GREEN}[INFO]${NC} Continuing with deployment..."
+    echo ""
+
+    # Update paths for the new location
+    cd "$PROJECT_ROOT"
+}
+
+# =============================================================================
+# Self-Update Functions
+# =============================================================================
+
+get_remote_script_version() {
+    # Fetch the SCRIPT_VERSION from the remote deploy.sh
+    local remote_version=""
+    if command -v curl &> /dev/null; then
+        remote_version=$(curl -fsSL "${GITHUB_RAW_BASE}/scripts/deploy.sh" 2>/dev/null | \
+            grep '^SCRIPT_VERSION=' | head -1 | cut -d'"' -f2)
+    elif command -v wget &> /dev/null; then
+        remote_version=$(wget -qO- "${GITHUB_RAW_BASE}/scripts/deploy.sh" 2>/dev/null | \
+            grep '^SCRIPT_VERSION=' | head -1 | cut -d'"' -f2)
+    fi
+    echo "$remote_version"
+}
+
+compare_versions() {
+    # Compare two version strings (YYYYMMDD.N format)
+    # Returns: 0 if equal, 1 if $1 > $2, 2 if $1 < $2
+    local v1="$1"
+    local v2="$2"
+
+    if [ "$v1" = "$v2" ]; then
+        return 0
+    fi
+
+    # Extract date and revision
+    local v1_date="${v1%.*}"
+    local v1_rev="${v1#*.}"
+    local v2_date="${v2%.*}"
+    local v2_rev="${v2#*.}"
+
+    # Compare dates first
+    if [ "$v1_date" -gt "$v2_date" ] 2>/dev/null; then
+        return 1
+    elif [ "$v1_date" -lt "$v2_date" ] 2>/dev/null; then
+        return 2
+    fi
+
+    # Same date, compare revisions
+    if [ "$v1_rev" -gt "$v2_rev" ] 2>/dev/null; then
+        return 1
+    elif [ "$v1_rev" -lt "$v2_rev" ] 2>/dev/null; then
+        return 2
+    fi
+
+    return 0
+}
+
+check_for_script_update() {
+    # Check if a newer version of deploy.sh is available
+    # Returns 0 if update available, 1 if up to date, 2 if check failed
+    local remote_version
+    remote_version=$(get_remote_script_version)
+
+    if [ -z "$remote_version" ]; then
+        return 2  # Failed to fetch
+    fi
+
+    compare_versions "$remote_version" "$SCRIPT_VERSION"
+    local result=$?
+
+    if [ $result -eq 1 ]; then
+        # Remote is newer
+        echo "$remote_version"
+        return 0
+    fi
+
+    return 1  # Up to date
+}
+
+do_self_update() {
+    # Download and replace this script with the latest version
+    local script_path="${BASH_SOURCE[0]}"
+
+    # Can't update if running from stdin
+    if [ -z "$script_path" ] || [ "$script_path" = "/dev/stdin" ] || [ ! -f "$script_path" ]; then
+        echo -e "${RED}[ERROR]${NC} Cannot self-update: script path not available"
+        echo -e "${YELLOW}[HINT]${NC} Download manually:"
+        echo "  curl -fsSL ${GITHUB_RAW_BASE}/scripts/deploy.sh -o deploy.sh"
+        return 1
+    fi
+
+    echo -e "${CYAN}[INFO]${NC} Checking for updates..."
+
+    local remote_version
+    remote_version=$(get_remote_script_version)
+
+    if [ -z "$remote_version" ]; then
+        echo -e "${RED}[ERROR]${NC} Failed to fetch remote version"
+        return 1
+    fi
+
+    compare_versions "$remote_version" "$SCRIPT_VERSION"
+    local result=$?
+
+    if [ $result -ne 1 ]; then
+        echo -e "${GREEN}[INFO]${NC} Already running the latest version ($SCRIPT_VERSION)"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[UPDATE]${NC} New version available: $remote_version (current: $SCRIPT_VERSION)"
+
+    # Create backup
+    local backup_path="${script_path}.backup"
+    cp "$script_path" "$backup_path"
+
+    # Download new version
+    local tmp_path="${script_path}.tmp"
+    echo -e "${CYAN}[INFO]${NC} Downloading update..."
+
+    if command -v curl &> /dev/null; then
+        if ! curl -fsSL "${GITHUB_RAW_BASE}/scripts/deploy.sh" -o "$tmp_path" 2>/dev/null; then
+            echo -e "${RED}[ERROR]${NC} Failed to download update"
+            rm -f "$tmp_path"
+            return 1
+        fi
+    elif command -v wget &> /dev/null; then
+        if ! wget -q "${GITHUB_RAW_BASE}/scripts/deploy.sh" -O "$tmp_path" 2>/dev/null; then
+            echo -e "${RED}[ERROR]${NC} Failed to download update"
+            rm -f "$tmp_path"
+            return 1
+        fi
+    fi
+
+    # Verify download
+    if [ ! -s "$tmp_path" ]; then
+        echo -e "${RED}[ERROR]${NC} Downloaded file is empty"
+        rm -f "$tmp_path"
+        return 1
+    fi
+
+    # Replace script
+    chmod +x "$tmp_path"
+    mv "$tmp_path" "$script_path"
+
+    echo -e "${GREEN}[SUCCESS]${NC} Updated to version $remote_version"
+    echo -e "${CYAN}[INFO]${NC} Backup saved to: $backup_path"
+    echo ""
+    echo -e "${YELLOW}[NOTE]${NC} Please re-run the script to use the new version."
+
+    return 0
+}
+
+prompt_for_update() {
+    # Prompt user if they want to update (used at startup)
+    local remote_version="$1"
+
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}  A newer version of deploy.sh is available!${NC}"
+    echo -e "${YELLOW}  Current: $SCRIPT_VERSION  →  Latest: $remote_version${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        if gum confirm "Update deploy.sh to version $remote_version?"; then
+            do_self_update
+            exit 0
+        else
+            echo -e "${CYAN}[INFO]${NC} Continuing with current version..."
+            echo ""
+        fi
+    else
+        read -p "Update to version $remote_version? [Y/n]: " choice
+        if [[ ! "$choice" =~ ^[Nn] ]]; then
+            do_self_update
+            exit 0
+        else
+            echo -e "${CYAN}[INFO]${NC} Continuing with current version..."
+            echo ""
+        fi
+    fi
+}
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+print_banner() {
+    echo -e "${CYAN}"
+    echo "  ██████╗██╗   ██╗██████╗  ██████╗ ██╗██████╗ "
+    echo " ██╔════╝╚██╗ ██╔╝██╔══██╗██╔═══██╗██║██╔══██╗"
+    echo " ██║      ╚████╔╝ ██████╔╝██║   ██║██║██║  ██║"
+    echo " ██║       ╚██╔╝  ██╔══██╗██║   ██║██║██║  ██║"
+    echo " ╚██████╗   ██║   ██║  ██║╚██████╔╝██║██████╔╝"
+    echo "  ╚═════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝╚═════╝ "
+    echo -e "${NC}"
+    echo -e "${BOLD}Cyber Range Orchestrator In Docker${NC}"
+    echo ""
+}
+
+log_info() {
+    # Suppress output in fullscreen TUI mode - status bar shows progress
+    [ "$TUI_FULLSCREEN" = true ] && return
+    if [ "$PROGRESS_BAR_ACTIVE" = true ]; then
+        # Use simpler output that works within scroll region
+        printf "\033[32m[INFO]\033[0m %s\n" "$1"
+    else
+        echo -e "${GREEN}[INFO]${NC} $1"
+    fi
+}
+
+log_warn() {
+    # Suppress output in fullscreen TUI mode - status bar shows progress
+    [ "$TUI_FULLSCREEN" = true ] && return
+    if [ "$PROGRESS_BAR_ACTIVE" = true ]; then
+        printf "\033[33m[WARN]\033[0m %s\n" "$1"
+    else
+        echo -e "${YELLOW}[WARN]${NC} $1"
+    fi
+}
+
+log_error() {
+    # Always show errors, even in fullscreen mode
+    if [ "$PROGRESS_BAR_ACTIVE" = true ] || [ "$TUI_FULLSCREEN" = true ]; then
+        printf "\033[31m[ERROR]\033[0m %s\n" "$1"
+    else
+        echo -e "${RED}[ERROR]${NC} $1"
+    fi
+}
+
+log_step() {
+    # Suppress output in fullscreen TUI mode - status bar shows progress
+    [ "$TUI_FULLSCREEN" = true ] && return
+    if [ "$PROGRESS_BAR_ACTIVE" = true ]; then
+        printf "\n\033[34m==>\033[0m \033[1m%s\033[0m\n" "$1"
+    else
+        echo ""
+        echo -e "${BLUE}==>${NC} ${BOLD}$1${NC}"
+    fi
+}
+
+generate_secret() {
+    # Generate a random 64-character secret
+    openssl rand -base64 48 | tr -d '/+=' | head -c 64
+}
+
+# =============================================================================
+# TUI Functions (using gum)
+# =============================================================================
+
+USE_TUI=true
+
+# Auto-install gum (TUI tool) on macOS and Linux
+install_gum() {
+    local arch
+    local os
+    local gum_version="0.14.5"
+    local download_url
+    local tmp_dir
+
+    # Detect architecture
+    case "$(uname -m)" in
+        x86_64|amd64) arch="x86_64" ;;
+        arm64|aarch64) arch="arm64" ;;
+        armv7l) arch="armv7" ;;
+        *)
+            echo -e "${RED}Unsupported architecture: $(uname -m)${NC}"
+            return 1
+            ;;
+    esac
+
+    # Detect OS
+    case "$(uname -s)" in
+        Darwin) os="Darwin" ;;
+        Linux) os="Linux" ;;
+        *)
+            echo -e "${RED}Unsupported OS: $(uname -s)${NC}"
+            return 1
+            ;;
+    esac
+
+    download_url="https://github.com/charmbracelet/gum/releases/download/v${gum_version}/gum_${gum_version}_${os}_${arch}.tar.gz"
+    tmp_dir=$(mktemp -d)
+
+    echo -e "${CYAN}Downloading gum v${gum_version} for ${os}/${arch}...${NC}"
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL "$download_url" -o "$tmp_dir/gum.tar.gz" || return 1
+    elif command -v wget &> /dev/null; then
+        wget -q "$download_url" -O "$tmp_dir/gum.tar.gz" || return 1
+    else
+        echo -e "${RED}Neither curl nor wget found${NC}"
+        return 1
+    fi
+
+    # Extract and install
+    tar -xzf "$tmp_dir/gum.tar.gz" -C "$tmp_dir" || return 1
+
+    # Try to install to /usr/local/bin, fall back to ~/.local/bin
+    if [ -w /usr/local/bin ]; then
+        mv "$tmp_dir/gum" /usr/local/bin/gum
+        chmod +x /usr/local/bin/gum
+    elif [ -w ~/.local/bin ]; then
+        mkdir -p ~/.local/bin
+        mv "$tmp_dir/gum" ~/.local/bin/gum
+        chmod +x ~/.local/bin/gum
+        export PATH="$HOME/.local/bin:$PATH"
+    else
+        # Try with sudo
+        echo -e "${YELLOW}Installing gum requires sudo access...${NC}"
+        sudo mv "$tmp_dir/gum" /usr/local/bin/gum
+        sudo chmod +x /usr/local/bin/gum
+    fi
+
+    rm -rf "$tmp_dir"
+
+    if command -v gum &> /dev/null; then
+        echo -e "${GREEN}gum installed successfully${NC}"
+        return 0
+    else
+        return 1
+    fi
+}
+
+check_gum() {
+    if command -v gum &> /dev/null; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}Installing 'gum' for beautiful terminal interfaces...${NC}"
+
+    detect_os
+
+    # Try package manager first (preferred for updates)
+    local installed=false
+
+    if [ "$OS_TYPE" = "macos" ]; then
+        if command -v brew &> /dev/null; then
+            echo -e "${CYAN}Installing via Homebrew...${NC}"
+            if brew install gum 2>/dev/null; then
+                installed=true
+            fi
+        fi
+    else
+        # Linux - try various package managers
+        if command -v apt-get &> /dev/null; then
+            # Debian/Ubuntu - add charm repo if needed
+            if ! apt-cache show gum &> /dev/null 2>&1; then
+                echo -e "${CYAN}Adding Charm repository...${NC}"
+                sudo mkdir -p /etc/apt/keyrings
+                curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null || true
+                echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list > /dev/null
+                sudo apt-get update -qq 2>/dev/null || true
+            fi
+            echo -e "${CYAN}Installing via apt...${NC}"
+            if sudo apt-get install -y gum 2>/dev/null; then
+                installed=true
+            fi
+        elif command -v dnf &> /dev/null; then
+            echo -e "${CYAN}Installing via dnf...${NC}"
+            if sudo dnf install -y gum 2>/dev/null; then
+                installed=true
+            fi
+        elif command -v yum &> /dev/null; then
+            echo -e "${CYAN}Installing via yum...${NC}"
+            if sudo yum install -y gum 2>/dev/null; then
+                installed=true
+            fi
+        elif command -v pacman &> /dev/null; then
+            echo -e "${CYAN}Installing via pacman...${NC}"
+            if sudo pacman -S --noconfirm gum 2>/dev/null; then
+                installed=true
+            fi
+        elif command -v zypper &> /dev/null; then
+            echo -e "${CYAN}Installing via zypper...${NC}"
+            if sudo zypper install -y gum 2>/dev/null; then
+                installed=true
+            fi
+        elif command -v apk &> /dev/null; then
+            echo -e "${CYAN}Installing via apk...${NC}"
+            if sudo apk add gum 2>/dev/null; then
+                installed=true
+            fi
+        fi
+    fi
+
+    # If package manager failed, try direct binary download
+    if [ "$installed" = false ]; then
+        echo -e "${YELLOW}Package manager install failed, trying direct download...${NC}"
+        if install_gum; then
+            installed=true
+        fi
+    fi
+
+    # Final check
+    if command -v gum &> /dev/null; then
+        return 0
+    fi
+
+    # All install methods failed - fall back to non-TUI mode
+    echo -e "${YELLOW}Could not install gum. Continuing without TUI...${NC}"
+    USE_TUI=false
+    return 0
+}
+
+tui_clear() {
+    if [ "$USE_TUI" = true ]; then
+        clear
+    fi
+}
+
+tui_header() {
+    if [ "$USE_TUI" = true ]; then
+        gum style \
+            --foreground 212 --border-foreground 212 --border double \
+            --align center --width 60 --margin "1 2" --padding "1 2" \
+            "$(echo -e "██████╗██╗   ██╗██████╗  ██████╗ ██╗██████╗ \n██╔════╝╚██╗ ██╔╝██╔══██╗██╔═══██╗██║██╔══██╗\n██║      ╚████╔╝ ██████╔╝██║   ██║██║██║  ██║\n██║       ╚██╔╝  ██╔══██╗██║   ██║██║██║  ██║\n╚██████╗   ██║   ██║  ██║╚██████╔╝██║██████╔╝\n ╚═════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝╚═════╝ ")"
+        echo ""
+        gum style --foreground 99 --bold "Cyber Range Orchestrator In Docker"
+        echo ""
+    else
+        print_banner
+    fi
+}
+
+tui_title() {
+    if [ "$USE_TUI" = true ]; then
+        gum style --foreground 212 --bold "$1"
+    else
+        echo -e "${BOLD}$1${NC}"
+    fi
+}
+
+tui_choose() {
+    local prompt="$1"
+    shift
+    if [ "$USE_TUI" = true ]; then
+        tui_suspend_scroll_region
+        local result=0
+        gum choose --header "$prompt" "$@" || result=$?
+        tui_restore_scroll_region
+        return $result
+    else
+        echo "$prompt"
+        select opt in "$@"; do
+            echo "$opt"
+            break
+        done
+    fi
+}
+
+tui_input() {
+    local prompt="$1"
+    local placeholder="${2:-}"
+    local default="${3:-}"
+    if [ "$USE_TUI" = true ]; then
+        tui_suspend_scroll_region
+        local value
+        value=$(gum input --placeholder "$placeholder" --value "$default" --header "$prompt") || true
+        tui_restore_scroll_region
+        echo "$value"
+    else
+        read -p "$prompt [$default]: " value
+        echo "${value:-$default}"
+    fi
+}
+
+tui_confirm() {
+    local prompt="$1"
+    if [ "$USE_TUI" = true ]; then
+        tui_suspend_scroll_region
+        local result=0
+        gum confirm "$prompt" || result=$?
+        tui_restore_scroll_region
+        return $result
+    else
+        read -p "$prompt [Y/n]: " choice
+        [[ ! "$choice" =~ ^[Nn] ]]
+    fi
+}
+
+tui_spin() {
+    local title="$1"
+    shift
+    if [ "$USE_TUI" = true ]; then
+        gum spin --spinner dot --title "$title" -- "$@"
+    else
+        echo "$title"
+        "$@"
+    fi
+}
+
+tui_success() {
+    # Suppress in fullscreen mode - status bar shows progress
+    [ "$TUI_FULLSCREEN" = true ] && return
+    if [ "$USE_TUI" = true ]; then
+        if [ "$PROGRESS_BAR_ACTIVE" = true ]; then
+            # Use printf instead of gum to avoid scroll region issues
+            printf "\033[38;5;82m\033[1m✓ %s\033[0m\n" "$1"
+        else
+            gum style --foreground 82 --bold "✓ $1"
+        fi
+    else
+        log_info "$1"
+    fi
+}
+
+tui_error() {
+    # Always show errors, even in fullscreen mode
+    if [ "$USE_TUI" = true ]; then
+        if [ "$PROGRESS_BAR_ACTIVE" = true ] || [ "$TUI_FULLSCREEN" = true ]; then
+            printf "\033[38;5;196m\033[1m✗ %s\033[0m\n" "$1"
+        else
+            gum style --foreground 196 --bold "✗ $1"
+        fi
+    else
+        log_error "$1"
+    fi
+}
+
+tui_warn() {
+    # Suppress in fullscreen mode - status bar shows progress
+    [ "$TUI_FULLSCREEN" = true ] && return
+    if [ "$USE_TUI" = true ]; then
+        if [ "$PROGRESS_BAR_ACTIVE" = true ]; then
+            printf "\033[38;5;214m⚠ %s\033[0m\n" "$1"
+        else
+            gum style --foreground 214 "⚠ $1"
+        fi
+    else
+        log_warn "$1"
+    fi
+}
+
+tui_info() {
+    # Suppress in fullscreen mode - status bar shows progress
+    [ "$TUI_FULLSCREEN" = true ] && return
+    if [ "$USE_TUI" = true ]; then
+        if [ "$PROGRESS_BAR_ACTIVE" = true ]; then
+            printf "\033[38;5;39m→ %s\033[0m\n" "$1"
+        else
+            gum style --foreground 39 "→ $1"
+        fi
+    else
+        log_info "$1"
+    fi
+}
+
+tui_summary_box() {
+    if [ "$USE_TUI" = true ]; then
+        gum style \
+            --border rounded --border-foreground 39 \
+            --padding "1 2" --margin "1 0" \
+            "$1"
+    else
+        echo ""
+        echo "$1"
+        echo ""
+    fi
+}
+
+# =============================================================================
+# Full-Screen TUI Framework (Deployment Dashboard)
+# =============================================================================
+
+# Terminal state
+TERM_LINES=24
+TERM_COLS=80
+STATUS_MESSAGE=""
+STATUS_TYPE="info"  # info, success, warn, error, progress
+DEPLOYMENT_PHASE=""
+DEPLOYMENT_PROGRESS=0
+TUI_FULLSCREEN=false
+TUI_SCROLL_REGION_SET=false  # Kept for compatibility (no longer used)
+TUI_LAST_HEIGHT=0
+
+# Save terminal state for cleanup
+ORIGINAL_STTY=""
+
+# Deployment step tracking
+DEPLOYMENT_STEPS=(
+    "Pre-flight checks"
+    "Creating data directories"
+    "Generating configuration"
+    "Setting up SSL certificates"
+    "Initializing Docker networks"
+    "Pulling Docker images"
+    "Starting services"
+    "Waiting for health"
+)
+DEPLOYMENT_STEP_STATUS=()    # "pending", "active", "done", "error"
+DEPLOYMENT_STEP_DETAIL=()   # Optional detail text for active step
+DEPLOY_ACTIVITY_LOG=()      # Activity log entries (newest first)
+MAX_ACTIVITY_LINES=0        # Calculated from terminal height
+CURRENT_STEP_INDEX=-1       # Index of current active step
+
+# Map phase names from do_deploy() to step indices
+_tui_phase_to_step_index() {
+    local phase="$1"
+    case "$phase" in
+        *"pre-flight"*|*"Pre-flight"*)           echo 0 ;;
+        *"data directories"*|*"Creating data"*)  echo 1 ;;
+        *"configuration"*|*"Generating"*)        echo 2 ;;
+        *"SSL"*|*"certificates"*)                echo 3 ;;
+        *"networks"*|*"Docker networks"*)        echo 4 ;;
+        *"Pulling"*|*"images"*)                  echo 5 ;;
+        *"Starting"*|*"services..."*)            echo 6 ;;
+        *"health"*|*"Waiting"*)                  echo 7 ;;
+        *"admin"*|*"Creating admin"*)            echo 7 ;;  # Map admin step to last
+        *)                                       echo -1 ;;
+    esac
+}
+
+tui_init_fullscreen() {
+    if [ "$USE_TUI" != true ]; then
+        return
+    fi
+
+    # Save terminal settings
+    ORIGINAL_STTY=$(stty -g 2>/dev/null) || true
+
+    # Get terminal dimensions
+    tui_update_dimensions
+
+    # Initialize step states to pending
+    DEPLOYMENT_STEP_STATUS=()
+    DEPLOYMENT_STEP_DETAIL=()
+    for ((i=0; i<${#DEPLOYMENT_STEPS[@]}; i++)); do
+        DEPLOYMENT_STEP_STATUS+=("pending")
+        DEPLOYMENT_STEP_DETAIL+=("")
+    done
+    DEPLOY_ACTIVITY_LOG=()
+    CURRENT_STEP_INDEX=-1
+
+    # Calculate max activity log lines from terminal height
+    # Layout: header(1) + blank(1) + title(1) + blank(1) + progressbar(1) + blank(1)
+    #       + steps(8) + blank(1) + log_header(1) + ... log lines ... + blank(1)
+    #       + separator(1) + statusbar(1) = 18 fixed lines
+    MAX_ACTIVITY_LINES=$((TERM_LINES - 18))
+    [ "$MAX_ACTIVITY_LINES" -lt 2 ] && MAX_ACTIVITY_LINES=2
+
+    # Set up cleanup trap with error reporting
+    trap 'exit_code=$?; tui_cleanup_fullscreen; if [ $exit_code -ne 0 ]; then echo -e "\033[31m[ERROR]\033[0m Script exited with code $exit_code"; fi' EXIT
+    trap 'tui_cleanup_fullscreen' INT TERM
+
+    # Hide cursor
+    printf "\033[?25l" 2>/dev/null || true
+
+    TUI_FULLSCREEN=true
+
+    # Initial draw
+    tui_draw_screen
+}
+
+tui_cleanup_fullscreen() {
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        # Show cursor
+        printf "\033[?25h" 2>/dev/null || true
+
+        # Restore terminal settings
+        if [ -n "$ORIGINAL_STTY" ]; then
+            stty "$ORIGINAL_STTY" 2>/dev/null || true
+        fi
+
+        # Move cursor to bottom and reset
+        printf "\033[%d;1H\033[0m\n" "$TERM_LINES" 2>/dev/null || true
+
+        TUI_FULLSCREEN=false
+    fi
+}
+
+tui_update_dimensions() {
+    # Prefer $LINES/$COLUMNS (bash updates via SIGWINCH), fall back to tput, then stty
+    TERM_LINES=${LINES:-$(tput lines 2>/dev/null || stty size 2>/dev/null | awk '{print $1}' || echo 24)}
+    TERM_COLS=${COLUMNS:-$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)}
+    # Ensure numeric
+    [[ "$TERM_LINES" =~ ^[0-9]+$ ]] || TERM_LINES=24
+    [[ "$TERM_COLS" =~ ^[0-9]+$ ]] || TERM_COLS=80
+}
+
+# Temporarily show cursor for interactive gum commands
+tui_suspend_scroll_region() {
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        printf "\033[?25h" 2>/dev/null || true  # Show cursor
+    fi
+}
+
+# Hide cursor and redraw after interactive input
+tui_restore_scroll_region() {
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        printf "\033[?25l" 2>/dev/null || true  # Hide cursor
+        tui_draw_screen  # Redraw after interactive input
+    fi
+}
+
+tui_set_status() {
+    local message="$1"
+    local type="${2:-info}"  # info, success, warn, error, progress
+    local sub_progress="${3:-}"  # Optional: sub-progress for detailed status (e.g., "9/9")
+
+    STATUS_MESSAGE="$message"
+    STATUS_TYPE="$type"
+
+    # If sub_progress is provided, update detail on the active step
+    if [ -n "$sub_progress" ] && [[ "$sub_progress" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+        local current="${BASH_REMATCH[1]}"
+        local total="${BASH_REMATCH[2]}"
+        if [ "$total" -gt 0 ] && [ "$CURRENT_STEP_INDEX" -ge 0 ]; then
+            DEPLOYMENT_STEP_DETAIL[$CURRENT_STEP_INDEX]="($current/$total)"
+            # Calculate sub-progress within current deployment step
+            local base_progress=$((DEPLOYMENT_PROGRESS / 14 * 14))
+            local step_progress=$((current * 14 / total))
+            DEPLOYMENT_PROGRESS=$((base_progress + step_progress))
+        fi
+    fi
+
+    # Add to activity log (strip "Pulling (X/Y): " prefix for cleaner log)
+    local log_entry="$message"
+    if [[ "$message" =~ ^Pulling\ \([0-9]+/[0-9]+\):\ (.+)$ ]]; then
+        log_entry="Pulling ${BASH_REMATCH[1]}..."
+    fi
+    tui_log "$log_entry"
+
+    # Handle pre-flight check mapping (called before tui_set_progress)
+    if [[ "$message" == *"pre-flight"* ]] || [[ "$message" == *"Pre-flight"* ]]; then
+        if [ "$CURRENT_STEP_INDEX" -lt 0 ]; then
+            CURRENT_STEP_INDEX=0
+            DEPLOYMENT_STEP_STATUS[0]="active"
+        fi
+    fi
+
+    # On success/complete, mark all steps as done
+    if [ "$type" = "success" ] && [ ${#DEPLOYMENT_STEP_STATUS[@]} -gt 0 ]; then
+        for ((i=0; i<${#DEPLOYMENT_STEP_STATUS[@]}; i++)); do
+            if [ "${DEPLOYMENT_STEP_STATUS[$i]}" != "error" ]; then
+                DEPLOYMENT_STEP_STATUS[$i]="done"
+                DEPLOYMENT_STEP_DETAIL[$i]=""
+            fi
+        done
+        DEPLOYMENT_PROGRESS=100
+    fi
+
+    # Trigger full redraw in fullscreen mode
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        tui_draw_screen
+    fi
+}
+
+tui_set_progress() {
+    local phase="$1"
+    local progress="$2"  # 0-100
+    local detail="${3:-}"
+
+    DEPLOYMENT_PHASE="$phase"
+    DEPLOYMENT_PROGRESS="$progress"
+
+    # Update fullscreen step tracking
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        local step_idx
+        step_idx=$(_tui_phase_to_step_index "$phase")
+
+        if [ "$step_idx" -ge 0 ]; then
+            # Mark all previous steps as done
+            for ((i=0; i<step_idx; i++)); do
+                if [ "${DEPLOYMENT_STEP_STATUS[$i]}" != "error" ]; then
+                    DEPLOYMENT_STEP_STATUS[$i]="done"
+                    DEPLOYMENT_STEP_DETAIL[$i]=""
+                fi
+            done
+            # Mark current step as active
+            DEPLOYMENT_STEP_STATUS[$step_idx]="active"
+            CURRENT_STEP_INDEX=$step_idx
+            if [ -n "$detail" ]; then
+                DEPLOYMENT_STEP_DETAIL[$step_idx]="$detail"
+            fi
+        fi
+
+        # Add to activity log
+        local clean_phase="${phase%...}"
+        tui_log "$clean_phase"
+
+        STATUS_MESSAGE="$phase"
+        STATUS_TYPE="progress"
+        tui_draw_screen
+    else
+        # Use bottom progress bar for non-fullscreen mode
+        local step=$((progress / 14))
+        [ "$step" -lt 1 ] && step=1
+        [ "$step" -gt 7 ] && step=7
+        progress_bar_update "$step" 7 "Deploy" "$phase"
+    fi
+}
+
+tui_log() {
+    local message="$1"
+    [ -z "$message" ] && return
+
+    # Skip consecutive duplicates (e.g. repeated health check polls)
+    if [ ${#DEPLOY_ACTIVITY_LOG[@]} -gt 0 ] && [ "${DEPLOY_ACTIVITY_LOG[0]}" = "$message" ]; then
+        return
+    fi
+
+    # Prepend to activity log (newest first)
+    DEPLOY_ACTIVITY_LOG=("$message" "${DEPLOY_ACTIVITY_LOG[@]}")
+
+    # Trim to max size
+    if [ "${#DEPLOY_ACTIVITY_LOG[@]}" -gt 50 ]; then
+        DEPLOY_ACTIVITY_LOG=("${DEPLOY_ACTIVITY_LOG[@]:0:50}")
+    fi
+}
+
+tui_draw_header_bar() {
+    if [ "$USE_TUI" != true ]; then
+        return
+    fi
+
+    # Format version properly
+    local version="${VERSION:-latest}"
+    version="${version#v}"  # Strip leading "v" if present
+    local right_content="v${version}"
+    if [ "$version" = "latest" ]; then
+        right_content="latest"
+    fi
+
+    local title=" PROVING GROUND"
+    local left_len=${#title}
+    local right_len=${#right_content}
+    local padding=$((TERM_COLS - left_len - right_len - 2))
+    [ $padding -lt 0 ] && padding=0
+
+    # Dark blue background (48;5;24), white text (38;5;255)
+    printf "\033[%d;1H" 1 2>/dev/null || true
+    printf "\033[48;5;24m\033[38;5;255m\033[2K"
+    printf "%s" "$title"
+    printf "%*s" "$padding" ""
+    printf "%s \033[0m" "$right_content"
+}
+
+tui_draw_status_bar() {
+    if [ "$USE_TUI" != true ]; then
+        return
+    fi
+
+    tui_update_dimensions
+
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
+    local status_icon=""
+    local status_color=""
+
+    case "$STATUS_TYPE" in
+        success)  status_icon="✓"; status_color="82" ;;
+        warn)     status_icon="⚠"; status_color="214" ;;
+        error)    status_icon="✗"; status_color="196" ;;
+        progress) status_icon="◐"; status_color="39" ;;
+        *)        status_icon="→"; status_color="245" ;;
+    esac
+
+    # Build progress indicator for status bar
+    local progress_part=""
+    if [ "$STATUS_TYPE" = "progress" ] && [ "$DEPLOYMENT_PROGRESS" -gt 0 ]; then
+        progress_part="  ${DEPLOYMENT_PROGRESS}%"
+    fi
+
+    # Truncate message if needed
+    local max_msg_len=$((TERM_COLS - 30))
+    local display_msg="$STATUS_MESSAGE"
+    if [ ${#display_msg} -gt $max_msg_len ] && [ $max_msg_len -gt 3 ]; then
+        display_msg="${display_msg:0:$((max_msg_len - 3))}..."
+    fi
+
+    local left_content=" $status_icon $display_msg$progress_part"
+    local right_content="$timestamp "
+    local left_len=${#left_content}
+    local right_len=${#right_content}
+    local padding=$((TERM_COLS - left_len - right_len))
+    [ $padding -lt 0 ] && padding=0
+
+    # Separator line above status bar
+    printf "\033[%d;1H" "$((TERM_LINES - 1))" 2>/dev/null || true
+    printf "\033[38;5;240m\033[2K"
+    printf " "
+    local sep_width=$((TERM_COLS - 2))
+    for ((i=0; i<sep_width; i++)); do printf "─"; done
+    printf "\033[0m"
+
+    # Status bar on last line - dark gray bg (48;5;236)
+    printf "\033[%d;1H" "$TERM_LINES" 2>/dev/null || true
+    printf "\033[48;5;236m\033[2K"
+    printf "\033[38;5;%sm %s" "$status_color" "$status_icon"
+    printf "\033[38;5;255m %s" "$display_msg"
+    if [ -n "$progress_part" ]; then
+        printf "\033[38;5;39m%s" "$progress_part"
+    fi
+    printf "%*s" "$padding" ""
+    printf "\033[38;5;245m%s\033[0m" "$right_content"
+}
+
+tui_draw_screen() {
+    if [ "$USE_TUI" != true ]; then
+        return
+    fi
+
+    tui_update_dimensions
+
+    # Hide cursor and clear screen
+    printf "\033[?25l" 2>/dev/null || true
+    printf "\033[2J\033[H" 2>/dev/null || true
+
+    # Layout calculations — everything adapts to TERM_LINES / TERM_COLS
+    # Fixed rows: header(1) + blank(1) + title(1) + blank(1) + progress(1)
+    #           + blank(1) + steps(8) + blank(1) + log_header(1) + separator(1) + statusbar(1)
+    # = 18 fixed rows; remaining rows go to activity log
+    local log_header_row=16
+    local log_start_row=17
+    local log_end_row=$((TERM_LINES - 2))
+    local available_log_lines=$((log_end_row - log_start_row + 1))
+    [ $available_log_lines -lt 1 ] && available_log_lines=1
+
+    # === Row 1: Header bar ===
+    tui_draw_header_bar
+
+    # === Row 3: Title ===
+    printf "\033[3;1H\033[2K" 2>/dev/null || true
+    printf "  \033[38;5;255m\033[1mDeploying PROVING GROUND\033[0m"
+
+    # === Row 5: Progress bar (scales to terminal width) ===
+    printf "\033[5;1H\033[2K" 2>/dev/null || true
+    local bar_width=$((TERM_COLS - 14))
+    [ $bar_width -lt 10 ] && bar_width=10
+    local filled=$((DEPLOYMENT_PROGRESS * bar_width / 100))
+    local empty=$((bar_width - filled))
+    printf "  \033[38;5;82m"
+    for ((i=0; i<filled; i++)); do printf "█"; done
+    printf "\033[38;5;240m"
+    for ((i=0; i<empty; i++)); do printf "░"; done
+    printf " \033[38;5;255m\033[1m%3d%%\033[0m" "$DEPLOYMENT_PROGRESS"
+
+    # === Rows 7-14: Step checklist (8 steps) ===
+    local row=7
+    for ((i=0; i<${#DEPLOYMENT_STEPS[@]}; i++)); do
+        printf "\033[%d;1H\033[2K" "$row" 2>/dev/null || true
+        local step_name="${DEPLOYMENT_STEPS[$i]}"
+        local step_status="${DEPLOYMENT_STEP_STATUS[$i]:-pending}"
+        local step_detail="${DEPLOYMENT_STEP_DETAIL[$i]:-}"
+
+        case "$step_status" in
+            done)
+                printf "  \033[38;5;82m✓ %s\033[0m" "$step_name"
+                ;;
+            active)
+                printf "  \033[38;5;39m\033[1m◐ %s\033[0m" "$step_name"
+                if [ -n "$step_detail" ]; then
+                    printf " \033[38;5;39m%s\033[0m" "$step_detail"
+                fi
+                ;;
+            error)
+                printf "  \033[38;5;196m✗ %s\033[0m" "$step_name"
+                ;;
+            *)
+                printf "  \033[38;5;242m· %s\033[0m" "$step_name"
+                ;;
+        esac
+
+        row=$((row + 1))
+    done
+
+    # === Activity log header ===
+    printf "\033[%d;1H\033[2K" "$log_header_row" 2>/dev/null || true
+    local log_label=" Recent Activity "
+    local dash_total=$((TERM_COLS - ${#log_label} - 4))
+    local dash_left=2
+    local dash_right=$((dash_total - dash_left))
+    [ $dash_right -lt 0 ] && dash_right=0
+    printf "  \033[38;5;240m"
+    for ((i=0; i<dash_left; i++)); do printf "─"; done
+    printf "\033[38;5;245m%s\033[38;5;240m" "$log_label"
+    for ((i=0; i<dash_right; i++)); do printf "─"; done
+    printf "\033[0m"
+
+    # === Activity log entries (bottom-aligned: newest at bottom) ===
+    # DEPLOY_ACTIVITY_LOG is stored newest-first (index 0 = newest).
+    local show_count=${#DEPLOY_ACTIVITY_LOG[@]}
+    [ $show_count -gt $available_log_lines ] && show_count=$available_log_lines
+
+    # Calculate where entries start (bottom-aligned)
+    local entries_start_row=$((log_end_row - show_count + 1))
+
+    local log_row=$log_start_row
+    for ((j=0; j<available_log_lines; j++)); do
+        printf "\033[%d;1H\033[2K" "$log_row" 2>/dev/null || true
+        if [ $log_row -ge $entries_start_row ] && [ $show_count -gt 0 ]; then
+            # Which entry to show? Reverse order: oldest visible at top
+            local offset=$((log_row - entries_start_row))
+            local entry_idx=$((show_count - 1 - offset))
+            if [ $entry_idx -ge 0 ] && [ $entry_idx -lt ${#DEPLOY_ACTIVITY_LOG[@]} ]; then
+                local entry="${DEPLOY_ACTIVITY_LOG[$entry_idx]}"
+                local max_entry_len=$((TERM_COLS - 8))
+                if [ ${#entry} -gt $max_entry_len ] && [ $max_entry_len -gt 3 ]; then
+                    entry="${entry:0:$((max_entry_len - 3))}..."
+                fi
+                # Color based on content
+                if [[ "$entry" == "✓"* ]]; then
+                    printf "    \033[38;5;82m%s\033[0m" "$entry"
+                elif [[ "$entry" == "⚠"* ]] || [[ "$entry" == "✗"* ]]; then
+                    printf "    \033[38;5;214m%s\033[0m" "$entry"
+                else
+                    printf "    \033[38;5;250m%s\033[0m" "$entry"
+                fi
+            fi
+        fi
+        log_row=$((log_row + 1))
+    done
+
+    # === Bottom: Separator + Status bar ===
+    tui_draw_status_bar
+}
+
+tui_main_area() {
+    # Position cursor in main content area
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        printf "\033[3;1H" 2>/dev/null || true
+    fi
+}
+
+# Deployment progress helper (legacy, kept for compatibility)
+tui_deployment_step() {
+    local step_name="$1"
+    local step_num="$2"
+    local total_steps="$3"
+
+    local progress=$((step_num * 100 / total_steps))
+    tui_set_progress "$step_name" "$progress"
+
+    # Also print to main area
+    tui_info "$step_name"
+}
+
+# Service status monitoring
+tui_show_services_status() {
+    if [ "$USE_TUI" != true ]; then
+        return
+    fi
+
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    # Get service status
+    local services=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null) || true
+
+    if [ -n "$services" ]; then
+        echo ""
+        gum style --foreground 212 --bold "Services"
+        echo "$services" | while IFS= read -r line; do
+            if echo "$line" | grep -q "(healthy)"; then
+                gum style --foreground 82 "  $line"
+            elif echo "$line" | grep -q "Up"; then
+                gum style --foreground 214 "  $line"
+            elif echo "$line" | grep -q "NAME"; then
+                gum style --foreground 245 "  $line"
+            else
+                gum style --foreground 196 "  $line"
+            fi
+        done
+    fi
+}
+
+# Live status update (can be called periodically)
+tui_refresh_status() {
+    if [ "$TUI_FULLSCREEN" != true ]; then
+        return
+    fi
+
+    # Update status bar with current time
+    tui_draw_status_bar
+}
+
+# Background status updater
+STATUS_UPDATER_PID=""
+
+tui_start_status_updater() {
+    if [ "$USE_TUI" != true ]; then
+        return
+    fi
+
+    # Start background process to update status every 5 seconds
+    (
+        while true; do
+            sleep 5
+            tui_refresh_status
+        done
+    ) &
+    STATUS_UPDATER_PID=$!
+}
+
+tui_stop_status_updater() {
+    if [ -n "$STATUS_UPDATER_PID" ]; then
+        kill "$STATUS_UPDATER_PID" 2>/dev/null || true
+        STATUS_UPDATER_PID=""
+    fi
+}
+
+# Live Dashboard (K9s-style) — fully integrated TUI with cursor-positioned updates
+tui_live_dashboard() {
+    local compose_cmd="${1:-docker compose}"
+
+    # Hide cursor
+    printf "\033[?25l" 2>/dev/null || true
+
+    # Save existing traps so we can restore after dashboard exits
+    local _saved_int_trap _saved_term_trap
+    _saved_int_trap=$(trap -p INT) || true
+    _saved_term_trap=$(trap -p TERM) || true
+
+    # Trap to restore cursor on exit from dashboard
+    trap 'printf "\033[?25h\033[0m" 2>/dev/null; return' INT TERM
+
+    local refresh_interval=5
+    local first_draw=true
+
+    while true; do
+        # Get terminal dimensions
+        local lines=${LINES:-$(tput lines 2>/dev/null || echo 24)}
+        local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+        [[ "$lines" =~ ^[0-9]+$ ]] || lines=24
+        [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+
+        # Only full-clear on first draw; after that use cursor positioning
+        if [ "$first_draw" = true ]; then
+            printf "\033[2J" 2>/dev/null || true
+            first_draw=false
+        fi
+
+        # ── Collect all data first (minimizes time between clear and draw) ──
+        local svc_data=""
+        svc_data=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps --format "table {{.Name}}\t{{.Service}}\t{{.Status}}" 2>/dev/null) || true
+
+        local healthy=0 running=0 total=0 svc_lines=()
+        if [ -n "$svc_data" ]; then
+            while IFS= read -r line; do
+                # Skip header
+                [[ "$line" == NAME* ]] && continue
+                [ -z "$line" ] && continue
+                total=$((total + 1))
+                if echo "$line" | grep -q "Up"; then
+                    running=$((running + 1))
+                    echo "$line" | grep -q "(healthy)" && healthy=$((healthy + 1))
+                fi
+                svc_lines+=("$line")
+            done <<< "$svc_data"
+        fi
+
+        local range_containers=""
+        range_containers=$(docker ps --filter "label=proving_ground.type=dind" --format "{{.Names}}\t{{.Status}}" 2>/dev/null) || true
+        local range_count=0 range_lines=()
+        if [ -n "$range_containers" ]; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                range_count=$((range_count + 1))
+                range_lines+=("$line")
+            done <<< "$range_containers"
+        fi
+
+        local stats_data=""
+        stats_data=$(docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" 2>/dev/null) || true
+        local stats_lines=()
+        if [ -n "$stats_data" ]; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                stats_lines+=("$line")
+            done <<< "$stats_data"
+        fi
+
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+        # ── Draw ──
+        local row=1
+
+        # === Row 1: Header bar (dark blue bg) ===
+        printf "\033[%d;1H\033[48;5;24m\033[38;5;255m\033[2K" "$row"
+        printf " ◆ PROVING GROUND Live Dashboard"
+        local hdr_right="q quit · r refresh"
+        local hdr_pad=$((cols - 25 - ${#hdr_right} - 1))
+        [ $hdr_pad -lt 0 ] && hdr_pad=0
+        printf "%*s" "$hdr_pad" ""
+        printf "\033[38;5;153m%s \033[0m" "$hdr_right"
+        row=$((row + 1))
+
+        # === Row 2: blank ===
+        printf "\033[%d;1H\033[2K" "$row"
+        row=$((row + 1))
+
+        # === Status summary ===
+        local status_color="82" status_text="HEALTHY" status_icon="●"
+        if [ "$running" -eq 0 ]; then
+            status_color="196"; status_text="DOWN"; status_icon="✗"
+        elif [ "$healthy" -lt "$running" ]; then
+            status_color="214"; status_text="DEGRADED"; status_icon="◐"
+        fi
+
+        printf "\033[%d;1H\033[2K" "$row"
+        printf "  \033[38;5;${status_color}m\033[1m%s %s\033[0m" "$status_icon" "$status_text"
+        printf "  \033[38;5;245m│\033[0m  \033[38;5;255m%d\033[38;5;245m services running  \033[38;5;255m%d\033[38;5;245m healthy\033[0m" "$running" "$healthy"
+        row=$((row + 1))
+
+        # === Row: blank ===
+        printf "\033[%d;1H\033[2K" "$row"
+        row=$((row + 1))
+
+        # === Services section header ===
+        printf "\033[%d;1H\033[2K" "$row"
+        local sec_label="Services"
+        printf "  \033[38;5;212m\033[1m%s\033[0m" "$sec_label"
+        local dash_start=$((3 + ${#sec_label} + 1))
+        local dash_count=$((cols - dash_start - 2))
+        [ $dash_count -gt 0 ] && { printf " \033[38;5;240m"; for ((i=0; i<dash_count; i++)); do printf "─"; done; printf "\033[0m"; }
+        row=$((row + 1))
+
+        # === Services table header ===
+        printf "\033[%d;1H\033[2K" "$row"
+        printf "    \033[38;5;245m%-22s %-12s %-30s\033[0m" "CONTAINER" "SERVICE" "STATUS"
+        row=$((row + 1))
+
+        # === Service rows ===
+        if [ ${#svc_lines[@]} -gt 0 ]; then
+            for svc_line in "${svc_lines[@]}"; do
+                printf "\033[%d;1H\033[2K" "$row"
+                # Parse: Name\tService\tStatus
+                local svc_name svc_service svc_status
+                svc_name=$(echo "$svc_line" | awk -F'\t' '{print $1}' | xargs)
+                svc_service=$(echo "$svc_line" | awk -F'\t' '{print $2}' | xargs)
+                svc_status=$(echo "$svc_line" | awk -F'\t' '{$1=""; $2=""; print}' | sed 's/^ *//')
+                # Fallback: if tab-separated didn't work, split by whitespace
+                if [ -z "$svc_service" ]; then
+                    svc_name=$(echo "$svc_line" | awk '{print $1}')
+                    svc_service=$(echo "$svc_line" | awk '{print $2}')
+                    svc_status=$(echo "$svc_line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+                fi
+
+                local dot_color="196"
+                if echo "$svc_status" | grep -q "(healthy)"; then
+                    dot_color="82"
+                elif echo "$svc_status" | grep -q "Up"; then
+                    dot_color="214"
+                fi
+                printf "    \033[38;5;${dot_color}m●\033[0m %-21s \033[38;5;39m%-12s\033[0m \033[38;5;250m%s\033[0m" "$svc_name" "$svc_service" "$svc_status"
+                row=$((row + 1))
+            done
+        else
+            printf "\033[%d;1H\033[2K" "$row"
+            printf "    \033[38;5;196mNo services found\033[0m"
+            row=$((row + 1))
+        fi
+
+        # === Blank ===
+        printf "\033[%d;1H\033[2K" "$row"
+        row=$((row + 1))
+
+        # === Deployed Ranges section ===
+        printf "\033[%d;1H\033[2K" "$row"
+        local range_label="Deployed Ranges ($range_count)"
+        printf "  \033[38;5;212m\033[1m%s\033[0m" "$range_label"
+        dash_start=$((3 + ${#range_label} + 1))
+        dash_count=$((cols - dash_start - 2))
+        [ $dash_count -gt 0 ] && { printf " \033[38;5;240m"; for ((i=0; i<dash_count; i++)); do printf "─"; done; printf "\033[0m"; }
+        row=$((row + 1))
+
+        if [ ${#range_lines[@]} -gt 0 ]; then
+            for range_line in "${range_lines[@]}"; do
+                printf "\033[%d;1H\033[2K" "$row"
+                local rname rstatus
+                rname=$(echo "$range_line" | cut -f1)
+                rstatus=$(echo "$range_line" | cut -f2-)
+                local rdot="196"
+                echo "$rstatus" | grep -q "Up" && rdot="82"
+                printf "    \033[38;5;${rdot}m●\033[0m %-30s \033[38;5;250m%s\033[0m" "$rname" "$rstatus"
+                row=$((row + 1))
+            done
+        else
+            printf "\033[%d;1H\033[2K" "$row"
+            printf "    \033[38;5;242mNo ranges deployed\033[0m"
+            row=$((row + 1))
+        fi
+
+        # === Blank ===
+        printf "\033[%d;1H\033[2K" "$row"
+        row=$((row + 1))
+
+        # === Resource Usage section ===
+        printf "\033[%d;1H\033[2K" "$row"
+        local res_label="Resource Usage"
+        printf "  \033[38;5;212m\033[1m%s\033[0m" "$res_label"
+        dash_start=$((3 + ${#res_label} + 1))
+        dash_count=$((cols - dash_start - 2))
+        [ $dash_count -gt 0 ] && { printf " \033[38;5;240m"; for ((i=0; i<dash_count; i++)); do printf "─"; done; printf "\033[0m"; }
+        row=$((row + 1))
+
+        # Table header
+        printf "\033[%d;1H\033[2K" "$row"
+        printf "    \033[38;5;245m%-24s %8s  %-24s\033[0m" "CONTAINER" "CPU" "MEMORY"
+        row=$((row + 1))
+
+        if [ ${#stats_lines[@]} -gt 0 ]; then
+            local stats_shown=0
+            for stat_line in "${stats_lines[@]}"; do
+                [ $stats_shown -ge 10 ] && break
+                printf "\033[%d;1H\033[2K" "$row"
+                local st_name st_cpu st_mem
+                st_name=$(echo "$stat_line" | cut -f1)
+                st_cpu=$(echo "$stat_line" | cut -f2)
+                st_mem=$(echo "$stat_line" | cut -f3)
+
+                # CPU color: green < 25%, yellow < 75%, red >= 75%
+                local cpu_val cpu_color="82"
+                cpu_val=$(echo "$st_cpu" | tr -d '%' | cut -d. -f1)
+                [[ "$cpu_val" =~ ^[0-9]+$ ]] || cpu_val=0
+                [ "$cpu_val" -ge 25 ] && cpu_color="214"
+                [ "$cpu_val" -ge 75 ] && cpu_color="196"
+
+                # Build a mini CPU bar (8 chars wide)
+                local bar_len=8
+                local bar_filled=$((cpu_val * bar_len / 100))
+                [ $bar_filled -gt $bar_len ] && bar_filled=$bar_len
+                local bar_empty=$((bar_len - bar_filled))
+                local cpu_bar=""
+                for ((i=0; i<bar_filled; i++)); do cpu_bar+="█"; done
+                for ((i=0; i<bar_empty; i++)); do cpu_bar+="░"; done
+
+                printf "    %-24s \033[38;5;${cpu_color}m%s\033[0m %5s  \033[38;5;250m%s\033[0m" \
+                    "$st_name" "$cpu_bar" "$st_cpu" "$st_mem"
+                row=$((row + 1))
+                stats_shown=$((stats_shown + 1))
+            done
+        else
+            printf "\033[%d;1H\033[2K" "$row"
+            printf "    \033[38;5;242mStats unavailable\033[0m"
+            row=$((row + 1))
+        fi
+
+        # === Clear any leftover lines from previous draws ===
+        while [ $row -lt $((lines - 1)) ]; do
+            printf "\033[%d;1H\033[2K" "$row"
+            row=$((row + 1))
+        done
+
+        # === Separator line ===
+        printf "\033[%d;1H\033[38;5;240m\033[2K " "$((lines - 1))"
+        local sep_w=$((cols - 2))
+        for ((i=0; i<sep_w; i++)); do printf "─"; done
+        printf "\033[0m"
+
+        # === Status bar (last line) ===
+        printf "\033[%d;1H\033[48;5;236m\033[2K" "$lines"
+        printf " \033[38;5;82m●\033[38;5;245m Auto-refresh: %ds" "$refresh_interval"
+        local bar_right="Last update: $timestamp "
+        local bar_pad=$((cols - 22 - ${#bar_right}))
+        [ $bar_pad -lt 0 ] && bar_pad=0
+        printf "%*s" "$bar_pad" ""
+        printf "\033[38;5;255m%s\033[0m" "$bar_right"
+
+        # Wait for key or timeout
+        if read -t "$refresh_interval" -n 1 key 2>/dev/null; then
+            case "$key" in
+                q|Q)
+                    printf "\033[?25h\033[0m" 2>/dev/null || true
+                    printf "\033[2J\033[H" 2>/dev/null || true
+                    eval "$_saved_int_trap" 2>/dev/null || trap - INT
+                    eval "$_saved_term_trap" 2>/dev/null || trap - TERM
+                    return
+                    ;;
+                r|R)
+                    first_draw=true  # Force full redraw on manual refresh
+                    continue
+                    ;;
+            esac
+        fi
+    done
+}
+
+# =============================================================================
+# Image Backup/Restore Functions
+# =============================================================================
+
+BACKUP_DIR="${PROVING_GROUND_BACKUP_DIR:-$HOME/.proving-ground-backups}"
+# Use 127.0.0.1 explicitly - 'localhost' may resolve to IPv6 and conflict with macOS AirPlay on port 5000
+REGISTRY_URL="http://127.0.0.1:5000"
+
+# Progress bar state
+PROGRESS_BAR_ACTIVE=false
+PROGRESS_BAR_SCROLL_REGION_SET=false
+PROGRESS_BAR_LAST_HEIGHT=0
+
+# Initialize progress bar
+progress_bar_init() {
+    if [ "$USE_TUI" != true ]; then
+        return
+    fi
+    PROGRESS_BAR_ACTIVE=true
+    tput civis 2>/dev/null || true  # Hide cursor
+
+    # Set up scroll region to protect the bottom status bar line
+    local term_height=$(tput lines 2>/dev/null || echo 24)
+    PROGRESS_BAR_LAST_HEIGHT=$term_height
+
+    # Create scroll region from line 0 to second-to-last line
+    # This prevents normal output from overwriting the status bar
+    tput csr 0 $((term_height - 2)) 2>/dev/null || true
+    PROGRESS_BAR_SCROLL_REGION_SET=true
+
+    # Position cursor at the end of the scroll region
+    tput cup $((term_height - 2)) 0 2>/dev/null || true
+}
+
+# Update and draw progress bar at bottom of screen
+# Usage: progress_bar_update current total "Operation" "detail"
+progress_bar_update() {
+    local current="${1:-0}"
+    local total="${2:-1}"
+    local operation="${3:-Working}"
+    local detail="${4:-}"
+
+    if [ "$PROGRESS_BAR_ACTIVE" != true ]; then
+        return
+    fi
+
+    local term_width=$(tput cols 2>/dev/null || echo 80)
+    local term_height=$(tput lines 2>/dev/null || echo 24)
+
+    # Handle terminal resize - update scroll region if height changed
+    if [ "$PROGRESS_BAR_SCROLL_REGION_SET" = true ] && [ "$term_height" != "$PROGRESS_BAR_LAST_HEIGHT" ]; then
+        PROGRESS_BAR_LAST_HEIGHT=$term_height
+        tput csr 0 $((term_height - 2)) 2>/dev/null || true
+    fi
+
+    # Calculate percentage
+    local percent=0
+    if [ "$total" -gt 0 ] 2>/dev/null; then
+        percent=$((current * 100 / total))
+    fi
+
+    # Build progress bar - fixed width of 20
+    local bar_width=20
+    local filled=$((percent * bar_width / 100))
+    local empty=$((bar_width - filled))
+
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    # Build the status line
+    local info=""
+    if [ -n "$detail" ]; then
+        info="${operation}: ${detail}"
+    else
+        info="${operation}"
+    fi
+
+    # Truncate info if needed
+    local max_info=$((term_width - 35))
+    if [ ${#info} -gt $max_info ] && [ $max_info -gt 3 ]; then
+        info="${info:0:$((max_info - 3))}..."
+    fi
+
+    # Add timestamp
+    local timestamp=$(date '+%H:%M:%S')
+
+    # Save cursor position
+    tput sc 2>/dev/null || true
+
+    # Temporarily exit scroll region to draw status bar
+    if [ "$PROGRESS_BAR_SCROLL_REGION_SET" = true ]; then
+        tput csr 0 $((term_height - 1)) 2>/dev/null || true
+    fi
+
+    # Move to bottom line and draw status bar
+    tput cup $((term_height - 1)) 0 2>/dev/null || true
+
+    # Clear line and draw progress bar with dark background
+    printf "\033[48;5;236m\033[2K"  # Dark gray background, clear line
+    printf " \033[38;5;82m%s\033[0m\033[48;5;236m %d%% │ \033[38;5;39m%s\033[0m\033[48;5;236m" "$bar" "$percent" "$info"
+
+    # Right-align timestamp
+    local content_len=$((${#bar} + ${#info} + 10))
+    local padding=$((term_width - content_len - ${#timestamp} - 2))
+    if [ $padding -gt 0 ]; then
+        printf "%*s" "$padding" ""
+    fi
+    printf "\033[38;5;245m%s \033[0m" "$timestamp"
+
+    # Restore scroll region
+    if [ "$PROGRESS_BAR_SCROLL_REGION_SET" = true ]; then
+        tput csr 0 $((term_height - 2)) 2>/dev/null || true
+    fi
+
+    # Restore cursor position
+    tput rc 2>/dev/null || true
+}
+
+# Clean up progress bar
+progress_bar_cleanup() {
+    if [ "$PROGRESS_BAR_ACTIVE" != true ]; then
+        return
+    fi
+
+    PROGRESS_BAR_ACTIVE=false
+
+    local term_height=$(tput lines 2>/dev/null || echo 24)
+
+    # Reset scroll region to full terminal before cleanup
+    if [ "$PROGRESS_BAR_SCROLL_REGION_SET" = true ]; then
+        tput csr 0 $((term_height - 1)) 2>/dev/null || true
+        PROGRESS_BAR_SCROLL_REGION_SET=false
+    fi
+
+    # Clear the progress bar line
+    tput cup $((term_height - 1)) 0 2>/dev/null || true
+    echo -ne "\033[2K"
+
+    # Move cursor to a sensible position
+    tput cup $((term_height - 2)) 0 2>/dev/null || true
+
+    tput cnorm 2>/dev/null || true  # Show cursor
+}
+
+# Get list of images from PROVING GROUND registry
+get_registry_images() {
+    local images=""
+
+    # Query registry catalog
+    local catalog=$(curl -s "${REGISTRY_URL}/v2/_catalog" 2>/dev/null) || true
+
+    if [ -z "$catalog" ] || echo "$catalog" | grep -q "error\|connection refused" 2>/dev/null; then
+        return 1
+    fi
+
+    # Parse repository names from JSON response
+    local repos=$(echo "$catalog" | grep -oE '"[^"]+/[^"]+"' | tr -d '"' | sort -u) || true
+
+    if [ -z "$repos" ]; then
+        # Try alternate JSON parsing
+        repos=$(echo "$catalog" | sed 's/.*"repositories":\[//;s/\].*//' | tr ',' '\n' | tr -d '"[] ' | grep -v '^$') || true
+    fi
+
+    # Get tags for each repository
+    for repo in $repos; do
+        local tags_json=$(curl -s "${REGISTRY_URL}/v2/${repo}/tags/list" 2>/dev/null) || true
+        local tags=$(echo "$tags_json" | sed 's/.*"tags":\[//;s/\].*//' | tr ',' '\n' | tr -d '"[] ' | grep -v '^$' | grep -v 'null') || true
+
+        for tag in $tags; do
+            if [ -n "$tag" ]; then
+                echo "localhost:5000/${repo}:${tag}"
+            fi
+        done
+    done
+}
+
+backup_images() {
+    local backup_name="${1:-}"
+
+    tui_title "Backup Registry Images"
+    echo ""
+
+    tui_info "Scanning PROVING GROUND registry at ${REGISTRY_URL}..."
+    echo ""
+
+    # Get images from registry
+    local all_images=$(get_registry_images)
+
+    if [ -z "$all_images" ]; then
+        tui_error "No images found in PROVING GROUND registry"
+        tui_info "Make sure PROVING GROUND is running and the registry has images"
+        return 1
+    fi
+
+    local total_count=$(echo "$all_images" | wc -l | tr -d ' ')
+    tui_info "Found $total_count images in registry"
+    echo ""
+
+    # Let user select which images to backup
+    local selected_images=""
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        tui_info "Select images to backup (space to select, enter to confirm):"
+        echo ""
+
+        # Use gum filter with multi-select
+        selected_images=$(echo "$all_images" | gum filter --no-limit --header "Select images (space=select, enter=confirm):" --placeholder "Type to filter...") || true
+
+        if [ -z "$selected_images" ]; then
+            # If filter returned nothing, offer to select all
+            if gum confirm "No images selected. Backup all $total_count images?"; then
+                selected_images="$all_images"
+            else
+                tui_info "Backup cancelled"
+                return 0
+            fi
+        fi
+    else
+        # Non-TUI mode: show numbered list
+        echo "Available images:"
+        local i=1
+        echo "$all_images" | while read -r img; do
+            echo "  [$i] $img"
+            i=$((i + 1))
+        done
+        echo ""
+        echo "Enter image numbers to backup (comma-separated, or 'all'):"
+        read -p "> " selection
+
+        if [ "$selection" = "all" ]; then
+            selected_images="$all_images"
+        else
+            # Parse comma-separated numbers
+            for num in $(echo "$selection" | tr ',' ' '); do
+                local img=$(echo "$all_images" | sed -n "${num}p")
+                [ -n "$img" ] && selected_images="${selected_images}${img}"$'\n'
+            done
+        fi
+    fi
+
+    if [ -z "$selected_images" ]; then
+        tui_info "No images selected, backup cancelled"
+        return 0
+    fi
+
+    local image_count=$(echo "$selected_images" | grep -v '^$' | wc -l | tr -d ' ')
+    echo ""
+    tui_info "Selected $image_count images for backup"
+
+    # Get backup name if not provided
+    if [ -z "$backup_name" ]; then
+        if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+            backup_name=$(gum input --placeholder "Enter backup name" --value "$(date +%Y%m%d_%H%M%S)") || true
+        else
+            read -p "Backup name [$(date +%Y%m%d_%H%M%S)]: " backup_name
+            [ -z "$backup_name" ] && backup_name="$(date +%Y%m%d_%H%M%S)"
+        fi
+    fi
+
+    local backup_path="$BACKUP_DIR/$backup_name"
+    mkdir -p "$backup_path"
+
+    echo ""
+    tui_info "Backup location: $backup_path"
+    echo ""
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        if ! gum confirm "Proceed with backup of $image_count images?"; then
+            tui_info "Backup cancelled"
+            rm -rf "$backup_path"
+            return 0
+        fi
+    else
+        read -p "Proceed with backup? [Y/n]: " confirm
+        if [[ "$confirm" =~ ^[Nn] ]]; then
+            echo "Backup cancelled"
+            rm -rf "$backup_path"
+            return 0
+        fi
+    fi
+
+    echo ""
+    tui_info "Starting backup (this may take a while)..."
+
+    # Initialize progress bar
+    progress_bar_init
+
+    local current=0
+    local failed=0
+
+    # Store selected images to a temp file for reliable iteration with counter
+    local temp_images="/tmp/proving_ground_backup_images_$$"
+    echo "$selected_images" | grep -v '^$' > "$temp_images"
+
+    while IFS= read -r img; do
+        if [ -n "$img" ]; then
+            current=$((current + 1))
+            local safe_name=$(echo "$img" | tr '/:' '_')
+            local tar_file="$backup_path/${safe_name}.tar"
+
+            # Update progress bar - Pulling phase
+            progress_bar_update "$current" "$image_count" "Backup" "Pulling: $img"
+            echo "  [$current/$image_count] $img"
+
+            # First pull from registry to ensure we have it locally (with explicit platform)
+            if ! docker pull --platform "$DOCKER_PLATFORM" "$img" >/dev/null 2>&1; then
+                echo -e "    ${RED}✗${NC} Failed to pull from registry"
+                failed=$((failed + 1))
+                continue
+            fi
+
+            # Update progress bar - Saving phase
+            progress_bar_update "$current" "$image_count" "Backup" "Saving: $img"
+
+            if docker save "$img" -o "$tar_file" 2>/dev/null; then
+                # Update progress bar - Compressing phase
+                progress_bar_update "$current" "$image_count" "Backup" "Compressing: ${safe_name}.tar"
+
+                gzip -f "$tar_file" 2>/dev/null || true
+                local size=$(du -h "${tar_file}.gz" 2>/dev/null | cut -f1) || size="?"
+                echo -e "    ${GREEN}✓${NC} ${safe_name}.tar.gz ($size)"
+                echo "$img|${safe_name}.tar.gz" >> "$backup_path/manifest.txt"
+            else
+                echo -e "    ${RED}✗${NC} FAILED to save"
+                failed=$((failed + 1))
+            fi
+        fi
+    done < "$temp_images"
+
+    rm -f "$temp_images"
+
+    # Clean up progress bar
+    progress_bar_cleanup
+
+    # Save metadata
+    cat > "$backup_path/backup_info.txt" << EOF
+PROVING GROUND Registry Image Backup
+Created: $(date)
+Host: $(hostname)
+Images: $image_count
+Source: ${REGISTRY_URL}
+EOF
+
+    echo ""
+    local backup_size=$(du -sh "$backup_path" 2>/dev/null | cut -f1) || backup_size="unknown"
+    tui_success "Backup complete: $backup_path ($backup_size)"
+
+    if [ "$failed" -gt 0 ]; then
+        tui_warn "$failed image(s) failed to backup"
+    fi
+
+    echo ""
+    tui_info "To restore, run: $0 --restore $backup_name"
+}
+
+restore_images() {
+    local backup_name="$1"
+
+    tui_title "Restore Registry Images"
+    echo ""
+
+    # List available backups if no name specified
+    if [ -z "$backup_name" ]; then
+        if [ ! -d "$BACKUP_DIR" ]; then
+            tui_error "No backups found at $BACKUP_DIR"
+            return 1
+        fi
+
+        local backups=$(ls -1 "$BACKUP_DIR" 2>/dev/null | sort -r) || true
+
+        if [ -z "$backups" ]; then
+            tui_error "No backups found"
+            return 1
+        fi
+
+        tui_info "Available backups:"
+        echo ""
+
+        echo "$backups" | while read -r b; do
+            if [ -d "$BACKUP_DIR/$b" ]; then
+                local size=$(du -sh "$BACKUP_DIR/$b" 2>/dev/null | cut -f1) || size="?"
+                local date_info=""
+                [ -f "$BACKUP_DIR/$b/backup_info.txt" ] && date_info=$(grep "Created:" "$BACKUP_DIR/$b/backup_info.txt" | cut -d: -f2-) || true
+                echo "  • $b ($size) $date_info"
+            fi
+        done
+
+        echo ""
+
+        if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+            backup_name=$(echo "$backups" | gum choose --header "Select backup to restore:") || true
+        else
+            read -p "Enter backup name: " backup_name
+        fi
+
+        if [ -z "$backup_name" ]; then
+            tui_info "Restore cancelled"
+            return 0
+        fi
+    fi
+
+    local backup_path="$BACKUP_DIR/$backup_name"
+
+    if [ ! -d "$backup_path" ]; then
+        tui_error "Backup not found: $backup_path"
+        return 1
+    fi
+
+    # Get list of images from manifest
+    if [ ! -f "$backup_path/manifest.txt" ]; then
+        tui_error "No manifest found in backup - cannot determine image names"
+        return 1
+    fi
+
+    # Read manifest into array-like format
+    local all_images=$(cat "$backup_path/manifest.txt" | cut -d'|' -f1)
+    local total_count=$(echo "$all_images" | wc -l | tr -d ' ')
+
+    tui_info "Backup: $backup_name"
+    tui_info "Total images in backup: $total_count"
+    echo ""
+
+    # Let user select which images to restore
+    local selected_images=""
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        tui_info "Select images to restore (space to select, enter to confirm):"
+        echo ""
+
+        # Use gum filter with multi-select
+        selected_images=$(echo "$all_images" | gum filter --no-limit --header "Select images (space=select, enter=confirm):" --placeholder "Type to filter...") || true
+
+        if [ -z "$selected_images" ]; then
+            # If filter returned nothing, offer to restore all
+            if gum confirm "No images selected. Restore all $total_count images?"; then
+                selected_images="$all_images"
+            else
+                tui_info "Restore cancelled"
+                return 0
+            fi
+        fi
+    else
+        # Non-TUI mode: show numbered list
+        echo "Available images:"
+        local i=1
+        echo "$all_images" | while read -r img; do
+            echo "  [$i] $img"
+            i=$((i + 1))
+        done
+        echo ""
+        echo "Enter image numbers to restore (comma-separated, or 'all'):"
+        read -p "> " selection
+
+        if [ "$selection" = "all" ]; then
+            selected_images="$all_images"
+        else
+            # Parse comma-separated numbers
+            for num in $(echo "$selection" | tr ',' ' '); do
+                local img=$(echo "$all_images" | sed -n "${num}p")
+                [ -n "$img" ] && selected_images="${selected_images}${img}"$'\n'
+            done
+        fi
+    fi
+
+    if [ -z "$selected_images" ]; then
+        tui_info "No images selected, restore cancelled"
+        return 0
+    fi
+
+    local image_count=$(echo "$selected_images" | grep -v '^$' | wc -l | tr -d ' ')
+    echo ""
+    tui_info "Selected $image_count images for restore"
+    echo ""
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        if ! gum confirm "Proceed with restore of $image_count images?"; then
+            tui_info "Restore cancelled"
+            return 0
+        fi
+    else
+        read -p "Proceed with restore? [Y/n]: " confirm
+        if [[ "$confirm" =~ ^[Nn] ]]; then
+            echo "Restore cancelled"
+            return 0
+        fi
+    fi
+
+    echo ""
+    tui_info "Restoring images..."
+
+    # Initialize progress bar
+    progress_bar_init
+
+    local current=0
+    local failed=0
+
+    # Store selected images to a temp file for reliable iteration with counter
+    local temp_images="/tmp/proving_ground_restore_images_$$"
+    echo "$selected_images" | grep -v '^$' > "$temp_images"
+
+    while IFS= read -r img; do
+        if [ -n "$img" ]; then
+            current=$((current + 1))
+
+            # Find the tar file for this image from manifest
+            local tar_filename=$(grep "^${img}|" "$backup_path/manifest.txt" | cut -d'|' -f2)
+
+            if [ -z "$tar_filename" ]; then
+                echo "  [$current/$image_count] $img"
+                echo -e "    ${RED}✗${NC} NOT FOUND in manifest"
+                failed=$((failed + 1))
+                continue
+            fi
+
+            local tar_file="$backup_path/$tar_filename"
+
+            if [ ! -f "$tar_file" ]; then
+                echo "  [$current/$image_count] $img"
+                echo -e "    ${RED}✗${NC} FILE NOT FOUND: $tar_filename"
+                failed=$((failed + 1))
+                continue
+            fi
+
+            # Update progress bar - Decompressing phase
+            progress_bar_update "$current" "$image_count" "Restore" "Decompressing: $tar_filename"
+            echo "  [$current/$image_count] $img"
+
+            # Update progress bar - Loading phase
+            progress_bar_update "$current" "$image_count" "Restore" "Loading: $img"
+
+            if gunzip -c "$tar_file" | docker load >/dev/null 2>&1; then
+                echo -e "    ${GREEN}✓${NC} Loaded"
+                echo "$img" >> /tmp/proving_ground_restored_images.txt
+            else
+                echo -e "    ${RED}✗${NC} FAILED to load"
+                failed=$((failed + 1))
+            fi
+        fi
+    done < "$temp_images"
+
+    rm -f "$temp_images"
+
+    # Clean up progress bar
+    progress_bar_cleanup
+
+    echo ""
+    tui_success "Restored $((image_count - failed)) of $image_count images"
+
+    if [ "$failed" -gt 0 ]; then
+        tui_warn "$failed image(s) failed to restore"
+    fi
+
+    # Offer to push to local registry
+    echo ""
+    tui_info "To use restored images in PROVING GROUND, push them to the local registry."
+    echo ""
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        if gum confirm "Push restored images to PROVING GROUND registry?"; then
+            push_restored_to_registry
+        fi
+    else
+        read -p "Push restored images to PROVING GROUND registry? [Y/n]: " push_confirm
+        if [[ ! "$push_confirm" =~ ^[Nn] ]]; then
+            push_restored_to_registry
+        fi
+    fi
+
+    # Cleanup temp file
+    rm -f /tmp/proving_ground_restored_images.txt
+}
+
+push_to_registry() {
+    tui_info "Pushing images to PROVING GROUND registry..."
+
+    # Get localhost:5000 images that need to be pushed
+    local images=$(docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep "localhost:5000" | grep -v "<none>") || true
+
+    if [ -z "$images" ]; then
+        tui_warn "No images found for local registry"
+        return
+    fi
+
+    echo "$images" | while read -r img; do
+        if [ -n "$img" ]; then
+            echo "  Pushing: $img"
+            docker push "$img" 2>/dev/null || echo "    → Failed (registry may not be running)"
+        fi
+    done
+
+    tui_success "Push complete"
+}
+
+push_restored_to_registry() {
+    tui_info "Pushing restored images to PROVING GROUND registry..."
+
+    # Check if registry is running
+    if ! curl -s "${REGISTRY_URL}/v2/" >/dev/null 2>&1; then
+        tui_error "PROVING GROUND registry is not running"
+        tui_info "Start PROVING GROUND first with: $0 --start"
+        return 1
+    fi
+
+    # Get list of restored images from temp file or scan docker
+    local images=""
+    if [ -f /tmp/proving_ground_restored_images.txt ]; then
+        images=$(cat /tmp/proving_ground_restored_images.txt | sort -u)
+    else
+        # Fallback: get all localhost:5000 images
+        images=$(docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep "localhost:5000" | grep -v "<none>") || true
+    fi
+
+    if [ -z "$images" ]; then
+        tui_warn "No images to push"
+        return
+    fi
+
+    local total=$(echo "$images" | grep -v '^$' | wc -l | tr -d ' ')
+    local current=0
+    local failed=0
+
+    # Initialize progress bar
+    progress_bar_init
+
+    # Store images to temp file for reliable iteration
+    local temp_images="/tmp/proving_ground_push_images_$$"
+    echo "$images" | grep -v '^$' > "$temp_images"
+
+    while IFS= read -r img; do
+        if [ -n "$img" ]; then
+            current=$((current + 1))
+            progress_bar_update "$current" "$total" "Push" "Pushing: $img"
+            echo "  [$current/$total] $img"
+
+            if docker push "$img" >/dev/null 2>&1; then
+                echo -e "    ${GREEN}✓${NC} Pushed"
+            else
+                echo -e "    ${RED}✗${NC} FAILED (check if registry is running)"
+                failed=$((failed + 1))
+            fi
+        fi
+    done < "$temp_images"
+
+    rm -f "$temp_images"
+
+    # Clean up progress bar
+    progress_bar_cleanup
+
+    echo ""
+    if [ "$failed" -gt 0 ]; then
+        tui_warn "$failed image(s) failed to push"
+    else
+        tui_success "All images pushed to registry"
+    fi
+}
+
+list_backups() {
+    tui_title "Available Image Backups"
+    echo ""
+
+    if [ ! -d "$BACKUP_DIR" ]; then
+        tui_info "No backups found"
+        tui_info "Backup location: $BACKUP_DIR"
+        return
+    fi
+
+    local backups=$(ls -1 "$BACKUP_DIR" 2>/dev/null) || true
+
+    if [ -z "$backups" ]; then
+        tui_info "No backups found"
+        return
+    fi
+
+    echo "$backups" | while read -r b; do
+        if [ -d "$BACKUP_DIR/$b" ]; then
+            local size=$(du -sh "$BACKUP_DIR/$b" 2>/dev/null | cut -f1) || size="?"
+            local image_count=$(ls -1 "$BACKUP_DIR/$b"/*.tar.gz 2>/dev/null | wc -l | tr -d ' ') || image_count="?"
+
+            echo ""
+            gum style --foreground 212 --bold "  $b"
+            echo "    Size: $size"
+            echo "    Images: $image_count"
+
+            if [ -f "$BACKUP_DIR/$b/backup_info.txt" ]; then
+                local created=$(grep "Created:" "$BACKUP_DIR/$b/backup_info.txt" | cut -d: -f2-) || true
+                [ -n "$created" ] && echo "    Created:$created"
+            fi
+        fi
+    done
+
+    echo ""
+    tui_info "Backup location: $BACKUP_DIR"
+}
+
+delete_backup() {
+    local backup_name="$1"
+
+    if [ -z "$backup_name" ]; then
+        # List and select
+        local backups=$(ls -1 "$BACKUP_DIR" 2>/dev/null | sort -r) || true
+
+        if [ -z "$backups" ]; then
+            tui_error "No backups found"
+            return 1
+        fi
+
+        if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+            backup_name=$(echo "$backups" | gum choose --header "Select backup to delete:") || true
+        else
+            list_backups
+            read -p "Enter backup name to delete: " backup_name
+        fi
+    fi
+
+    if [ -z "$backup_name" ]; then
+        return 0
+    fi
+
+    local backup_path="$BACKUP_DIR/$backup_name"
+
+    if [ ! -d "$backup_path" ]; then
+        tui_error "Backup not found: $backup_name"
+        return 1
+    fi
+
+    local size=$(du -sh "$backup_path" 2>/dev/null | cut -f1) || size="?"
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        if gum confirm "Delete backup '$backup_name' ($size)?"; then
+            rm -rf "$backup_path"
+            tui_success "Backup deleted: $backup_name"
+        fi
+    else
+        read -p "Delete backup '$backup_name' ($size)? [y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy] ]]; then
+            rm -rf "$backup_path"
+            echo "Backup deleted: $backup_name"
+        fi
+    fi
+}
+
+# =============================================================================
+# Factory Reset - Complete system reset to "never installed" state
+# =============================================================================
+
+factory_reset() {
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    # Get DATA_DIR (use current or detect default)
+    local data_dir="${DATA_DIR:-$(get_default_data_dir)}"
+    local backup_dir="${BACKUP_DIR:-$HOME/.proving-ground-backups}"
+
+    # =========================================================================
+    # Phase 1: Initial Warning
+    # =========================================================================
+    echo ""
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        gum style --foreground 196 --border double --border-foreground 196 \
+            --align center --width 60 --margin "1 2" --padding "1 2" \
+            "⚠️  FACTORY RESET  ⚠️" "" "Return PROVING GROUND to 'never installed' state"
+        echo ""
+        tui_warn "This will permanently remove PROVING GROUND and all its data."
+        echo ""
+
+        if ! gum confirm --affirmative="I understand, continue" --negative="Cancel" --default=false \
+            "This is a DESTRUCTIVE operation. Do you want to continue?"; then
+            tui_info "Factory reset cancelled"
+            return
+        fi
+    else
+        echo "========================================"
+        echo "         ⚠️  FACTORY RESET  ⚠️"
+        echo "========================================"
+        echo ""
+        echo "This will permanently remove PROVING GROUND and all its data."
+        echo ""
+        read -p "This is DESTRUCTIVE. Continue? [y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy] ]]; then
+            echo "Factory reset cancelled"
+            return
+        fi
+    fi
+
+    # =========================================================================
+    # Phase 2: Resource Discovery
+    # =========================================================================
+    echo ""
+    tui_title "Discovering PROVING GROUND Resources..."
+    echo ""
+
+    # Docker Volumes
+    local compose_volumes=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml config --volumes 2>/dev/null) || true
+    local dind_volumes=$(docker volume ls -q 2>/dev/null | grep "pg-range-.*-docker") || true
+    local dind_volume_count=0
+    [ -n "$dind_volumes" ] && dind_volume_count=$(echo "$dind_volumes" | wc -l | tr -d ' ')
+
+    # Get volume sizes
+    local postgres_size="unknown"
+    local minio_size="unknown"
+    if docker volume inspect proving_ground_postgres_data &>/dev/null 2>&1 || docker volume inspect postgres_data &>/dev/null 2>&1; then
+        postgres_size="exists"
+    fi
+    if docker volume inspect proving_ground_minio_data &>/dev/null 2>&1 || docker volume inspect minio_data &>/dev/null 2>&1; then
+        minio_size="exists"
+    fi
+
+    # Data directories with sizes
+    local iso_size="0"
+    local template_size="0"
+    local vm_size="0"
+    local registry_size="0"
+    local catalogs_size="0"
+    local scenarios_size="0"
+    local images_size="0"
+    local shared_size="0"
+
+    [ -d "$data_dir/iso-cache" ] && iso_size=$(du -sh "$data_dir/iso-cache" 2>/dev/null | cut -f1) || iso_size="0"
+    [ -d "$data_dir/template-storage" ] && template_size=$(du -sh "$data_dir/template-storage" 2>/dev/null | cut -f1) || template_size="0"
+    [ -d "$data_dir/vm-storage" ] && vm_size=$(du -sh "$data_dir/vm-storage" 2>/dev/null | cut -f1) || vm_size="0"
+    [ -d "$data_dir/registry" ] && registry_size=$(du -sh "$data_dir/registry" 2>/dev/null | cut -f1) || registry_size="0"
+    [ -d "$data_dir/catalogs" ] && catalogs_size=$(du -sh "$data_dir/catalogs" 2>/dev/null | cut -f1) || catalogs_size="0"
+    [ -d "$data_dir/scenarios" ] && scenarios_size=$(du -sh "$data_dir/scenarios" 2>/dev/null | cut -f1) || scenarios_size="0"
+    [ -d "$data_dir/images" ] && images_size=$(du -sh "$data_dir/images" 2>/dev/null | cut -f1) || images_size="0"
+    [ -d "$data_dir/shared" ] && shared_size=$(du -sh "$data_dir/shared" 2>/dev/null | cut -f1) || shared_size="0"
+
+    # Docker Images
+    local proving_ground_images=$(docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep "ghcr.io/jongodb/cyroid" | grep -v "<none>") || true
+    local proving_ground_image_count=0
+    [ -n "$proving_ground_images" ] && proving_ground_image_count=$(echo "$proving_ground_images" | wc -l | tr -d ' ')
+
+    local range_images=$(docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep -E "dockur/|kasmweb|vyos|qemux|localhost:5000" | grep -v "<none>") || true
+    local range_image_count=0
+    [ -n "$range_images" ] && range_image_count=$(echo "$range_images" | wc -l | tr -d ' ')
+
+    # Docker Networks
+    local proving_ground_networks=$(docker network ls --filter "name=pg-" --format "{{.Name}}" 2>/dev/null) || true
+    local range_networks=$(docker network ls --filter "name=range-" --format "{{.Name}}" 2>/dev/null) || true
+
+    # Range containers
+    local range_containers=$(docker ps -a --filter "label=proving_ground.type=dind" --format "{{.Names}}" 2>/dev/null) || true
+    local dind_containers=$(docker ps -a --filter "name=dind-" --format "{{.Names}}" 2>/dev/null) || true
+    local all_range_containers=""
+    [ -n "$range_containers" ] && all_range_containers="$range_containers"
+    if [ -n "$dind_containers" ]; then
+        [ -n "$all_range_containers" ] && all_range_containers="$all_range_containers"$'\n'"$dind_containers" || all_range_containers="$dind_containers"
+    fi
+    all_range_containers=$(echo "$all_range_containers" | sort -u | grep -v '^$') || true
+    local range_count=0
+    [ -n "$all_range_containers" ] && range_count=$(echo "$all_range_containers" | wc -l | tr -d ' ')
+
+    # Config files
+    local has_env=false
+    local env_backup_count=0
+    [ -f "$ENV_FILE" ] && has_env=true
+    env_backup_count=$(ls -1 "$PROJECT_ROOT/.env.prod.backup."* 2>/dev/null | wc -l | tr -d ' ') || env_backup_count=0
+
+    # Backups
+    local backup_size="0"
+    local backup_count=0
+    if [ -d "$backup_dir" ]; then
+        backup_size=$(du -sh "$backup_dir" 2>/dev/null | cut -f1) || backup_size="0"
+        backup_count=$(ls -1 "$backup_dir" 2>/dev/null | wc -l | tr -d ' ') || backup_count=0
+    fi
+
+    # =========================================================================
+    # Phase 3: Display discovered resources
+    # =========================================================================
+    echo "  Found resources:"
+    echo ""
+    echo "  Docker Volumes:"
+    [ -n "$compose_volumes" ] && echo "$compose_volumes" | while read -r v; do echo "    • $v"; done
+    [ "$dind_volume_count" -gt 0 ] && echo "    • $dind_volume_count DinD volume(s)"
+    echo ""
+
+    if [ -d "$data_dir" ]; then
+        echo "  Data Directory: $data_dir"
+        echo "    • iso-cache: $iso_size"
+        echo "    • template-storage: $template_size"
+        echo "    • vm-storage: $vm_size"
+        echo "    • registry: $registry_size"
+        echo "    • catalogs: $catalogs_size"
+        echo "    • scenarios: $scenarios_size"
+        echo "    • images: $images_size"
+        echo "    • shared: $shared_size"
+        echo ""
+    fi
+
+    echo "  Docker Images:"
+    echo "    • PROVING GROUND images: $proving_ground_image_count"
+    echo "    • Range images (qemu, kasmweb, vyos, etc): $range_image_count"
+    echo ""
+
+    if [ "$range_count" -gt 0 ]; then
+        echo "  Running Ranges: $range_count container(s)"
+        echo ""
+    fi
+
+    if [ "$backup_count" -gt 0 ]; then
+        echo "  Backups: $backup_count backup(s) ($backup_size)"
+        echo ""
+    fi
+
+    # =========================================================================
+    # Phase 4: Selection (what to delete)
+    # =========================================================================
+    echo ""
+    tui_title "Select what to DELETE"
+    echo ""
+
+    # Initialize deletion flags with defaults
+    local delete_db_volume=true
+    local delete_minio_volume=true
+    local delete_dind_volumes=true
+    local delete_iso_cache=false        # PRESERVE by default (large, slow to re-download)
+    local delete_templates=true
+    local delete_vm_storage=true
+    local delete_registry=true
+    local delete_catalogs=true
+    local delete_scenarios=true
+    local delete_images_dir=true
+    local delete_shared=true
+    local delete_proving_ground_images=true
+    local delete_range_images=true
+    local delete_ranges=true
+    local delete_networks=true
+    local delete_config=true
+    local delete_backups=false          # PRESERVE by default
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        # Use gum for interactive selection
+        echo "  Use ${CYAN}↑/↓${NC} to navigate, ${CYAN}space${NC} to toggle, ${CYAN}enter${NC} to confirm"
+        echo "  Items marked with ${GREEN}[✓]${NC} will be ${RED}DELETED${NC}"
+        echo ""
+
+        # Build options list with current selection state
+        local options=""
+        options+="[VOLUME] postgres_data - Database"$'\n'
+        options+="[VOLUME] minio_data - Object storage"$'\n'
+        [ "$dind_volume_count" -gt 0 ] && options+="[VOLUME] DinD volumes ($dind_volume_count) - Range Docker data"$'\n'
+        [ -d "$data_dir/iso-cache" ] && options+="[DATA] iso-cache ($iso_size) - Downloaded ISOs (SLOW TO RE-DOWNLOAD)"$'\n'
+        [ -d "$data_dir/template-storage" ] && options+="[DATA] template-storage ($template_size) - VM templates"$'\n'
+        [ -d "$data_dir/vm-storage" ] && options+="[DATA] vm-storage ($vm_size) - Running VMs"$'\n'
+        [ -d "$data_dir/registry" ] && options+="[DATA] registry ($registry_size) - Docker registry"$'\n'
+        [ -d "$data_dir/catalogs" ] && options+="[DATA] catalogs ($catalogs_size)"$'\n'
+        [ -d "$data_dir/scenarios" ] && options+="[DATA] scenarios ($scenarios_size)"$'\n'
+        [ -d "$data_dir/images" ] && options+="[DATA] images ($images_size) - Custom Dockerfiles"$'\n'
+        [ -d "$data_dir/shared" ] && options+="[DATA] shared ($shared_size)"$'\n'
+        [ "$proving_ground_image_count" -gt 0 ] && options+="[IMAGES] PROVING GROUND images ($proving_ground_image_count)"$'\n'
+        [ "$range_image_count" -gt 0 ] && options+="[IMAGES] Range images ($range_image_count) - qemu, kasmweb, vyos, etc"$'\n'
+        [ "$range_count" -gt 0 ] && options+="[RANGES] Active range containers ($range_count)"$'\n'
+        options+="[NETWORKS] Docker networks (pg-mgmt, pg-ranges)"$'\n'
+        options+="[CONFIG] .env.prod and config files"$'\n'
+        [ "$backup_count" -gt 0 ] && options+="[BACKUP] Image backups ($backup_count, $backup_size) - PRESERVED BY DEFAULT"
+
+        # Remove trailing newline
+        options=$(echo "$options" | sed '/^$/d')
+
+        # Pre-select items (everything except iso-cache and backups)
+        local preselected=""
+        preselected+="[VOLUME] postgres_data"$'\n'
+        preselected+="[VOLUME] minio_data"$'\n'
+        [ "$dind_volume_count" -gt 0 ] && preselected+="[VOLUME] DinD volumes"$'\n'
+        [ -d "$data_dir/template-storage" ] && preselected+="[DATA] template-storage"$'\n'
+        [ -d "$data_dir/vm-storage" ] && preselected+="[DATA] vm-storage"$'\n'
+        [ -d "$data_dir/registry" ] && preselected+="[DATA] registry"$'\n'
+        [ -d "$data_dir/catalogs" ] && preselected+="[DATA] catalogs"$'\n'
+        [ -d "$data_dir/scenarios" ] && preselected+="[DATA] scenarios"$'\n'
+        [ -d "$data_dir/images" ] && preselected+="[DATA] images"$'\n'
+        [ -d "$data_dir/shared" ] && preselected+="[DATA] shared"$'\n'
+        [ "$proving_ground_image_count" -gt 0 ] && preselected+="[IMAGES] PROVING GROUND images"$'\n'
+        [ "$range_image_count" -gt 0 ] && preselected+="[IMAGES] Range images"$'\n'
+        [ "$range_count" -gt 0 ] && preselected+="[RANGES] Active range"$'\n'
+        preselected+="[NETWORKS] Docker networks"$'\n'
+        preselected+="[CONFIG] .env.prod"
+
+        # Use gum choose with --no-limit for multi-select
+        local selected
+        selected=$(echo "$options" | gum choose --no-limit \
+            --header "Select items to DELETE (space=toggle, enter=confirm):" \
+            --selected="$preselected") || true
+
+        if [ -z "$selected" ]; then
+            tui_info "Nothing selected for deletion. Factory reset cancelled."
+            return
+        fi
+
+        # Parse selections
+        delete_db_volume=false
+        delete_minio_volume=false
+        delete_dind_volumes=false
+        delete_iso_cache=false
+        delete_templates=false
+        delete_vm_storage=false
+        delete_registry=false
+        delete_catalogs=false
+        delete_scenarios=false
+        delete_images_dir=false
+        delete_shared=false
+        delete_proving_ground_images=false
+        delete_range_images=false
+        delete_ranges=false
+        delete_networks=false
+        delete_config=false
+        delete_backups=false
+
+        echo "$selected" | while IFS= read -r line; do
+            case "$line" in
+                *"postgres_data"*) echo "delete_db_volume" ;;
+                *"minio_data"*) echo "delete_minio_volume" ;;
+                *"DinD volumes"*) echo "delete_dind_volumes" ;;
+                *"iso-cache"*) echo "delete_iso_cache" ;;
+                *"template-storage"*) echo "delete_templates" ;;
+                *"vm-storage"*) echo "delete_vm_storage" ;;
+                *"registry"*) echo "delete_registry" ;;
+                *"catalogs"*) echo "delete_catalogs" ;;
+                *"scenarios"*) echo "delete_scenarios" ;;
+                *"[DATA] images"*) echo "delete_images_dir" ;;
+                *"shared"*) echo "delete_shared" ;;
+                *"PROVING GROUND images"*) echo "delete_proving_ground_images" ;;
+                *"Range images"*) echo "delete_range_images" ;;
+                *"Active range"*) echo "delete_ranges" ;;
+                *"Docker networks"*) echo "delete_networks" ;;
+                *".env.prod"*) echo "delete_config" ;;
+                *"Image backups"*) echo "delete_backups" ;;
+            esac
+        done > /tmp/factory_reset_selections.tmp
+
+        # Read back the selections
+        if [ -f /tmp/factory_reset_selections.tmp ]; then
+            while IFS= read -r flag; do
+                eval "$flag=true"
+            done < /tmp/factory_reset_selections.tmp
+            rm -f /tmp/factory_reset_selections.tmp
+        fi
+
+    else
+        # Non-TUI: ask about each category
+        echo "Select what to delete (default selections shown):"
+        echo ""
+
+        read -p "Delete database volume (postgres_data)? [Y/n]: " r
+        [[ "$r" =~ ^[Nn] ]] && delete_db_volume=false
+
+        read -p "Delete object storage volume (minio_data)? [Y/n]: " r
+        [[ "$r" =~ ^[Nn] ]] && delete_minio_volume=false
+
+        if [ "$dind_volume_count" -gt 0 ]; then
+            read -p "Delete DinD volumes ($dind_volume_count)? [Y/n]: " r
+            [[ "$r" =~ ^[Nn] ]] && delete_dind_volumes=false
+        fi
+
+        if [ -d "$data_dir/iso-cache" ] && [ "$iso_size" != "0" ]; then
+            read -p "Delete ISO cache ($iso_size)? [y/N]: " r
+            [[ "$r" =~ ^[Yy] ]] && delete_iso_cache=true
+        fi
+
+        read -p "Delete template storage ($template_size)? [Y/n]: " r
+        [[ "$r" =~ ^[Nn] ]] && delete_templates=false
+
+        read -p "Delete VM storage ($vm_size)? [Y/n]: " r
+        [[ "$r" =~ ^[Nn] ]] && delete_vm_storage=false
+
+        read -p "Delete Docker registry ($registry_size)? [Y/n]: " r
+        [[ "$r" =~ ^[Nn] ]] && delete_registry=false
+
+        if [ "$proving_ground_image_count" -gt 0 ]; then
+            read -p "Delete PROVING GROUND Docker images ($proving_ground_image_count)? [Y/n]: " r
+            [[ "$r" =~ ^[Nn] ]] && delete_proving_ground_images=false
+        fi
+
+        if [ "$range_image_count" -gt 0 ]; then
+            read -p "Delete Range Docker images ($range_image_count)? [Y/n]: " r
+            [[ "$r" =~ ^[Nn] ]] && delete_range_images=false
+        fi
+
+        if [ "$range_count" -gt 0 ]; then
+            read -p "Delete running ranges ($range_count)? [Y/n]: " r
+            [[ "$r" =~ ^[Nn] ]] && delete_ranges=false
+        fi
+
+        read -p "Delete Docker networks? [Y/n]: " r
+        [[ "$r" =~ ^[Nn] ]] && delete_networks=false
+
+        read -p "Delete config files (.env.prod, traefik)? [Y/n]: " r
+        [[ "$r" =~ ^[Nn] ]] && delete_config=false
+
+        if [ "$backup_count" -gt 0 ]; then
+            read -p "Delete image backups ($backup_count, $backup_size)? [y/N]: " r
+            [[ "$r" =~ ^[Yy] ]] && delete_backups=true
+        fi
+    fi
+
+    # =========================================================================
+    # Phase 5: Summary and Final Confirmation
+    # =========================================================================
+    echo ""
+    tui_title "Factory Reset Summary"
+    echo ""
+
+    echo "  ${RED}WILL BE DELETED:${NC}"
+    [ "$delete_db_volume" = true ] && echo "    • Database volume (postgres_data)"
+    [ "$delete_minio_volume" = true ] && echo "    • Object storage volume (minio_data)"
+    [ "$delete_dind_volumes" = true ] && [ "$dind_volume_count" -gt 0 ] && echo "    • DinD volumes ($dind_volume_count)"
+    [ "$delete_iso_cache" = true ] && echo "    • ISO cache ($iso_size)"
+    [ "$delete_templates" = true ] && echo "    • Template storage ($template_size)"
+    [ "$delete_vm_storage" = true ] && echo "    • VM storage ($vm_size)"
+    [ "$delete_registry" = true ] && echo "    • Docker registry ($registry_size)"
+    [ "$delete_catalogs" = true ] && echo "    • Catalogs"
+    [ "$delete_scenarios" = true ] && echo "    • Scenarios"
+    [ "$delete_images_dir" = true ] && echo "    • Custom images/Dockerfiles"
+    [ "$delete_shared" = true ] && echo "    • Shared files"
+    [ "$delete_proving_ground_images" = true ] && echo "    • PROVING GROUND Docker images ($proving_ground_image_count)"
+    [ "$delete_range_images" = true ] && echo "    • Range Docker images ($range_image_count)"
+    [ "$delete_ranges" = true ] && [ "$range_count" -gt 0 ] && echo "    • Running ranges ($range_count)"
+    [ "$delete_networks" = true ] && echo "    • Docker networks"
+    [ "$delete_config" = true ] && echo "    • Configuration files"
+    [ "$delete_backups" = true ] && echo "    • Image backups ($backup_size)"
+    echo ""
+
+    echo "  ${GREEN}WILL BE PRESERVED:${NC}"
+    [ "$delete_db_volume" = false ] && echo "    • Database volume (postgres_data)"
+    [ "$delete_minio_volume" = false ] && echo "    • Object storage volume (minio_data)"
+    [ "$delete_dind_volumes" = false ] && [ "$dind_volume_count" -gt 0 ] && echo "    • DinD volumes"
+    [ "$delete_iso_cache" = false ] && [ -d "$data_dir/iso-cache" ] && echo "    • ISO cache ($iso_size)"
+    [ "$delete_templates" = false ] && echo "    • Template storage"
+    [ "$delete_vm_storage" = false ] && echo "    • VM storage"
+    [ "$delete_registry" = false ] && echo "    • Docker registry"
+    [ "$delete_proving_ground_images" = false ] && echo "    • PROVING GROUND Docker images"
+    [ "$delete_range_images" = false ] && echo "    • Range Docker images"
+    [ "$delete_ranges" = false ] && [ "$range_count" -gt 0 ] && echo "    • Running ranges"
+    [ "$delete_networks" = false ] && echo "    • Docker networks"
+    [ "$delete_config" = false ] && echo "    • Configuration files"
+    [ "$delete_backups" = false ] && [ "$backup_count" -gt 0 ] && echo "    • Image backups ($backup_size)"
+    echo ""
+
+    # Final confirmation
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        tui_warn "This action CANNOT be undone!"
+        echo ""
+
+        if ! gum confirm --affirmative="Yes, delete selected items" --negative="Cancel" --default=false \
+            "Proceed with factory reset?"; then
+            tui_info "Factory reset cancelled"
+            return
+        fi
+
+        # Type to confirm
+        echo ""
+        local confirm_text
+        confirm_text=$(gum input --placeholder "FACTORY RESET" --header "Type 'FACTORY RESET' to confirm:") || true
+
+        if [ "$confirm_text" != "FACTORY RESET" ]; then
+            tui_error "Confirmation text did not match. Factory reset cancelled."
+            return
+        fi
+    else
+        echo "This action CANNOT be undone!"
+        echo ""
+        read -p "Type 'FACTORY RESET' to confirm: " confirm_text
+        if [ "$confirm_text" != "FACTORY RESET" ]; then
+            echo "Confirmation text did not match. Factory reset cancelled."
+            return
+        fi
+    fi
+
+    # =========================================================================
+    # Phase 6: Execution
+    # =========================================================================
+    echo ""
+    tui_title "Executing Factory Reset..."
+    echo ""
+
+    local errors=()
+
+    # Step 1: Stop running ranges
+    if [ "$delete_ranges" = true ] && [ -n "$all_range_containers" ]; then
+        tui_info "Stopping and removing range containers..."
+        echo "$all_range_containers" | while read -r container; do
+            if [ -n "$container" ]; then
+                echo "  Removing: $container"
+                docker stop "$container" 2>/dev/null || true
+                docker rm -f "$container" 2>/dev/null || true
+            fi
+        done
+        tui_success "Range containers removed"
+    fi
+
+    # Step 2: Stop PROVING GROUND services
+    tui_info "Stopping PROVING GROUND services..."
+    if [ "$delete_db_volume" = true ] || [ "$delete_minio_volume" = true ]; then
+        clean_shutdown --volumes 2>/dev/null || $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml down -v 2>/dev/null || true
+    else
+        clean_shutdown 2>/dev/null || $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml down 2>/dev/null || true
+    fi
+    tui_success "Services stopped"
+
+    # Step 3: Remove Docker volumes
+    if [ "$delete_db_volume" = true ]; then
+        tui_info "Removing database volume..."
+        docker volume rm proving_ground_postgres_data 2>/dev/null || docker volume rm postgres_data 2>/dev/null || true
+    fi
+    if [ "$delete_minio_volume" = true ]; then
+        tui_info "Removing object storage volume..."
+        docker volume rm proving_ground_minio_data 2>/dev/null || docker volume rm minio_data 2>/dev/null || true
+    fi
+    if [ "$delete_dind_volumes" = true ] && [ -n "$dind_volumes" ]; then
+        tui_info "Removing DinD volumes..."
+        echo "$dind_volumes" | while read -r vol; do
+            [ -n "$vol" ] && docker volume rm "$vol" 2>/dev/null || true
+        done
+    fi
+
+    # Also remove traefik-logs volume
+    docker volume rm proving_ground_traefik-logs 2>/dev/null || docker volume rm traefik-logs 2>/dev/null || true
+
+    # Step 4: Remove Docker networks
+    if [ "$delete_networks" = true ]; then
+        tui_info "Removing Docker networks..."
+        docker network rm pg-mgmt 2>/dev/null || true
+        docker network rm pg-ranges 2>/dev/null || true
+        if [ -n "$range_networks" ]; then
+            echo "$range_networks" | while read -r net; do
+                [ -n "$net" ] && docker network rm "$net" 2>/dev/null || true
+            done
+        fi
+        if [ -n "$proving_ground_networks" ]; then
+            echo "$proving_ground_networks" | while read -r net; do
+                [ -n "$net" ] && docker network rm "$net" 2>/dev/null || true
+            done
+        fi
+        tui_success "Networks removed"
+    fi
+
+    # Step 5: Clean data directories
+    tui_info "Cleaning data directories..."
+    [ "$delete_iso_cache" = true ] && [ -d "$data_dir/iso-cache" ] && rm -rf "$data_dir/iso-cache" && echo "  Removed: iso-cache"
+    [ "$delete_templates" = true ] && [ -d "$data_dir/template-storage" ] && rm -rf "$data_dir/template-storage" && echo "  Removed: template-storage"
+    [ "$delete_vm_storage" = true ] && [ -d "$data_dir/vm-storage" ] && rm -rf "$data_dir/vm-storage" && echo "  Removed: vm-storage"
+    [ "$delete_registry" = true ] && [ -d "$data_dir/registry" ] && rm -rf "$data_dir/registry" && echo "  Removed: registry"
+    [ "$delete_catalogs" = true ] && [ -d "$data_dir/catalogs" ] && rm -rf "$data_dir/catalogs" && echo "  Removed: catalogs"
+    [ "$delete_scenarios" = true ] && [ -d "$data_dir/scenarios" ] && rm -rf "$data_dir/scenarios" && echo "  Removed: scenarios"
+    [ "$delete_images_dir" = true ] && [ -d "$data_dir/images" ] && rm -rf "$data_dir/images" && echo "  Removed: images"
+    [ "$delete_shared" = true ] && [ -d "$data_dir/shared" ] && rm -rf "$data_dir/shared" && echo "  Removed: shared"
+
+    # Remove empty data directory
+    if [ -d "$data_dir" ] && [ -z "$(ls -A "$data_dir" 2>/dev/null)" ]; then
+        rmdir "$data_dir" 2>/dev/null || true
+    fi
+    tui_success "Data directories cleaned"
+
+    # Step 6: Remove Docker images
+    if [ "$delete_proving_ground_images" = true ] && [ -n "$proving_ground_images" ]; then
+        tui_info "Removing PROVING GROUND Docker images..."
+        echo "$proving_ground_images" | while read -r img; do
+            [ -n "$img" ] && docker rmi "$img" 2>/dev/null || true
+        done
+        tui_success "PROVING GROUND images removed"
+    fi
+    if [ "$delete_range_images" = true ] && [ -n "$range_images" ]; then
+        tui_info "Removing Range Docker images..."
+        echo "$range_images" | while read -r img; do
+            [ -n "$img" ] && docker rmi "$img" 2>/dev/null || true
+        done
+        tui_success "Range images removed"
+    fi
+
+    # Step 7: Remove config files
+    if [ "$delete_config" = true ]; then
+        tui_info "Removing configuration files..."
+        rm -f "$ENV_FILE" 2>/dev/null || true
+        rm -f "$PROJECT_ROOT/.env.prod.backup."* 2>/dev/null || true
+        rm -f "$PROJECT_ROOT/traefik.yml" 2>/dev/null || true
+        rm -f "$PROJECT_ROOT/traefik-prod.yml" 2>/dev/null || true
+        rm -f "$PROJECT_ROOT/traefik/acme.json" 2>/dev/null || true
+        rm -rf "$PROJECT_ROOT/traefik/certs" 2>/dev/null || true
+        rm -rf "$PROJECT_ROOT/traefik/dynamic" 2>/dev/null || true
+        rm -rf "$PROJECT_ROOT/acme" 2>/dev/null || true
+        rm -rf "$PROJECT_ROOT/certs" 2>/dev/null || true
+        tui_success "Configuration removed"
+    fi
+
+    # Step 8: Remove backups
+    if [ "$delete_backups" = true ] && [ -d "$backup_dir" ]; then
+        tui_info "Removing image backups..."
+        rm -rf "$backup_dir"
+        tui_success "Image backups removed"
+    fi
+
+    # Step 9: Final Docker cleanup
+    tui_info "Final Docker cleanup..."
+    docker system prune -f 2>/dev/null || true
+    tui_success "Docker cleanup complete"
+
+    # =========================================================================
+    # Phase 7: Completion and Re-deployment Offer
+    # =========================================================================
+    echo ""
+    gum style --foreground 82 --border rounded --border-foreground 82 \
+        --align center --width 50 --margin "1 2" --padding "1 2" \
+        "✓ Factory Reset Complete" 2>/dev/null || echo "=== Factory Reset Complete ==="
+    echo ""
+
+    # Show what was preserved
+    if [ "$delete_backups" = false ] && [ "$backup_count" -gt 0 ]; then
+        tui_success "Image backups preserved at: $backup_dir"
+    fi
+    if [ "$delete_iso_cache" = false ] && [ -d "$data_dir/iso-cache" ]; then
+        tui_success "ISO cache preserved at: $data_dir/iso-cache"
+    fi
+    echo ""
+
+    # Offer re-deployment
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        local next_action
+        next_action=$(gum choose --header "What would you like to do next?" \
+            "Run fresh deployment" \
+            "Exit") || true
+
+        case "$next_action" in
+            "Run fresh deployment")
+                echo ""
+                tui_info "Starting fresh deployment..."
+                echo ""
+                # Reset state variables
+                DOMAIN=""
+                IP=""
+                EMAIL=""
+                SSL_MODE=""
+                VERSION="latest"
+                DATA_DIR=""
+                # Run deployment
+                do_deploy
+                ;;
+            "Exit"|"")
+                echo ""
+                tui_info "Run './deploy.sh' when ready to deploy again"
+                ;;
+        esac
+    else
+        echo ""
+        read -p "Run fresh deployment now? [Y/n]: " redeploy
+        if [[ ! "$redeploy" =~ ^[Nn] ]]; then
+            DOMAIN=""
+            IP=""
+            EMAIL=""
+            SSL_MODE=""
+            VERSION="latest"
+            DATA_DIR=""
+            do_deploy
+        else
+            echo "Run './deploy.sh' when ready to deploy again"
+        fi
+    fi
+}
+
+check_prerequisites() {
+    # Comprehensive pre-flight checks for all requirements
+    local errors=0
+
+    tui_info "Running pre-flight checks..."
+    echo ""
+
+    # Check Docker
+    if ! command -v docker &> /dev/null; then
+        tui_error "Docker is not installed"
+        errors=$((errors + 1))
+    elif ! docker info &> /dev/null 2>&1; then
+        tui_warn "Docker is installed but not running"
+    else
+        tui_success "Docker is available"
+    fi
+
+    # Check Docker Compose
+    if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null 2>&1; then
+        tui_error "Docker Compose is not available"
+        errors=$((errors + 1))
+    else
+        tui_success "Docker Compose is available"
+    fi
+
+    # Check curl or wget (needed for version fetching)
+    if command -v curl &> /dev/null; then
+        tui_success "curl is available"
+    elif command -v wget &> /dev/null; then
+        tui_success "wget is available"
+    else
+        tui_warn "Neither curl nor wget found (version fetching may fail)"
+    fi
+
+    # Check openssl (needed for self-signed certs)
+    if command -v openssl &> /dev/null; then
+        tui_success "OpenSSL is available"
+    else
+        tui_warn "OpenSSL not found (self-signed certs will fail)"
+    fi
+
+    # Check required files exist
+    if [ ! -f "$PROJECT_ROOT/docker-compose.yml" ]; then
+        tui_error "docker-compose.yml not found - is this the PROVING GROUND directory?"
+        errors=$((errors + 1))
+    else
+        tui_success "docker-compose.yml found"
+    fi
+
+    if [ ! -f "$PROJECT_ROOT/docker-compose.prod.yml" ]; then
+        tui_error "docker-compose.prod.yml not found"
+        errors=$((errors + 1))
+    else
+        tui_success "docker-compose.prod.yml found"
+    fi
+
+    echo ""
+
+    if [ $errors -gt 0 ]; then
+        tui_error "Pre-flight checks failed with $errors error(s)"
+        tui_info "Please fix the issues above and try again"
+        exit 1
+    fi
+
+    tui_success "All pre-flight checks passed"
+    echo ""
+}
+
+check_docker() {
+    detect_os
+
+    if ! command -v docker &> /dev/null; then
+        tui_error "Docker is not installed"
+        echo ""
+        if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+            gum style --foreground 214 "How to fix:"
+            if [ "$OS_TYPE" = "macos" ]; then
+                gum style --foreground 245 "  1. Download Docker Desktop: https://docker.com/products/docker-desktop"
+                gum style --foreground 245 "  2. Install and launch Docker Desktop"
+                gum style --foreground 245 "  3. Run this script again"
+            else
+                gum style --foreground 245 "  Ubuntu/Debian: sudo apt install docker.io docker-compose-plugin"
+                gum style --foreground 245 "  Fedora: sudo dnf install docker docker-compose-plugin"
+                gum style --foreground 245 "  Arch: sudo pacman -S docker docker-compose"
+                gum style --foreground 245 ""
+                gum style --foreground 245 "  Then: sudo systemctl enable --now docker"
+            fi
+        else
+            echo "How to fix:"
+            if [ "$OS_TYPE" = "macos" ]; then
+                echo "  1. Download Docker Desktop: https://docker.com/products/docker-desktop"
+                echo "  2. Install and launch Docker Desktop"
+                echo "  3. Run this script again"
+            else
+                echo "  Ubuntu/Debian: sudo apt install docker.io docker-compose-plugin"
+                echo "  Fedora: sudo dnf install docker docker-compose-plugin"
+                echo "  Arch: sudo pacman -S docker docker-compose"
+                echo ""
+                echo "  Then: sudo systemctl enable --now docker"
+            fi
+        fi
+        exit 1
+    fi
+
+    if ! docker info &> /dev/null; then
+        tui_error "Docker daemon is not running or permission denied"
+        echo ""
+
+        if [ "$OS_TYPE" = "macos" ]; then
+            tui_info "Docker Desktop needs to be running"
+            echo ""
+            if tui_confirm "Try to start Docker Desktop?"; then
+                open -a Docker 2>/dev/null || open /Applications/Docker.app 2>/dev/null
+                tui_info "Waiting for Docker to start..."
+                local attempts=0
+                while [ $attempts -lt 30 ]; do
+                    if docker info &> /dev/null 2>&1; then
+                        tui_success "Docker is now running!"
+                        return 0
+                    fi
+                    sleep 2
+                    attempts=$((attempts + 1))
+                    echo -n "."
+                done
+                echo ""
+                tui_error "Docker didn't start in time. Please start Docker Desktop manually and try again."
+                exit 1
+            else
+                tui_info "Please start Docker Desktop and run this script again"
+                exit 1
+            fi
+        else
+            # Linux - offer to start Docker
+            if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+                local choice
+                choice=$(gum choose --header "Docker is not running. What would you like to do?" \
+                    "Start Docker now (requires sudo)" \
+                    "Show manual fix steps" \
+                    "Cancel") || true
+
+                case "$choice" in
+                    "Start Docker"*)
+                        tui_info "Starting Docker..."
+                        if sudo systemctl start docker 2>/dev/null; then
+                            sleep 2
+                            if docker info &> /dev/null; then
+                                tui_success "Docker started successfully!"
+                                return 0
+                            fi
+                        fi
+                        tui_error "Failed to start Docker"
+                        exit 1
+                        ;;
+                    "Show"*)
+                        echo ""
+                        gum style --foreground 214 "Manual fix steps:"
+                        gum style --foreground 245 "  1. Start Docker:    sudo systemctl start docker"
+                        gum style --foreground 245 "  2. Enable on boot:  sudo systemctl enable docker"
+                        gum style --foreground 245 "  3. Fix permissions: sudo usermod -aG docker \$USER"
+                        gum style --foreground 245 "     (requires logout/login to take effect)"
+                        exit 1
+                        ;;
+                    *)
+                        exit 1
+                        ;;
+                esac
+            else
+                echo "How to fix:"
+                echo "  Start Docker:    sudo systemctl start docker"
+                echo "  Enable on boot:  sudo systemctl enable docker"
+                echo "  Fix permissions: sudo usermod -aG docker \$USER"
+                echo "                   (then log out and back in)"
+                exit 1
+            fi
+        fi
+    fi
+
+    if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+        tui_error "Docker Compose is not available"
+        echo ""
+        if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+            gum style --foreground 214 "How to fix:"
+            if [ "$OS_TYPE" = "macos" ]; then
+                gum style --foreground 245 "  Docker Compose is included with Docker Desktop."
+                gum style --foreground 245 "  Please update Docker Desktop to the latest version."
+            else
+                gum style --foreground 245 "  Install the plugin: sudo apt install docker-compose-plugin"
+                gum style --foreground 245 "  Or standalone:      sudo curl -L https://github.com/docker/compose/releases/latest/download/docker-compose-linux-\$(uname -m) -o /usr/local/bin/docker-compose && sudo chmod +x /usr/local/bin/docker-compose"
+            fi
+        else
+            echo "How to fix:"
+            if [ "$OS_TYPE" = "macos" ]; then
+                echo "  Docker Compose is included with Docker Desktop."
+                echo "  Please update Docker Desktop to the latest version."
+            else
+                echo "  Install the plugin: sudo apt install docker-compose-plugin"
+            fi
+        fi
+        exit 1
+    fi
+
+    return 0
+}
+
+check_ports() {
+    local ports_in_use=""
+    local port80_proc=""
+    local port443_proc=""
+
+    # Check if port 80 is in use (skip if we're updating an existing deployment)
+    if [ "$ACTION" != "update" ]; then
+        # Try to identify what's using the ports
+        # Check for processes LISTENING on ports (not outbound connections)
+        if command -v lsof &> /dev/null; then
+            # -sTCP:LISTEN filters to only listening sockets
+            port80_proc=$(lsof -iTCP:80 -sTCP:LISTEN -t 2>/dev/null | head -1) || true
+            port443_proc=$(lsof -iTCP:443 -sTCP:LISTEN -t 2>/dev/null | head -1) || true
+            if [ -n "$port80_proc" ]; then ports_in_use="80 $ports_in_use"; fi
+            if [ -n "$port443_proc" ]; then ports_in_use="443 $ports_in_use"; fi
+        elif command -v ss &> /dev/null; then
+            # ss -tuln shows only listening sockets
+            if ss -tuln | grep -q ':80 '; then ports_in_use="80 $ports_in_use"; fi
+            if ss -tuln | grep -q ':443 '; then ports_in_use="443 $ports_in_use"; fi
+        elif command -v netstat &> /dev/null; then
+            # netstat -tuln shows only listening sockets
+            if netstat -tuln 2>/dev/null | grep -q ':80 '; then ports_in_use="80 $ports_in_use"; fi
+            if netstat -tuln 2>/dev/null | grep -q ':443 '; then ports_in_use="443 $ports_in_use"; fi
+        fi
+
+        if [ -n "$ports_in_use" ]; then
+            tui_warn "Ports in use: $ports_in_use"
+            echo ""
+
+            # Try to identify the process
+            local proc_info=""
+            if [ -n "$port80_proc" ] && command -v ps &> /dev/null; then
+                proc_info=$(ps -p "$port80_proc" -o comm= 2>/dev/null || echo "unknown")
+                tui_info "Port 80 is used by: $proc_info (PID: $port80_proc)"
+            fi
+            if [ -n "$port443_proc" ] && command -v ps &> /dev/null; then
+                proc_info=$(ps -p "$port443_proc" -o comm= 2>/dev/null || echo "unknown")
+                tui_info "Port 443 is used by: $proc_info (PID: $port443_proc)"
+            fi
+
+            echo ""
+
+            # Check if it's a previous PROVING GROUND deployment
+            if docker ps 2>/dev/null | grep -q "proving_ground\|traefik"; then
+                tui_info "This looks like a previous PROVING GROUND deployment."
+                echo ""
+                if tui_confirm "Stop existing PROVING GROUND deployment and continue?"; then
+                    tui_info "Stopping existing deployment..."
+                    docker_compose_cmd -f docker-compose.yml -f docker-compose.prod.yml down 2>/dev/null || true
+                    sleep 2
+                    tui_success "Previous deployment stopped"
+                else
+                    tui_info "Deployment cancelled"
+                    exit 1
+                fi
+            else
+                # Offer to show what to do
+                if [ "$USE_TUI" = true ] && command -v gum &> /dev/null && [ -t 0 ]; then
+                    local choice
+                    choice=$(gum choose --header "What would you like to do?" \
+                        "Continue anyway (may fail)" \
+                        "Show how to stop the service" \
+                        "Cancel deployment") || true
+
+                    case "$choice" in
+                        "Continue"*)
+                            tui_warn "Continuing - deployment may fail if ports are blocked"
+                            ;;
+                        "Show"*)
+                            echo ""
+                            gum style --foreground 214 "To free up ports, you can:"
+                            echo ""
+                            if [ -n "$port80_proc" ]; then
+                                gum style --foreground 245 "  Stop process on port 80:  sudo kill $port80_proc"
+                            fi
+                            if [ -n "$port443_proc" ]; then
+                                gum style --foreground 245 "  Stop process on port 443: sudo kill $port443_proc"
+                            fi
+                            gum style --foreground 245 "  Stop Apache:              sudo systemctl stop apache2"
+                            gum style --foreground 245 "  Stop Nginx:               sudo systemctl stop nginx"
+                            echo ""
+                            tui_info "Run this script again after freeing the ports"
+                            exit 1
+                            ;;
+                        *)
+                            tui_info "Deployment cancelled"
+                            exit 1
+                            ;;
+                    esac
+                else
+                    if ! tui_confirm "Continue anyway?"; then
+                        echo ""
+                        echo "To free up ports, try:"
+                        echo "  sudo systemctl stop apache2"
+                        echo "  sudo systemctl stop nginx"
+                        if [ -n "$port80_proc" ]; then echo "  sudo kill $port80_proc"; fi
+                        if [ -n "$port443_proc" ]; then echo "  sudo kill $port443_proc"; fi
+                        exit 1
+                    fi
+                fi
+            fi
+        else
+            tui_success "Ports 80 and 443 are available"
+        fi
+    fi
+
+    return 0
+}
+
+check_data_dir_writable() {
+    local parent_dir=$(dirname "$DATA_DIR")
+
+    # Check if we can create the data directory
+    if [ -d "$DATA_DIR" ]; then
+        if [ ! -w "$DATA_DIR" ]; then
+            log_error "Data directory $DATA_DIR exists but is not writable"
+            log_info "Try: sudo chown -R \$(id -u):\$(id -g) $DATA_DIR"
+            exit 1
+        fi
+    elif [ -d "$parent_dir" ]; then
+        if [ ! -w "$parent_dir" ]; then
+            log_warn "Cannot write to $parent_dir - will need sudo to create data directory"
+        fi
+    fi
+}
+
+backup_env_file() {
+    if [ -f "$ENV_FILE" ]; then
+        local backup="${ENV_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$ENV_FILE" "$backup"
+        log_info "Backed up existing config to $backup"
+    fi
+}
+
+docker_compose_cmd() {
+    local env_args=""
+    if [ -f "$ENV_FILE" ]; then
+        env_args="--env-file $ENV_FILE"
+    fi
+    if docker compose version &> /dev/null 2>&1; then
+        docker compose $env_args "$@"
+    else
+        docker-compose $env_args "$@"
+    fi
+}
+
+# Clean shutdown of services with professional output
+# Usage: clean_shutdown [--volumes]
+clean_shutdown() {
+    local remove_volumes=false
+    if [ "$1" = "--volumes" ]; then
+        remove_volumes=true
+    fi
+
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    # Get list of running containers
+    local containers=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps -q 2>/dev/null | wc -l | tr -d ' ')
+
+    if [ "$containers" -gt 0 ]; then
+        # Show what we're stopping
+        echo -e "  ${CYAN}▸${NC} Stopping $containers containers..."
+
+        # Run docker compose down with output suppressed
+        if [ "$remove_volumes" = true ]; then
+            $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml down -v --remove-orphans >/dev/null 2>&1
+        else
+            $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml down --remove-orphans >/dev/null 2>&1
+        fi
+
+        echo -e "  ${GREEN}✓${NC} Containers stopped"
+    else
+        echo -e "  ${GREEN}✓${NC} No services running"
+    fi
+
+    if [ "$remove_volumes" = true ]; then
+        echo -e "  ${GREEN}✓${NC} Compose volumes removed"
+
+        # Also remove any orphaned PROVING GROUND-related volumes
+        local proving_ground_volumes=$(docker volume ls -q --filter "name=proving_ground" 2>/dev/null)
+        if [ -n "$proving_ground_volumes" ]; then
+            echo -e "  ${CYAN}▸${NC} Removing orphaned PROVING GROUND volumes..."
+            echo "$proving_ground_volumes" | xargs -r docker volume rm 2>/dev/null || true
+            echo -e "  ${GREEN}✓${NC} Orphaned volumes removed"
+        fi
+
+        # Remove project-specific volumes by compose project name
+        local project_name=$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+        local project_volumes=$(docker volume ls -q --filter "name=${project_name}_" 2>/dev/null)
+        if [ -n "$project_volumes" ]; then
+            echo -e "  ${CYAN}▸${NC} Removing project volumes..."
+            echo "$project_volumes" | xargs -r docker volume rm 2>/dev/null || true
+            echo -e "  ${GREEN}✓${NC} Project volumes removed"
+        fi
+
+        # Clean up dangling volumes (volumes not attached to any container)
+        local dangling=$(docker volume ls -q -f dangling=true 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$dangling" -gt 0 ]; then
+            echo -e "  ${CYAN}▸${NC} Pruning $dangling dangling volumes..."
+            docker volume prune -f >/dev/null 2>&1 || true
+            echo -e "  ${GREEN}✓${NC} Dangling volumes pruned"
+        fi
+    fi
+}
+
+show_help() {
+    echo "PROVING GROUND Production Deployment Script"
+    echo ""
+    echo "A full TUI for deploying and managing PROVING GROUND in production."
+    echo "Uses 'gum' for beautiful terminal interfaces (auto-installs on macOS)."
+    echo ""
+    echo "Installation:"
+    echo "  # Option 1: Git clone (recommended for updates)"
+    echo "  git clone https://github.com/JongoDB/PROVING GROUND.git && cd PROVING GROUND"
+    echo "  ./scripts/deploy.sh"
+    echo ""
+    echo "  # Option 2: Standalone (downloads required files automatically)"
+    echo "  curl -fsSL https://raw.githubusercontent.com/JongoDB/PROVING GROUND/master/scripts/deploy.sh -o deploy.sh"
+    echo "  bash deploy.sh"
+    echo ""
+    echo "Usage:"
+    echo "  $0                                    Interactive TUI setup"
+    echo "  $0 --domain example.com              Domain with Let's Encrypt"
+    echo "  $0 --ip 192.168.1.100                IP with self-signed cert"
+    echo "  $0 --update                          Update (interactive version)"
+    echo "  $0 --start                           Start stopped deployment"
+    echo "  $0 --stop                            Stop all services"
+    echo "  $0 --restart                         Restart all services"
+    echo "  $0 --status                          Show service status"
+    echo ""
+    echo "Lifecycle Commands:"
+    echo "  --start            Start a stopped PROVING GROUND deployment"
+    echo "  --stop             Stop all running services"
+    echo "  --restart          Stop then start all services"
+    echo "  --update           Update to new version (interactive selection)"
+    echo "  --status           Show current status and health"
+    echo ""
+    echo "Image Backup/Restore:"
+    echo "  --backup [NAME]    Backup all PROVING GROUND Docker images to disk"
+    echo "  --restore [NAME]   Restore Docker images from a backup"
+    echo "                     NAME is optional - interactive selection if omitted"
+    echo ""
+    echo "Script Maintenance:"
+    echo "  --self-update      Update this script to the latest version"
+    echo ""
+    echo "Deploy Options:"
+    echo "  --domain DOMAIN    Domain name for the server"
+    echo "  --ip IP            IP address for the server"
+    echo "  --email EMAIL      Email for Let's Encrypt notifications"
+    echo "  --ssl MODE         SSL mode: letsencrypt, selfsigned, manual"
+    echo "  --version VER      PROVING GROUND version (default: interactive)"
+    echo "  --data-dir DIR     Data directory (default: auto by OS)"
+    echo "  -y, --yes          Non-interactive mode (use defaults)"
+    echo "  --admin-user USER  Admin username (default: admin)"
+    echo "  --admin-password P Admin password (default: admin123)"
+    echo "  --admin-email E    Admin email (default: admin@example.com)"
+    echo "  --help             Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  # Interactive deployment (recommended)"
+    echo "  $0"
+    echo ""
+    echo "  # Deploy with domain and Let's Encrypt"
+    echo "  $0 --domain proving_ground.example.com --email admin@example.com"
+    echo ""
+    echo "  # Update to specific version"
+    echo "  $0 --update --version v0.30.0"
+    echo ""
+    echo "  # Check status"
+    echo "  $0 --status"
+    echo ""
+    echo "  # Backup Docker images"
+    echo "  $0 --backup                         # Interactive name selection"
+    echo "  $0 --backup my-backup               # Named backup"
+    echo ""
+    echo "  # Restore Docker images"
+    echo "  $0 --restore                        # Interactive backup selection"
+    echo "  $0 --restore my-backup              # Restore specific backup"
+    echo ""
+    echo "  # Update this script"
+    echo "  $0 --self-update                    # Check and update deploy.sh"
+    echo ""
+    echo "Script version: $SCRIPT_VERSION"
+}
+
+# =============================================================================
+# Deployment Functions
+# =============================================================================
+
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)     OS_TYPE="linux" ;;
+        Darwin*)    OS_TYPE="macos" ;;
+        *)          OS_TYPE="unknown" ;;
+    esac
+    return 0
+}
+
+get_default_data_dir() {
+    detect_os
+    if [ "$OS_TYPE" = "macos" ]; then
+        # macOS: use home directory since /data requires special setup
+        echo "$HOME/.proving_ground/data"
+    else
+        # Linux: use /data/proving-ground (standard location)
+        echo "/data/proving-ground"
+    fi
+}
+
+create_data_directories() {
+    log_step "Creating data directories"
+
+    detect_os
+
+    # Check if we need sudo (can't write to parent directory)
+    local parent_dir=$(dirname "$DATA_DIR")
+    local need_sudo=false
+
+    if [ ! -d "$DATA_DIR" ]; then
+        if [ -d "$parent_dir" ] && [ ! -w "$parent_dir" ]; then
+            need_sudo=true
+        elif [ ! -d "$parent_dir" ]; then
+            # Parent doesn't exist, check its parent
+            local grandparent=$(dirname "$parent_dir")
+            if [ ! -w "$grandparent" ]; then
+                need_sudo=true
+            fi
+        fi
+    fi
+
+    # All directories needed by PROVING GROUND
+    local dirs="iso-cache template-storage vm-storage shared catalogs scenarios images registry"
+
+    if [ "$need_sudo" = true ]; then
+        log_info "Need elevated permissions to create $DATA_DIR"
+        sudo mkdir -p "$DATA_DIR"/{iso-cache,template-storage,vm-storage,shared,catalogs,scenarios,images,registry}
+        sudo chown -R "$(id -u):$(id -g)" "$DATA_DIR"
+    else
+        mkdir -p "$DATA_DIR"/{iso-cache,template-storage,vm-storage,shared,catalogs,scenarios,images,registry}
+    fi
+
+    log_info "Data directory: $DATA_DIR"
+    log_info "Operating system: $OS_TYPE"
+
+    # Create registry config file if missing (must be a file, not directory)
+    local registry_config="$PROJECT_ROOT/config/registry-config.yml"
+    if [ -d "$registry_config" ]; then
+        log_warn "Removing invalid registry config directory"
+        rm -rf "$registry_config"
+    fi
+    if [ ! -f "$registry_config" ]; then
+        mkdir -p "$PROJECT_ROOT/config"
+        cat > "$registry_config" << 'REGISTRYEOF'
+version: 0.1
+log:
+  level: info
+storage:
+  filesystem:
+    rootdirectory: /var/lib/registry
+  delete:
+    enabled: true
+http:
+  addr: :5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+REGISTRYEOF
+        log_info "Created registry config"
+    fi
+}
+
+create_env_file() {
+    log_step "Configuring environment"
+
+    # Determine address to use
+    local address="${DOMAIN:-$IP}"
+
+    # Determine SSL mode
+    if [ -z "$SSL_MODE" ]; then
+        if [ -n "$DOMAIN" ]; then
+            SSL_MODE="letsencrypt"
+        else
+            SSL_MODE="selfsigned"
+        fi
+    fi
+
+    # Generate secrets if needed
+    local jwt_secret=""
+    local pg_password=""
+    local minio_password=""
+
+    if [ -f "$ENV_FILE" ]; then
+        # Load existing secrets
+        source "$ENV_FILE" 2>/dev/null || true
+        jwt_secret="${JWT_SECRET_KEY:-}"
+        pg_password="${POSTGRES_PASSWORD:-}"
+        minio_password="${MINIO_SECRET_KEY:-}"
+    fi
+
+    # Generate any missing secrets
+    if [ -z "$jwt_secret" ]; then
+        jwt_secret=$(generate_secret)
+        log_info "Generated JWT secret"
+    fi
+    if [ -z "$pg_password" ]; then
+        pg_password=$(generate_secret | head -c 32)
+        log_info "Generated PostgreSQL password"
+    fi
+    if [ -z "$minio_password" ]; then
+        minio_password=$(generate_secret | head -c 32)
+        log_info "Generated MinIO password"
+    fi
+
+    # Set SSL resolver for Let's Encrypt
+    local ssl_resolver=""
+    if [ "$SSL_MODE" = "letsencrypt" ]; then
+        ssl_resolver="letsencrypt"
+    fi
+
+    # Write environment file
+    cat > "$ENV_FILE" << EOF
+# PROVING GROUND Production Environment
+# Generated by deploy.sh on $(date)
+
+# Server Configuration
+DOMAIN=$address
+SSL_MODE=$SSL_MODE
+SSL_RESOLVER=$ssl_resolver
+ACME_EMAIL=${EMAIL:-admin@${address}}
+
+# Secrets (auto-generated)
+JWT_SECRET_KEY=$jwt_secret
+POSTGRES_PASSWORD=$pg_password
+MINIO_SECRET_KEY=$minio_password
+
+# Settings
+DEBUG=false
+VERSION=${VERSION#v}
+PROVING_GROUND_DATA_DIR=$DATA_DIR
+
+# DinD Configuration
+DIND_IMAGE=ghcr.io/jongodb/cyroid-dind:${VERSION#v}
+DIND_STARTUP_TIMEOUT=60
+DIND_DOCKER_PORT=2375
+
+# Network Configuration
+PROVING_GROUND_MGMT_NETWORK=pg-mgmt
+PROVING_GROUND_MGMT_SUBNET=172.30.0.0/24
+PROVING_GROUND_RANGES_NETWORK=pg-ranges
+PROVING_GROUND_RANGES_SUBNET=172.30.1.0/24
+EOF
+
+    chmod 600 "$ENV_FILE"
+    log_info "Environment file: $ENV_FILE"
+    log_info "SSL Mode: $SSL_MODE"
+}
+
+setup_ssl() {
+    log_step "Setting up SSL certificates"
+
+    # Generate production Traefik config with correct email
+    generate_traefik_config
+
+    # Ensure directories exist (needed for docker-compose mounts)
+    mkdir -p "$PROJECT_ROOT/certs"
+    mkdir -p "$PROJECT_ROOT/acme"
+    mkdir -p "$PROJECT_ROOT/traefik/dynamic"
+
+    # Ensure acme.json exists with correct permissions
+    if [ ! -f "$PROJECT_ROOT/acme/acme.json" ]; then
+        touch "$PROJECT_ROOT/acme/acme.json"
+        chmod 600 "$PROJECT_ROOT/acme/acme.json"
+    fi
+
+    # Create base traefik dynamic config if missing (defensive - should be in git)
+    if [ ! -f "$PROJECT_ROOT/traefik/dynamic/base.yml" ]; then
+        cat > "$PROJECT_ROOT/traefik/dynamic/base.yml" << 'BASEEOF'
+# Traefik dynamic configuration
+http:
+  serversTransports:
+    # Transport for containers with self-signed certs (KasmVNC, etc.)
+    insecure-transport:
+      insecureSkipVerify: true
+
+tls:
+  # Default certificate store
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/certs/cert.pem
+        keyFile: /etc/traefik/certs/key.pem
+
+  # Certificate configuration
+  certificates:
+    - certFile: /etc/traefik/certs/cert.pem
+      keyFile: /etc/traefik/certs/key.pem
+      stores:
+        - default
+
+  # TLS options
+  options:
+    default:
+      minVersion: VersionTLS12
+      sniStrict: false
+BASEEOF
+    fi
+
+    case "$SSL_MODE" in
+        letsencrypt)
+            log_info "Using Let's Encrypt for automatic certificates"
+            log_info "Certificates will be obtained on first request"
+            ;;
+
+        selfsigned)
+            log_info "Generating self-signed certificate"
+            generate_self_signed_cert "${DOMAIN:-$IP}"
+            ;;
+
+        manual)
+            if [ ! -f "$PROJECT_ROOT/certs/cert.pem" ] || [ ! -f "$PROJECT_ROOT/certs/key.pem" ]; then
+                log_error "Manual SSL mode requires certificates in ./certs/"
+                log_info "Please place your certificate files:"
+                log_info "  - ./certs/cert.pem"
+                log_info "  - ./certs/key.pem"
+                exit 1
+            fi
+            log_info "Using manually provided certificates"
+            ;;
+    esac
+}
+
+generate_self_signed_cert() {
+    local hostname="$1"
+    local certs_dir="$PROJECT_ROOT/certs"
+
+    # Check for openssl
+    if ! command -v openssl &> /dev/null; then
+        tui_error "OpenSSL is not installed (required for self-signed certificates)"
+        echo ""
+        if [ "$OS_TYPE" = "macos" ]; then
+            tui_info "Install with: brew install openssl"
+        else
+            tui_info "Install with: sudo apt install openssl  OR  sudo dnf install openssl"
+        fi
+        exit 1
+    fi
+
+    # Determine if input is an IP address or domain
+    local san cn
+    if [[ "$hostname" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        san="IP:$hostname"
+        cn="$hostname"
+    else
+        san="DNS:$hostname,DNS:*.$hostname"
+        cn="$hostname"
+    fi
+
+    # Generate certificate (non-interactive, always overwrite)
+    openssl req -x509 -nodes -days 365 \
+        -newkey rsa:2048 \
+        -keyout "$certs_dir/key.pem" \
+        -out "$certs_dir/cert.pem" \
+        -subj "/CN=$cn/O=PROVING GROUND/OU=Cyber Range" \
+        -addext "subjectAltName=$san" \
+        -addext "keyUsage=digitalSignature,keyEncipherment" \
+        -addext "extendedKeyUsage=serverAuth" \
+        2>/dev/null
+
+    chmod 644 "$certs_dir/cert.pem"
+    chmod 600 "$certs_dir/key.pem"
+
+    log_info "Certificate generated for: $hostname"
+}
+
+generate_traefik_config() {
+    local acme_email="${EMAIL:-admin@${DOMAIN:-$IP}}"
+    local traefik_config="$PROJECT_ROOT/traefik-prod.yml"
+
+    log_info "Generating Traefik production config"
+
+    cat > "$traefik_config" << EOF
+# Traefik Production Configuration (Generated by deploy.sh)
+#
+# Features:
+# - ACME (Let's Encrypt) automatic certificate management
+# - HTTP to HTTPS redirect
+# - Dashboard disabled for security
+# - Health check ping endpoint on :8082
+
+api:
+  insecure: false
+  dashboard: false
+
+# Health check ping endpoint
+ping:
+  entryPoint: traefik
+
+entryPoints:
+  # Internal entrypoint for health checks
+  traefik:
+    address: ":8082"
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    exposedByDefault: false
+    network: pg-mgmt
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "$acme_email"
+      storage: /etc/traefik/acme/acme.json
+      httpChallenge:
+        entryPoint: web
+
+log:
+  level: WARN
+  format: common
+EOF
+
+    log_info "Traefik config generated with email: $acme_email"
+}
+
+init_networks() {
+    log_step "Initializing Docker networks"
+
+    # Create management network if not exists
+    if ! docker network inspect pg-mgmt &>/dev/null; then
+        log_info "Creating pg-mgmt network..."
+        docker network create \
+            --driver bridge \
+            --subnet 172.30.0.0/24 \
+            --gateway 172.30.0.1 \
+            pg-mgmt >/dev/null 2>&1
+        log_info "Created pg-mgmt (172.30.0.0/24)"
+    else
+        log_info "pg-mgmt network already exists"
+    fi
+
+    # Create ranges network if not exists
+    if ! docker network inspect pg-ranges &>/dev/null; then
+        log_info "Creating pg-ranges network..."
+        docker network create \
+            --driver bridge \
+            --subnet 172.30.1.0/24 \
+            --gateway 172.30.1.1 \
+            pg-ranges >/dev/null 2>&1
+        log_info "Created pg-ranges (172.30.1.0/24)"
+    else
+        log_info "pg-ranges network already exists"
+    fi
+}
+
+pull_images() {
+    cd "$PROJECT_ROOT"
+
+    # Export env vars for docker-compose
+    export $(grep -v '^#' "$ENV_FILE" | xargs) 2>/dev/null || true
+
+    # Ensure platform is set for multi-arch pulls
+    detect_platform
+    log_info "Pulling images for platform: $DOCKER_PLATFORM"
+
+    # Determine docker compose command
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    # Get list of images to show what we're pulling
+    local images
+    images=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml config 2>/dev/null | grep 'image:' | awk '{print $2}' | sort -u) || true
+
+    # Add additional images needed for range deployment (not in docker-compose)
+    local extra_images="ghcr.io/jongodb/cyroid-dind:${VERSION:-latest}"
+    if [ -n "$images" ]; then
+        images=$(echo -e "$images\n$extra_images" | sort -u)
+    else
+        images="$extra_images"
+    fi
+
+    if [ -n "$images" ]; then
+        local total=$(echo "$images" | wc -l | tr -d ' ')
+
+        # Only print detailed output if not in fullscreen TUI mode
+        if [ "$TUI_FULLSCREEN" != true ]; then
+            printf "\n"
+            tui_info "Pulling $total images for $DOCKER_PLATFORM:"
+        fi
+
+        local current=0
+        # Store images to temp file for reliable iteration
+        local temp_images="/tmp/proving_ground_pull_images_$$"
+        echo "$images" > "$temp_images"
+
+        while IFS= read -r img; do
+            current=$((current + 1))
+            local name=$(echo "$img" | sed 's/.*\///' | cut -d: -f1)
+
+            # Update progress
+            if [ "$TUI_FULLSCREEN" = true ]; then
+                tui_set_status "Pulling ($current/$total): $name" "progress" "$current/$total"
+            else
+                progress_bar_update "$current" "$total" "Pull Images" "$img"
+                printf "  [%d/%d] %s\n" "$current" "$total" "$name"
+            fi
+
+            # Pull individual image with explicit platform to avoid multi-arch issues
+            if docker pull --platform "$DOCKER_PLATFORM" "$img" >/dev/null 2>&1; then
+                if [ "$TUI_FULLSCREEN" = true ]; then
+                    tui_log "✓ Pulled $name"
+                else
+                    printf "    \033[32m✓\033[0m Pulled\n"
+                fi
+            else
+                # Check if image exists locally
+                if docker image inspect "$img" &>/dev/null; then
+                    if [ "$TUI_FULLSCREEN" = true ]; then
+                        tui_log "✓ $name (cached locally)"
+                    else
+                        printf "    \033[33m⚠\033[0m Using cached local image\n"
+                    fi
+                else
+                    if [ "$TUI_FULLSCREEN" = true ]; then
+                        tui_log "✗ $name (pull failed, not found locally)"
+                    else
+                        printf "    \033[31m✗\033[0m Pull failed and image not found locally!\n"
+                    fi
+                fi
+            fi
+        done < "$temp_images"
+
+        rm -f "$temp_images"
+        [ "$TUI_FULLSCREEN" != true ] && printf "\n" || true
+    else
+        # Fallback to compose pull if we can't parse images
+        $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml pull
+    fi
+}
+
+start_services() {
+    cd "$PROJECT_ROOT"
+
+    # Export env vars for docker-compose
+    set -a
+    source "$ENV_FILE"
+    set +a
+
+    # Determine docker compose command
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    # Start services (don't use gum spin - it can fail silently)
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        # Capture output and errors, log them to TUI activity log
+        local compose_output
+        compose_output=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml up -d 2>&1) || true
+        # Log any errors to TUI activity log
+        if [ -n "$compose_output" ]; then
+            while IFS= read -r line; do
+                if [[ "$line" == *"Error"* ]] || [[ "$line" == *"error"* ]] || [[ "$line" == *"not found"* ]]; then
+                    tui_log "✗ $line"
+                fi
+            done <<< "$compose_output"
+        fi
+    else
+        $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml up -d 2>&1 | while read -r line; do
+            if [ -n "$line" ]; then
+                echo "  $line"
+            fi
+        done || true
+    fi
+
+    # Verify containers actually started
+    sleep 3
+    local running_count
+    running_count=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps 2>/dev/null | grep -c "Up") || running_count=0
+
+    if [ "$running_count" -eq 0 ]; then
+        tui_log "✗ No containers started - checking for errors..."
+        # Show compose logs for diagnosis
+        local error_logs
+        error_logs=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml logs --tail=5 2>&1 | grep -iE "error|fatal|fail|not found" | head -5) || true
+        if [ -n "$error_logs" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && tui_log "✗ $line"
+            done <<< "$error_logs"
+        fi
+        SERVICES_STARTED=false
+        return 1
+    fi
+
+    tui_log "$running_count containers running"
+
+    # Retry any stuck in "Created" state
+    local created_containers=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps --filter "status=created" -q 2>/dev/null) || true
+    if [ -n "$created_containers" ]; then
+        log_warn "Some containers didn't start, retrying..."
+        echo "$created_containers" | xargs -r docker start 2>/dev/null || true
+        sleep 2
+    fi
+    SERVICES_STARTED=true
+}
+
+wait_for_health() {
+    local max_attempts=60
+    local attempt=0
+    local target_healthy=8  # All 8 services should be healthy
+
+    local last_healthy=-1
+    while [ $attempt -lt $max_attempts ]; do
+        local healthy_count
+        healthy_count=$(docker_compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps 2>/dev/null | grep -c "(healthy)") || healthy_count=0
+        local running_count
+        running_count=$(docker_compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps 2>/dev/null | grep -c "Up") || running_count=0
+
+        # Update progress bar
+        if [ "$TUI_FULLSCREEN" = true ]; then
+            tui_set_status "Waiting for services... ($healthy_count/$target_healthy healthy)" "progress" "$healthy_count/$target_healthy"
+            # Log when healthy count changes
+            if [ "$healthy_count" -ne "$last_healthy" ]; then
+                last_healthy=$healthy_count
+                if [ "$healthy_count" -gt 0 ]; then
+                    tui_log "$healthy_count/$target_healthy services healthy"
+                fi
+            fi
+        else
+            progress_bar_update "$healthy_count" "$target_healthy" "Health Check" "$healthy_count/$target_healthy healthy, $running_count running"
+        fi
+
+        if [ "$healthy_count" -ge "$target_healthy" ]; then
+            tui_set_status "All services healthy!" "success"
+            tui_success "All services are healthy!"
+            return 0
+        fi
+
+        attempt=$((attempt + 1))
+
+        # After 15 attempts (30s), log which services are not healthy
+        if [ "$attempt" -eq 15 ] && [ "$TUI_FULLSCREEN" = true ] && [ "$running_count" -lt "$target_healthy" ]; then
+            local not_running
+            not_running=$(docker_compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps 2>/dev/null | grep -v "Up" | grep -v "NAME" | awk '{print $1}' | head -5) || true
+            if [ -n "$not_running" ]; then
+                while IFS= read -r svc; do
+                    [ -n "$svc" ] && tui_log "⚠ Not running: $svc"
+                done <<< "$not_running"
+            fi
+        fi
+
+        # Show dots in non-TUI mode without progress bar
+        if [ "$USE_TUI" != true ]; then
+            echo -n "."
+        fi
+
+        sleep 2
+    done
+
+    [ "$TUI_FULLSCREEN" != true ] && echo "" || true
+    tui_set_status "Some services may not be healthy" "warn"
+    tui_warn "Some services may not be fully healthy yet"
+    tui_info "Check status with: $0 --status"
+    tui_info "View logs with: docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f"
+}
+
+create_initial_admin() {
+    # Create the initial admin user via API
+    local address="${DOMAIN:-$IP}"
+    local protocol="https"
+    local api_url="${protocol}://${address}/api/v1/auth/register"
+
+    # Default credentials
+    local default_username="admin"
+    local default_email="admin@example.com"
+    local default_password="admin123"
+
+    if [ "$TUI_FULLSCREEN" != true ]; then
+        echo ""
+        tui_title "Step 5: Initial Admin User"
+        echo ""
+    fi
+
+    # TUI input with defaults pre-filled
+    local admin_username admin_email admin_password
+
+    # Check for CLI-provided credentials first
+    if [ -n "$CLI_ADMIN_USER" ] || [ -n "$CLI_ADMIN_PASSWORD" ] || [ -n "$CLI_ADMIN_EMAIL" ] || [ "$NON_INTERACTIVE" = true ]; then
+        # Use CLI flags or defaults in non-interactive mode
+        admin_username="${CLI_ADMIN_USER:-$default_username}"
+        admin_email="${CLI_ADMIN_EMAIL:-$default_email}"
+        admin_password="${CLI_ADMIN_PASSWORD:-$default_password}"
+        tui_info "Using provided/default credentials (non-interactive mode)"
+    elif [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        # Suspend scroll region for interactive gum input
+        tui_suspend_scroll_region
+        admin_username=$(gum input --placeholder "admin" --value "$default_username" --header "Admin username:") || true
+        admin_email=$(gum input --placeholder "admin@example.com" --value "$default_email" --header "Admin email:") || true
+        admin_password=$(gum input --placeholder "admin123" --value "$default_password" --password --header "Admin password:") || true
+        # Restore scroll region after input
+        tui_restore_scroll_region
+    else
+        read -p "Admin username [$default_username]: " admin_username
+        admin_username="${admin_username:-$default_username}"
+        read -p "Admin email [$default_email]: " admin_email
+        admin_email="${admin_email:-$default_email}"
+        read -sp "Admin password [$default_password]: " admin_password
+        admin_password="${admin_password:-$default_password}"
+        echo ""
+    fi
+
+    # Use defaults if empty
+    admin_username="${admin_username:-$default_username}"
+    admin_email="${admin_email:-$default_email}"
+    admin_password="${admin_password:-$default_password}"
+
+    echo ""
+    tui_info "Creating admin user: $admin_username ($admin_email)"
+
+    # Wait a bit for API to be fully ready
+    sleep 3
+
+    # Call the register API (-k for self-signed certs)
+    local response
+    local http_code
+
+    if command -v curl &> /dev/null; then
+        response=$(curl -sk -w "\n%{http_code}" -X POST "$api_url" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"$admin_username\",\"email\":\"$admin_email\",\"password\":\"$admin_password\"}" 2>/dev/null)
+    elif command -v wget &> /dev/null; then
+        response=$(wget -qO- --no-check-certificate --post-data="{\"username\":\"$admin_username\",\"email\":\"$admin_email\",\"password\":\"$admin_password\"}" \
+            --header="Content-Type: application/json" "$api_url" 2>/dev/null)
+        http_code="200"
+    else
+        tui_warn "Neither curl nor wget available - skipping admin user creation"
+        tui_info "Register the first user through the web UI to become admin"
+        return 0
+    fi
+
+    # Parse response (last line is http code from curl)
+    if command -v curl &> /dev/null; then
+        http_code=$(echo "$response" | tail -n1)
+        response=$(echo "$response" | sed '$d')
+    fi
+
+    if [ "$http_code" = "201" ]; then
+        tui_success "Admin user '$admin_username' created successfully!"
+
+        # Store credentials for display
+        ADMIN_USERNAME="$admin_username"
+        ADMIN_EMAIL="$admin_email"
+        ADMIN_PASSWORD="$admin_password"
+    elif echo "$response" | grep -q "already registered"; then
+        tui_warn "User already exists - skipping admin creation"
+        tui_info "An admin user may have been created previously"
+    else
+        tui_warn "Could not create admin user automatically"
+        tui_info "Register through the web UI - first user becomes admin"
+        if [ -n "$response" ]; then
+            tui_info "API response: $response"
+        fi
+    fi
+}
+
+seed_students() {
+    # Seed user accounts via API (requires admin login)
+    local address="${DOMAIN:-$IP}"
+    local protocol="https"
+    local login_url="${protocol}://${address}/api/v1/auth/login"
+    local create_url="${protocol}://${address}/api/v1/users"
+
+    echo ""
+    tui_title "Seed User Accounts"
+    echo ""
+
+    # Get role to assign
+    local role
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        tui_suspend_scroll_region
+        role=$(gum choose --header "Select role for seeded accounts:" \
+            "student (Recommended)" \
+            "engineer" \
+            "evaluator" \
+            "admin") || true
+        tui_restore_scroll_region
+        # Extract just the role name (remove " (Recommended)" suffix if present)
+        role=$(echo "$role" | awk '{print $1}')
+    else
+        echo "Available roles: student, engineer, evaluator, admin"
+        read -p "Role for seeded accounts [student]: " role
+    fi
+
+    # Default to student if empty
+    role="${role:-student}"
+
+    # Validate role
+    if [[ ! "$role" =~ ^(student|engineer|evaluator|admin)$ ]]; then
+        tui_error "Invalid role. Must be: student, engineer, evaluator, or admin"
+        return 1
+    fi
+
+    # Get number of users to create
+    local num_users
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        tui_suspend_scroll_region
+        num_users=$(gum input --placeholder "10" --header "How many ${role} accounts to create?") || true
+        tui_restore_scroll_region
+    else
+        read -p "How many ${role} accounts to create? [10]: " num_users
+    fi
+
+    # Default to 10 if empty
+    num_users="${num_users:-10}"
+
+    # Validate input is a number
+    if ! [[ "$num_users" =~ ^[0-9]+$ ]] || [ "$num_users" -lt 1 ]; then
+        tui_error "Invalid number. Please enter a positive integer."
+        return 1
+    fi
+
+    # Get admin credentials to authenticate
+    echo ""
+    tui_info "Admin login required to create users with roles"
+    echo ""
+
+    local admin_user admin_pass
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        tui_suspend_scroll_region
+        admin_user=$(gum input --placeholder "admin" --header "Admin username:") || true
+        admin_pass=$(gum input --password --header "Admin password:") || true
+        tui_restore_scroll_region
+    else
+        read -p "Admin username: " admin_user
+        read -sp "Admin password: " admin_pass
+        echo ""
+    fi
+
+    if [ -z "$admin_user" ] || [ -z "$admin_pass" ]; then
+        tui_error "Admin credentials are required"
+        return 1
+    fi
+
+    # Login to get token
+    tui_info "Authenticating..."
+    local login_response login_code token
+    login_response=$(curl -sk -w "\n%{http_code}" -X POST "$login_url" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"${admin_user}\",\"password\":\"${admin_pass}\"}" 2>/dev/null)
+    login_code=$(echo "$login_response" | tail -n1)
+    login_response=$(echo "$login_response" | sed '$d')
+
+    if [ "$login_code" != "200" ]; then
+        tui_error "Admin login failed. Check credentials."
+        return 1
+    fi
+
+    token=$(echo "$login_response" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+    if [ -z "$token" ]; then
+        tui_error "Failed to extract token from login response"
+        return 1
+    fi
+
+    tui_success "Authenticated as $admin_user"
+    echo ""
+    tui_info "Creating $num_users ${role} account(s)..."
+    echo ""
+
+    local success_count=0
+    local fail_count=0
+
+    for i in $(seq 1 "$num_users"); do
+        local username="${role}${i}"
+        local email="${role}${i}@${role}.com"
+        local password="password"
+
+        local response
+        local http_code
+
+        response=$(curl -sk -w "\n%{http_code}" -X POST "$create_url" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $token" \
+            -d "{\"username\":\"$username\",\"email\":\"$email\",\"password\":\"$password\",\"roles\":[\"$role\"]}" 2>/dev/null)
+        http_code=$(echo "$response" | tail -n1)
+        response=$(echo "$response" | sed '$d')
+
+        if [ "$http_code" = "201" ]; then
+            tui_success "  Created: $username ($email) [${role}]"
+            success_count=$((success_count + 1))
+        elif echo "$response" | grep -q "already registered"; then
+            tui_warn "  Skipped: $username (already exists)"
+            fail_count=$((fail_count + 1))
+        else
+            tui_error "  Failed: $username"
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    echo ""
+    tui_info "Seeding complete: $success_count created, $fail_count skipped/failed"
+    echo ""
+    tui_info "All accounts have password: password"
+}
+
+show_access_info() {
+    local address="${DOMAIN:-$IP}"
+    local protocol="https"
+
+    echo ""
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        local ssl_note=""
+        if [ "$SSL_MODE" = "selfsigned" ]; then
+            ssl_note="
+
+Note: Using self-signed certificate.
+      Browser will show a security warning.
+      Click 'Advanced' → 'Proceed' to continue."
+        fi
+
+        local login_info=""
+        if [ -n "$ADMIN_USERNAME" ]; then
+            login_info="Login credentials:
+  Username: $ADMIN_USERNAME
+  Password: $ADMIN_PASSWORD"
+        else
+            login_info="First login:
+  Register a new account
+  First user becomes admin"
+        fi
+
+        gum style \
+            --foreground 82 --border-foreground 82 --border double \
+            --align center --width 60 --margin "1 2" --padding "1 2" \
+            "🎉 PROVING GROUND Deployment Complete!
+
+Access URL: ${protocol}://${address}
+
+${login_info}${ssl_note}"
+
+        echo ""
+        gum style --foreground 245 "Useful commands:"
+        echo ""
+        gum style --foreground 39 "  View logs:  docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f"
+        gum style --foreground 39 "  Stop:       $0 --stop"
+        gum style --foreground 39 "  Update:     $0 --update"
+        gum style --foreground 39 "  Status:     $0 --status"
+    else
+        echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║${NC}            ${BOLD}PROVING GROUND Deployment Complete!${NC}                     ${GREEN}║${NC}"
+        echo -e "${GREEN}╠════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${GREEN}║${NC}                                                            ${GREEN}║${NC}"
+        echo -e "${GREEN}║${NC}  ${CYAN}Access URL:${NC}  ${protocol}://${address}                  ${GREEN}║${NC}"
+        echo -e "${GREEN}║${NC}                                                            ${GREEN}║${NC}"
+        if [ -n "$ADMIN_USERNAME" ]; then
+        echo -e "${GREEN}║${NC}  ${CYAN}Login credentials:${NC}                                      ${GREEN}║${NC}"
+        echo -e "${GREEN}║${NC}    Username: $ADMIN_USERNAME                                        ${GREEN}║${NC}"
+        echo -e "${GREEN}║${NC}    Password: $ADMIN_PASSWORD                                     ${GREEN}║${NC}"
+        else
+        echo -e "${GREEN}║${NC}  ${CYAN}First login:${NC}                                           ${GREEN}║${NC}"
+        echo -e "${GREEN}║${NC}    Register a new account - first user becomes admin      ${GREEN}║${NC}"
+        fi
+        echo -e "${GREEN}║${NC}                                                            ${GREEN}║${NC}"
+        if [ "$SSL_MODE" = "selfsigned" ]; then
+        echo -e "${GREEN}║${NC}  ${YELLOW}Note:${NC} Using self-signed certificate.                    ${GREEN}║${NC}"
+        echo -e "${GREEN}║${NC}        Browser will show a security warning.               ${GREEN}║${NC}"
+        echo -e "${GREEN}║${NC}        Click 'Advanced' -> 'Proceed' to continue.          ${GREEN}║${NC}"
+        echo -e "${GREEN}║${NC}                                                            ${GREEN}║${NC}"
+        fi
+        echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "Useful commands:"
+        echo "  View logs:     docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f"
+        echo "  Stop:          $0 --stop"
+        echo "  Update:        $0 --update"
+        echo "  Status:        $0 --status"
+    fi
+    echo ""
+}
+
+do_deploy() {
+    # Determine docker compose command
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    # Check if PROVING GROUND is already running (check for env file + running containers from this project)
+    if [ -f "$ENV_FILE" ]; then
+        # Load env first so compose can work
+        set -a
+        source "$ENV_FILE" 2>/dev/null || true
+        set +a
+
+        local running_containers=""
+        running_containers=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps -q 2>/dev/null | head -1) || true
+
+        if [ -n "$running_containers" ]; then
+            tui_clear
+            tui_header
+
+            tui_success "PROVING GROUND is already running!"
+            echo ""
+
+            # Get address from env
+            local address="${DOMAIN:-$IP}"
+            if [ -n "$address" ]; then
+                tui_info "Access at: https://$address"
+            fi
+
+            # Go straight to management menu
+            if [ -t 0 ]; then
+                management_menu
+            else
+                tui_info "Use '$0 --stop' to stop services"
+                tui_info "Use '$0 --status' to check status"
+            fi
+            return 0
+        fi
+    fi
+
+    # If interactive mode, TUI header shown in interactive_setup
+    # Otherwise show banner now
+    if [ -n "$DOMAIN" ] || [ -n "$IP" ]; then
+        tui_clear
+        tui_header
+    fi
+
+    # Comprehensive pre-flight checks
+    check_prerequisites
+
+    # Detailed Docker check with auto-fix options
+    check_docker
+
+    check_ports
+
+    # If no domain/IP specified, run interactive setup
+    if [ -z "$DOMAIN" ] && [ -z "$IP" ]; then
+        interactive_setup
+    fi
+
+    # Initialize TUI for deployment
+    if [ "$USE_TUI" = true ]; then
+        tui_init_fullscreen
+        tui_set_status "Initializing deployment..." "info"
+    fi
+
+    # Initialize progress bar for non-fullscreen mode
+    if [ "$TUI_FULLSCREEN" != true ] && [ "$USE_TUI" = true ]; then
+        progress_bar_init
+    fi
+
+    # Show header only in non-fullscreen mode (fullscreen uses status bar only)
+    if [ "$TUI_FULLSCREEN" != true ]; then
+        tui_main_area
+        tui_header
+        tui_title "Deploying PROVING GROUND"
+        echo ""
+    fi
+
+    # Pre-flight checks
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        tui_set_status "Running pre-flight checks..." "progress"
+    else
+        progress_bar_update 0 7 "Deploy" "Running pre-flight checks..."
+    fi
+    check_data_dir_writable
+    backup_env_file
+
+    # Create directories and config (Step 1/7)
+    tui_set_progress "Creating data directories..." 14
+    create_data_directories
+
+    # Generate config (Step 2/7)
+    tui_set_progress "Generating configuration..." 28
+    create_env_file
+
+    # Setup SSL (Step 3/7)
+    tui_set_progress "Setting up SSL certificates..." 42
+    setup_ssl
+
+    # Init networks (Step 4/7)
+    tui_set_progress "Initializing Docker networks..." 56
+    init_networks
+
+    # Pull images (Step 5/7)
+    tui_set_progress "Pulling Docker images..." 70
+    pull_images
+
+    # Start services (Step 6/7)
+    tui_set_progress "Starting services..." 85
+    SERVICES_STARTED=false
+    start_services || true
+
+    if [ "$SERVICES_STARTED" != true ]; then
+        tui_set_status "Services failed to start!" "error"
+        if [ "$TUI_FULLSCREEN" = true ]; then
+            # Show error state for a moment, then clean up
+            sleep 3
+            tui_cleanup_fullscreen
+        fi
+        tui_error "Services failed to start. Check logs with:"
+        tui_info "  docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml logs"
+        echo ""
+        # Still show management menu for recovery options
+        if [ -t 0 ]; then
+            management_menu
+        fi
+        return 1
+    fi
+
+    # Wait for health (Step 7/7)
+    tui_set_progress "Waiting for services to be healthy..." 92
+    wait_for_health
+
+    # Create initial admin user (final step)
+    tui_set_progress "Creating admin user..." 98
+    create_initial_admin
+
+    # Deployment complete
+    tui_set_status "Deployment complete!" "success"
+
+    # Clean up TUI modes before showing access info
+    if [ "$TUI_FULLSCREEN" = true ]; then
+        tui_cleanup_fullscreen
+    elif [ "$PROGRESS_BAR_ACTIVE" = true ]; then
+        progress_bar_cleanup
+    fi
+
+    show_access_info
+
+    # Show management menu if running interactively
+    if [ -t 0 ]; then
+        management_menu
+    fi
+}
+
+management_menu() {
+    # Determine docker compose command
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    while true; do
+        echo ""
+        if [ "$USE_TUI" = true ] && command -v gum &> /dev/null && [ -t 0 ]; then
+            local choice
+            choice=$(gum choose --header "What would you like to do?" \
+                "Live Dashboard (auto-refresh)" \
+                "View logs" \
+                "Show status" \
+                "Restart services" \
+                "Stop services" \
+                "Seed students" \
+                "Image Backup/Restore" \
+                "Clean up (stop + remove data)" \
+                "Factory Reset (complete reset)" \
+                "Exit") || true
+
+            # Handle Ctrl+C / Escape — treat as Exit
+            if [ -z "$choice" ]; then
+                break
+            fi
+
+            case "$choice" in
+                "Live Dashboard"*)
+                    tui_live_dashboard "$compose_cmd"
+                    ;;
+                "View logs")
+                    clear
+                    gum style --background 214 --foreground 0 --bold --padding "0 2" " Press Ctrl+C to exit and return to menu "
+                    echo ""
+                    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml logs -f --tail=50 || true
+                    echo ""
+                    tui_success "Returned to menu"
+                    sleep 1
+                    ;;
+                "Show status")
+                    echo ""
+                    tui_title "Service Status"
+                    echo ""
+                    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps
+                    echo ""
+                    local healthy=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps 2>/dev/null | grep -c "(healthy)" || echo "0")
+                    local running=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps 2>/dev/null | grep -c "Up" || echo "0")
+                    tui_info "Running: $running | Healthy: $healthy"
+                    ;;
+                "Restart services")
+                    echo ""
+                    tui_info "Restarting services..."
+                    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml restart
+                    tui_success "Services restarted"
+                    wait_for_health
+                    ;;
+                "Stop services")
+                    echo ""
+                    if gum confirm "Stop all PROVING GROUND services?" 2>/dev/null; then
+                        tui_info "Stopping services..."
+                        $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml down
+                        tui_success "Services stopped"
+                        echo ""
+                        tui_info "Run '$0 --start' to start again"
+                        break
+                    fi
+                    ;;
+                "Seed students")
+                    seed_students
+                    ;;
+                "Image Backup/Restore"*)
+                    echo ""
+                    local backup_choice
+                    backup_choice=$(gum choose --header "Image Backup/Restore" \
+                        "Backup images (save to disk)" \
+                        "Restore images (load from backup)" \
+                        "List backups" \
+                        "Delete backup" \
+                        "← Back") || true
+
+                    if [ -z "$backup_choice" ]; then continue; fi
+
+                    case "$backup_choice" in
+                        "Backup"*)
+                            echo ""
+                            local backup_name
+                            backup_name=$(gum input --placeholder "$(date +%Y%m%d_%H%M%S)" --header "Backup name (or press Enter for timestamp):") || true
+                            backup_images "$backup_name"
+                            ;;
+                        "Restore"*)
+                            restore_images
+                            ;;
+                        "List"*)
+                            list_backups
+                            ;;
+                        "Delete"*)
+                            delete_backup
+                            ;;
+                        "← Back"*)
+                            continue
+                            ;;
+                    esac
+                    ;;
+                "Clean up"*)
+                    echo ""
+                    tui_warn "This will stop all services and DELETE all data!"
+                    echo ""
+
+                    # Show what will be removed
+                    tui_title "The following will be removed:"
+                    echo ""
+
+                    # List running containers
+                    local containers=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps --format "{{.Names}}" 2>/dev/null) || true
+                    if [ -n "$containers" ]; then
+                        echo "  PROVING GROUND Services:"
+                        echo "$containers" | while read -r c; do echo "    - $c"; done
+                        echo ""
+                    fi
+
+                    # List volumes
+                    local volumes=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml config --volumes 2>/dev/null) || true
+                    if [ -n "$volumes" ]; then
+                        echo "  Docker volumes:"
+                        echo "$volumes" | while read -r v; do echo "    - $v"; done
+                        echo ""
+                    fi
+
+                    # Detect deployed ranges (DinD containers and range networks)
+                    local range_containers=$(docker ps -a --filter "label=proving_ground.type=dind" --format "{{.Names}}" 2>/dev/null) || true
+                    local dind_containers=$(docker ps -a --filter "name=dind-" --format "{{.Names}}" 2>/dev/null) || true
+                    local range_networks=$(docker network ls --filter "name=range-" --format "{{.Name}}" 2>/dev/null) || true
+                    local proving_ground_networks=$(docker network ls --filter "name=pg-" --format "{{.Name}}" 2>/dev/null) || true
+
+                    # Combine range containers (labeled + dind- prefixed)
+                    local all_range_containers=""
+                    if [ -n "$range_containers" ]; then
+                        all_range_containers="$range_containers"
+                    fi
+                    if [ -n "$dind_containers" ]; then
+                        if [ -n "$all_range_containers" ]; then
+                            all_range_containers="$all_range_containers"$'\n'"$dind_containers"
+                        else
+                            all_range_containers="$dind_containers"
+                        fi
+                    fi
+                    # Deduplicate
+                    all_range_containers=$(echo "$all_range_containers" | sort -u | grep -v '^$') || true
+
+                    local has_ranges=false
+                    if [ -n "$all_range_containers" ] || [ -n "$range_networks" ]; then
+                        has_ranges=true
+                        echo "  Deployed Ranges detected:"
+                        if [ -n "$all_range_containers" ]; then
+                            local range_count=$(echo "$all_range_containers" | wc -l | tr -d ' ')
+                            echo "    - $range_count range container(s)"
+                            echo "$all_range_containers" | while read -r c; do
+                                [ -n "$c" ] && echo "      • $c"
+                            done
+                        fi
+                        if [ -n "$range_networks" ]; then
+                            local net_count=$(echo "$range_networks" | wc -l | tr -d ' ')
+                            echo "    - $net_count range network(s)"
+                        fi
+                        echo ""
+                    fi
+
+                    # Data directory with size
+                    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+                        local data_size=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1) || data_size="unknown"
+                        echo "  Data directory:"
+                        echo "    - $DATA_DIR ($data_size)"
+                        echo ""
+                    fi
+
+                    # Config files
+                    echo "  Configuration files:"
+                    if [ -f "$ENV_FILE" ]; then
+                        echo "    - $ENV_FILE"
+                    fi
+                    if [ -f "$PROJECT_ROOT/traefik/acme.json" ]; then
+                        echo "    - $PROJECT_ROOT/traefik/acme.json (SSL certificates)"
+                    fi
+                    if [ -d "$PROJECT_ROOT/traefik/certs" ]; then
+                        echo "    - $PROJECT_ROOT/traefik/certs/ (SSL certificates)"
+                    fi
+                    echo ""
+
+                    # Ask about ranges if they exist
+                    local delete_ranges=false
+                    if [ "$has_ranges" = true ]; then
+                        echo ""
+                        if gum confirm --affirmative="Yes, delete ranges too" --negative="Keep ranges" "Also delete all deployed ranges and their networks?"; then
+                            delete_ranges=true
+                            tui_warn "Ranges will also be deleted!"
+                        else
+                            tui_info "Ranges will be preserved"
+                        fi
+                        echo ""
+                    fi
+
+                    # Check for image backups - PROTECT BY DEFAULT
+                    local delete_backups=false
+                    local backup_list=""
+                    if [ -d "$BACKUP_DIR" ]; then
+                        backup_list=$(ls -1 "$BACKUP_DIR" 2>/dev/null) || true
+                    fi
+
+                    if [ -n "$backup_list" ]; then
+                        local backup_count=$(echo "$backup_list" | wc -l | tr -d ' ')
+                        local backup_size=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1) || backup_size="unknown"
+
+                        echo ""
+                        gum style --foreground 212 --bold "  Image Backups Found: $backup_count ($backup_size total)"
+                        echo ""
+                        echo "  Backups are stored separately at: $BACKUP_DIR"
+                        echo "  These will be ${GREEN}PRESERVED${NC} by default."
+                        echo ""
+                        echo "$backup_list" | while read -r b; do
+                            [ -n "$b" ] && echo "    • $b"
+                        done
+                        echo ""
+
+                        if gum confirm --affirmative="Delete backups too" --negative="Keep backups (recommended)" --default=false "Also delete image backups?"; then
+                            delete_backups=true
+                            tui_warn "Image backups will also be deleted!"
+                        else
+                            tui_success "Image backups will be preserved"
+                        fi
+                        echo ""
+                    fi
+
+                    if gum confirm --affirmative="Yes, delete everything" --negative="Cancel" "Are you sure? This cannot be undone."; then
+                        # Delete ranges first if requested
+                        if [ "$delete_ranges" = true ]; then
+                            tui_info "Stopping and removing deployed ranges..."
+
+                            # Stop and remove all range containers
+                            if [ -n "$all_range_containers" ]; then
+                                echo "$all_range_containers" | while read -r container; do
+                                    if [ -n "$container" ]; then
+                                        tui_info "  Removing: $container"
+                                        docker stop "$container" 2>/dev/null || true
+                                        docker rm -f "$container" 2>/dev/null || true
+                                    fi
+                                done
+                            fi
+
+                            # Remove range networks
+                            if [ -n "$range_networks" ]; then
+                                echo "$range_networks" | while read -r network; do
+                                    if [ -n "$network" ]; then
+                                        tui_info "  Removing network: $network"
+                                        docker network rm "$network" 2>/dev/null || true
+                                    fi
+                                done
+                            fi
+
+                            tui_success "Deployed ranges removed"
+                        fi
+
+                        tui_info "Stopping PROVING GROUND services..."
+                        clean_shutdown --volumes
+                        tui_success "Services stopped"
+
+                        # Remove PROVING GROUND management networks
+                        if [ -n "$proving_ground_networks" ]; then
+                            tui_info "Removing PROVING GROUND networks..."
+                            echo "$proving_ground_networks" | while read -r network; do
+                                if [ -n "$network" ]; then
+                                    docker network rm "$network" 2>/dev/null || true
+                                fi
+                            done
+                            tui_success "PROVING GROUND networks removed"
+                        fi
+
+                        if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+                            tui_info "Removing data directory: $DATA_DIR"
+                            rm -rf "$DATA_DIR" 2>/dev/null || sudo rm -rf "$DATA_DIR"
+                            tui_success "Data directory removed"
+                        fi
+
+                        if [ -f "$ENV_FILE" ]; then
+                            rm -f "$ENV_FILE"
+                            tui_success "Configuration removed"
+                        fi
+
+                        # Clean up traefik certs
+                        rm -f "$PROJECT_ROOT/traefik/acme.json" 2>/dev/null || true
+                        rm -rf "$PROJECT_ROOT/traefik/certs" 2>/dev/null || true
+
+                        # Delete backups only if explicitly requested
+                        if [ "$delete_backups" = true ] && [ -d "$BACKUP_DIR" ]; then
+                            tui_info "Removing image backups..."
+                            rm -rf "$BACKUP_DIR"
+                            tui_success "Image backups removed"
+                        elif [ -d "$BACKUP_DIR" ] && [ -n "$backup_list" ]; then
+                            echo ""
+                            tui_success "Image backups preserved at: $BACKUP_DIR"
+                        fi
+
+                        echo ""
+                        tui_success "Cleanup complete"
+                        break
+                    fi
+                    ;;
+                "Factory Reset"*)
+                    factory_reset
+                    # If user chose to redeploy, we're done here
+                    # If they exited, break out of menu
+                    break
+                    ;;
+                "Exit"|"")
+                    echo ""
+                    tui_info "PROVING GROUND is still running in the background"
+                    tui_info "Use '$0 --stop' to stop services"
+                    break
+                    ;;
+            esac
+        else
+            # Non-TUI fallback
+            echo ""
+            echo "Management Menu:"
+            echo "  1) View logs"
+            echo "  2) Show status"
+            echo "  3) Restart services"
+            echo "  4) Stop services"
+            echo "  5) Seed students"
+            echo "  6) Clean up (stop + remove data)"
+            echo "  7) Factory Reset (complete reset)"
+            echo "  8) Exit"
+            echo ""
+            read -p "Choice [1-8]: " choice
+
+            case "$choice" in
+                1)
+                    echo ""
+                    echo "Showing logs (Ctrl+C to stop)..."
+                    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml logs -f --tail=50 || true
+                    ;;
+                2)
+                    echo ""
+                    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps
+                    ;;
+                3)
+                    echo ""
+                    echo "Restarting services..."
+                    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml restart
+                    echo "Services restarted"
+                    ;;
+                4)
+                    echo ""
+                    read -p "Stop all services? [y/N]: " confirm
+                    if [[ "$confirm" =~ ^[Yy] ]]; then
+                        $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml down
+                        echo "Services stopped"
+                        break
+                    fi
+                    ;;
+                5)
+                    seed_students
+                    ;;
+                6)
+                    echo ""
+                    echo "WARNING: This will delete all data!"
+                    echo ""
+                    echo "The following will be removed:"
+                    echo ""
+
+                    # List containers
+                    local containers=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps --format "{{.Names}}" 2>/dev/null) || true
+                    if [ -n "$containers" ]; then
+                        echo "  PROVING GROUND Services:"
+                        echo "$containers" | while read -r c; do echo "    - $c"; done
+                        echo ""
+                    fi
+
+                    # List volumes
+                    local volumes=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml config --volumes 2>/dev/null) || true
+                    if [ -n "$volumes" ]; then
+                        echo "  Docker volumes:"
+                        echo "$volumes" | while read -r v; do echo "    - $v"; done
+                        echo ""
+                    fi
+
+                    # Detect deployed ranges
+                    local range_containers=$(docker ps -a --filter "label=proving_ground.type=dind" --format "{{.Names}}" 2>/dev/null) || true
+                    local dind_containers=$(docker ps -a --filter "name=dind-" --format "{{.Names}}" 2>/dev/null) || true
+                    local range_networks=$(docker network ls --filter "name=range-" --format "{{.Name}}" 2>/dev/null) || true
+                    local proving_ground_networks=$(docker network ls --filter "name=pg-" --format "{{.Name}}" 2>/dev/null) || true
+
+                    # Combine and deduplicate range containers
+                    local all_range_containers=""
+                    [ -n "$range_containers" ] && all_range_containers="$range_containers"
+                    if [ -n "$dind_containers" ]; then
+                        [ -n "$all_range_containers" ] && all_range_containers="$all_range_containers"$'\n'"$dind_containers" || all_range_containers="$dind_containers"
+                    fi
+                    all_range_containers=$(echo "$all_range_containers" | sort -u | grep -v '^$') || true
+
+                    local has_ranges=false
+                    if [ -n "$all_range_containers" ] || [ -n "$range_networks" ]; then
+                        has_ranges=true
+                        echo "  Deployed Ranges detected:"
+                        if [ -n "$all_range_containers" ]; then
+                            local range_count=$(echo "$all_range_containers" | wc -l | tr -d ' ')
+                            echo "    - $range_count range container(s)"
+                        fi
+                        if [ -n "$range_networks" ]; then
+                            local net_count=$(echo "$range_networks" | wc -l | tr -d ' ')
+                            echo "    - $net_count range network(s)"
+                        fi
+                        echo ""
+                    fi
+
+                    # Data directory
+                    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+                        local data_size=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1) || data_size="unknown"
+                        echo "  Data directory:"
+                        echo "    - $DATA_DIR ($data_size)"
+                        echo ""
+                    fi
+
+                    # Config
+                    echo "  Configuration files:"
+                    [ -f "$ENV_FILE" ] && echo "    - $ENV_FILE"
+                    [ -f "$PROJECT_ROOT/traefik/acme.json" ] && echo "    - $PROJECT_ROOT/traefik/acme.json"
+                    [ -d "$PROJECT_ROOT/traefik/certs" ] && echo "    - $PROJECT_ROOT/traefik/certs/"
+                    echo ""
+
+                    # Ask about ranges
+                    local delete_ranges=false
+                    if [ "$has_ranges" = true ]; then
+                        read -p "Also delete all deployed ranges? [y/N]: " range_confirm
+                        if [[ "$range_confirm" =~ ^[Yy] ]]; then
+                            delete_ranges=true
+                            echo "Ranges will also be deleted."
+                        fi
+                        echo ""
+                    fi
+
+                    # Check for image backups - PROTECT BY DEFAULT
+                    local delete_backups=false
+                    local backup_list=""
+                    if [ -d "$BACKUP_DIR" ]; then
+                        backup_list=$(ls -1 "$BACKUP_DIR" 2>/dev/null) || true
+                    fi
+
+                    if [ -n "$backup_list" ]; then
+                        local backup_count=$(echo "$backup_list" | wc -l | tr -d ' ')
+                        local backup_size=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1) || backup_size="unknown"
+                        echo ""
+                        echo "  Image Backups Found: $backup_count ($backup_size total)"
+                        echo "  Location: $BACKUP_DIR"
+                        echo "  Backups will be PRESERVED by default."
+                        echo ""
+                        read -p "Also delete image backups? [y/N]: " backup_confirm
+                        if [[ "$backup_confirm" =~ ^[Yy] ]]; then
+                            delete_backups=true
+                            echo "Image backups will also be deleted."
+                        else
+                            echo "Image backups will be preserved."
+                        fi
+                        echo ""
+                    fi
+
+                    read -p "Type 'DELETE' to confirm: " confirm
+                    if [ "$confirm" = "DELETE" ]; then
+                        # Delete ranges first if requested
+                        if [ "$delete_ranges" = true ]; then
+                            echo "Removing deployed ranges..."
+
+                            # Stop and remove all range containers
+                            if [ -n "$all_range_containers" ]; then
+                                echo "$all_range_containers" | while read -r container; do
+                                    [ -n "$container" ] && echo "  Removing: $container" && docker rm -f "$container" 2>/dev/null || true
+                                done
+                            fi
+
+                            # Remove range networks
+                            if [ -n "$range_networks" ]; then
+                                echo "$range_networks" | while read -r network; do
+                                    [ -n "$network" ] && docker network rm "$network" 2>/dev/null || true
+                                done
+                            fi
+
+                            echo "Ranges removed"
+                        fi
+
+                        echo "Stopping PROVING GROUND services..."
+                        clean_shutdown --volumes
+
+                        # Remove PROVING GROUND networks
+                        if [ -n "$proving_ground_networks" ]; then
+                            echo "$proving_ground_networks" | while read -r network; do
+                                [ -n "$network" ] && docker network rm "$network" 2>/dev/null || true
+                            done
+                        fi
+
+                        if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+                            rm -rf "$DATA_DIR" 2>/dev/null || sudo rm -rf "$DATA_DIR"
+                        fi
+                        rm -f "$ENV_FILE" 2>/dev/null || true
+                        rm -f "$PROJECT_ROOT/traefik/acme.json" 2>/dev/null || true
+                        rm -rf "$PROJECT_ROOT/traefik/certs" 2>/dev/null || true
+
+                        # Delete backups only if explicitly requested
+                        if [ "$delete_backups" = true ] && [ -d "$BACKUP_DIR" ]; then
+                            echo "Removing image backups..."
+                            rm -rf "$BACKUP_DIR"
+                            echo "Image backups removed"
+                        elif [ -d "$BACKUP_DIR" ] && [ -n "$backup_list" ]; then
+                            echo ""
+                            echo "Image backups preserved at: $BACKUP_DIR"
+                        fi
+
+                        echo "Cleanup complete"
+                        break
+                    fi
+                    ;;
+                7)
+                    factory_reset
+                    # If user chose to redeploy, we're done here
+                    # If they exited, break out of menu
+                    break
+                    ;;
+                8|"")
+                    echo ""
+                    echo "PROVING GROUND is still running. Use '$0 --stop' to stop."
+                    break
+                    ;;
+            esac
+        fi
+    done
+}
+
+get_current_version() {
+    # Try to get current version from env file or running containers
+    if [ -f "$ENV_FILE" ]; then
+        grep "^VERSION=" "$ENV_FILE" 2>/dev/null | cut -d= -f2 || echo "unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+get_available_releases() {
+    # Fetch releases from GitHub API
+    if command -v curl &> /dev/null; then
+        curl -s "https://api.github.com/repos/JongoDB/PROVING GROUND/releases?per_page=10" 2>/dev/null | \
+            grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/' | head -10
+    elif command -v wget &> /dev/null; then
+        wget -qO- "https://api.github.com/repos/JongoDB/PROVING GROUND/releases?per_page=10" 2>/dev/null | \
+            grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/' | head -10
+    fi
+}
+
+get_available_tags() {
+    # Fetch tags from GitHub API (primary source for versions)
+    # Tags are the authoritative source since not all versions have releases
+    if command -v curl &> /dev/null; then
+        curl -s "https://api.github.com/repos/JongoDB/PROVING GROUND/tags?per_page=20" 2>/dev/null | \
+            grep '"name"' | sed 's/.*"name": "\(.*\)".*/\1/' | head -20
+    elif command -v wget &> /dev/null; then
+        wget -qO- "https://api.github.com/repos/JongoDB/PROVING GROUND/tags?per_page=20" 2>/dev/null | \
+            grep '"name"' | sed 's/.*"name": "\(.*\)".*/\1/' | head -20
+    fi
+}
+
+select_version_interactive() {
+    # Interactive version selection - sets VERSION variable
+    # Returns the selected version
+    #
+    # NOTE: Tags are the primary source for versions since not all versions
+    # have GitHub releases. The developer often just tags without creating a release.
+
+    if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+        tui_info "Fetching available versions from GitHub..."
+        echo ""
+
+        local releases=$(get_available_releases)
+        local tags=$(get_available_tags)
+
+        if [ -n "$tags" ] || [ -n "$releases" ]; then
+            # Get the latest version from tags (primary) or releases (fallback)
+            # Tags are authoritative since not all versions have releases
+            local latest_version=""
+            if [ -n "$tags" ]; then
+                latest_version=$(echo "$tags" | head -1)
+            elif [ -n "$releases" ]; then
+                latest_version=$(echo "$releases" | head -1)
+            fi
+
+            local latest_label="Latest (recommended)"
+            if [ -n "$latest_version" ]; then
+                latest_label="Latest (recommended) - $latest_version"
+            fi
+
+            # Build menu options - tags first since they're more complete
+            local version_choice
+            version_choice=$(gum choose --header "Select version to deploy:" \
+                "$latest_label" \
+                "Choose from tags (all versions)" \
+                "Choose from releases only" \
+                "Enter version manually") || true
+
+            case "$version_choice" in
+                "Latest"*)
+                    VERSION="latest"
+                    tui_success "Using latest version${latest_version:+ ($latest_version)}"
+                    ;;
+                "Choose from tags"*)
+                    if [ -n "$tags" ]; then
+                        echo ""
+                        tui_info "Available versions (from tags):"
+                        VERSION=$(echo "$tags" | gum choose --header "Select a version:") || true
+                        if [ -n "$VERSION" ]; then
+                            tui_success "Selected: $VERSION"
+                        else
+                            VERSION="latest"
+                            tui_warn "No selection made, using latest"
+                        fi
+                    else
+                        tui_warn "No tags found, using latest"
+                        VERSION="latest"
+                    fi
+                    ;;
+                "Choose from releases"*)
+                    if [ -n "$releases" ]; then
+                        # Show releases with gum choose
+                        echo ""
+                        tui_info "Available releases:"
+                        VERSION=$(echo "$releases" | gum choose --header "Select a release:") || true
+                        if [ -n "$VERSION" ]; then
+                            tui_success "Selected: $VERSION"
+                        else
+                            VERSION="latest"
+                            tui_warn "No selection made, using latest"
+                        fi
+                    else
+                        tui_warn "No releases found. Try 'Choose from tags' instead."
+                        VERSION="latest"
+                    fi
+                    ;;
+                "Enter"*)
+                    VERSION=$(gum input --placeholder "v0.32.0" --header "Enter version (e.g., v0.32.0):") || true
+                    if [ -z "$VERSION" ]; then
+                        VERSION="latest"
+                        tui_warn "No version entered, using latest"
+                    else
+                        tui_success "Using version: $VERSION"
+                    fi
+                    ;;
+                *)
+                    VERSION="latest"
+                    ;;
+            esac
+        else
+            tui_warn "Could not fetch versions from GitHub"
+            tui_info "Using latest version"
+            VERSION="latest"
+        fi
+    else
+        # Non-TUI fallback - also prioritize tags
+        echo "Fetching available versions..."
+        local tags=$(get_available_tags)
+
+        echo ""
+        echo "Version options:"
+        echo "  1) Latest (recommended)"
+        if [ -n "$tags" ]; then
+            echo "  2) Choose from available versions"
+        fi
+        echo "  3) Enter specific version"
+        echo ""
+        read -p "Choice [1]: " choice
+
+        case "$choice" in
+            2)
+                if [ -n "$tags" ]; then
+                    echo ""
+                    echo "Available versions:"
+                    local i=1
+                    echo "$tags" | while read -r tag; do
+                        echo "  $i) $tag"
+                        i=$((i + 1))
+                    done
+                    echo ""
+                    read -p "Select version number: " tag_choice
+                    VERSION=$(echo "$tags" | sed -n "${tag_choice}p")
+                    VERSION="${VERSION:-latest}"
+                else
+                    VERSION="latest"
+                fi
+                ;;
+            3)
+                read -p "Enter version (e.g., v0.32.0): " VERSION
+                VERSION="${VERSION:-latest}"
+                ;;
+            *)
+                VERSION="latest"
+                ;;
+        esac
+        echo "Using version: $VERSION"
+    fi
+
+    echo "$VERSION"
+}
+
+do_update() {
+    check_gum
+    tui_clear
+    tui_header
+
+    tui_title "Update PROVING GROUND"
+    echo ""
+
+    check_docker
+
+    if [ ! -f "$ENV_FILE" ]; then
+        tui_error "No existing deployment found"
+        tui_info "Run without --update for initial setup"
+        exit 1
+    fi
+
+    cd "$PROJECT_ROOT"
+
+    # Load environment
+    set -a
+    source "$ENV_FILE"
+    set +a
+
+    # Show current version
+    local current_version=$(get_current_version)
+    tui_info "Current version: $current_version"
+    echo ""
+
+    # Determine target version
+    local target_version="$VERSION"
+
+    if [ -z "$target_version" ] || [ "$target_version" = "latest" ]; then
+        # Interactive version selection
+        if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+            tui_info "Fetching available versions..."
+
+            local releases=$(get_available_releases)
+            local tags=$(get_available_tags)
+
+            if [ -n "$releases" ] || [ -n "$tags" ]; then
+                local version_choice
+                version_choice=$(gum choose --header "Select version to install:" \
+                    "Latest (newest release)" \
+                    "Choose from releases" \
+                    "Choose from tags" \
+                    "Enter version manually") || true
+
+                case "$version_choice" in
+                    "Latest"*)
+                        target_version="latest"
+                        ;;
+                    "Choose from releases"*)
+                        if [ -n "$releases" ]; then
+                            target_version=$(echo "$releases" | gum choose --header "Select release:") || true
+                        else
+                            tui_warn "No releases found, using latest"
+                            target_version="latest"
+                        fi
+                        ;;
+                    "Choose from tags"*)
+                        if [ -n "$tags" ]; then
+                            target_version=$(echo "$tags" | gum choose --header "Select tag:") || true
+                        else
+                            tui_warn "No tags found, using latest"
+                            target_version="latest"
+                        fi
+                        ;;
+                    "Enter"*)
+                        target_version=$(gum input --placeholder "v0.30.0" --header "Enter version:") || true
+                        ;;
+                    *)
+                        target_version="latest"
+                        ;;
+                esac
+            else
+                tui_warn "Could not fetch versions from GitHub, using latest"
+                target_version="latest"
+            fi
+        else
+            target_version="latest"
+        fi
+    fi
+
+    echo ""
+    tui_info "Target version: $target_version"
+    echo ""
+
+    if ! tui_confirm "Proceed with update?"; then
+        tui_info "Update cancelled"
+        exit 0
+    fi
+
+    echo ""
+
+    # Update VERSION in env file
+    if [ "$target_version" != "latest" ]; then
+        sed -i.bak "s/^VERSION=.*/VERSION=$target_version/" "$ENV_FILE" 2>/dev/null || \
+            sed -i '' "s/^VERSION=.*/VERSION=$target_version/" "$ENV_FILE"
+        export VERSION="$target_version"
+    fi
+
+    # Ensure platform is set for correct image architecture
+    detect_platform
+    tui_info "Platform: $DOCKER_PLATFORM"
+
+    # Ensure networks exist
+    init_networks
+
+    # Determine docker compose command
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    # Pull images
+    tui_info "Pulling Docker images for $DOCKER_PLATFORM..."
+    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml pull 2>&1 || true
+    tui_success "Images pulled"
+
+    # Restart services
+    tui_info "Restarting services..."
+    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml up -d 2>&1 || true
+    tui_success "Services restarted"
+
+    wait_for_health
+
+    echo ""
+    tui_success "Update complete! Now running: $target_version"
+    echo ""
+}
+
+do_start() {
+    check_gum
+    tui_clear
+    tui_header
+
+    tui_title "Start PROVING GROUND"
+    echo ""
+
+    check_docker
+
+    if [ ! -f "$ENV_FILE" ]; then
+        tui_error "No existing deployment found"
+        tui_info "Run without --start for initial setup"
+        exit 1
+    fi
+
+    cd "$PROJECT_ROOT"
+
+    # Load environment
+    set -a
+    source "$ENV_FILE"
+    set +a
+
+    # Ensure platform is set for correct image architecture
+    detect_platform
+    tui_info "Platform: $DOCKER_PLATFORM"
+
+    # Ensure networks exist (in case they were removed)
+    init_networks
+
+    # Determine docker compose command
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    tui_info "Starting PROVING GROUND services..."
+    $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml up -d 2>&1 || true
+
+    wait_for_health
+
+    local address="${DOMAIN:-$IP}"
+    [ -z "$address" ] && address=$(grep "^DOMAIN=" "$ENV_FILE" | cut -d= -f2)
+
+    echo ""
+    tui_success "PROVING GROUND is running!"
+    tui_info "Access at: https://$address"
+    echo ""
+}
+
+do_stop() {
+    check_gum
+    tui_clear
+    tui_header
+
+    tui_title "Stop PROVING GROUND"
+    echo ""
+
+    cd "$PROJECT_ROOT"
+
+    if [ -f "$ENV_FILE" ]; then
+        set -a
+        source "$ENV_FILE"
+        set +a
+    fi
+
+    # Determine docker compose command
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null 2>&1; then
+        compose_cmd="docker-compose"
+    fi
+    if [ -f "$ENV_FILE" ]; then
+        compose_cmd="$compose_cmd --env-file $ENV_FILE"
+    fi
+
+    # Check if anything is running
+    local running=$($compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps -q 2>/dev/null | wc -l | tr -d ' ')
+
+    if [ "$running" = "0" ]; then
+        tui_info "PROVING GROUND is not currently running"
+        exit 0
+    fi
+
+    tui_info "Found $running running containers"
+    echo ""
+
+    if ! tui_confirm "Stop all PROVING GROUND services?"; then
+        tui_info "Cancelled"
+        exit 0
+    fi
+
+    echo ""
+    tui_info "Stopping services..."
+    clean_shutdown
+    tui_success "All services stopped"
+    echo ""
+}
+
+do_status() {
+    check_gum
+    tui_clear
+    tui_header
+
+    tui_title "PROVING GROUND Status"
+    echo ""
+
+    cd "$PROJECT_ROOT"
+
+    if [ -f "$ENV_FILE" ]; then
+        set -a
+        source "$ENV_FILE"
+        set +a
+
+        local current_version=$(get_current_version)
+        local address=$(grep "^DOMAIN=" "$ENV_FILE" | cut -d= -f2)
+
+        tui_info "Version: $current_version"
+        tui_info "Address: https://$address"
+        echo ""
+    fi
+
+    tui_title "Services"
+    echo ""
+
+    docker_compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps
+
+    echo ""
+
+    # Show health summary
+    local total=$(docker_compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps -q 2>/dev/null | wc -l | tr -d ' ')
+    local healthy=$(docker_compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps 2>/dev/null | grep -c "(healthy)" || echo "0")
+    local running=$(docker_compose_cmd -f docker-compose.yml -f docker-compose.prod.yml ps 2>/dev/null | grep -c "Up" || echo "0")
+
+    if [ "$total" = "0" ]; then
+        tui_warn "PROVING GROUND is not running"
+        tui_info "Start with: $0 --start"
+    elif [ "$healthy" -ge 3 ]; then
+        tui_success "All core services healthy ($healthy/$total)"
+    else
+        tui_warn "Some services may have issues ($healthy healthy, $running running of $total)"
+        tui_info "View logs: docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f"
+    fi
+    echo ""
+}
+
+interactive_setup() {
+    # Check for TUI support
+    check_gum
+
+    # Step tracking for back navigation
+    local current_step=1
+    local max_step=5  # 1=Access, 2=SSL, 3=Data, 4=Version, 5=Summary
+    local access_type=""  # "domain" or "ip"
+
+    while [ $current_step -le $max_step ]; do
+        tui_clear
+        tui_header
+
+        if [ "$USE_TUI" = true ]; then
+            gum style --foreground 245 "This wizard will configure PROVING GROUND for production use."
+            gum style --foreground 245 --italic "Use '← Back' option to return to previous step."
+            echo ""
+        else
+            echo "This wizard will configure PROVING GROUND for production use."
+            echo ""
+        fi
+
+        case $current_step in
+            1)
+                # Step 1: Access method
+                tui_title "Step 1: Server Access"
+                echo ""
+
+                local access_choice
+                if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+                    access_choice=$(gum choose --header "How will users access PROVING GROUND?" \
+                        "IP address (e.g., 0.0.0.0)" \
+                        "Domain name (e.g., proving_ground.example.com)") || true
+                    if [ -z "$access_choice" ]; then continue; fi
+                else
+                    access_choice=$(tui_choose "How will users access PROVING GROUND?" \
+                        "IP address (e.g., 0.0.0.0)" \
+                        "Domain name (e.g., proving_ground.example.com)")
+                fi
+
+                case "$access_choice" in
+                    "IP address"*)
+                        access_type="ip"
+                        echo ""
+                        local input_ip
+                        input_ip=$(tui_input "Enter server IP address:" "0.0.0.0" "${IP:-0.0.0.0}")
+                        if [ -z "$input_ip" ]; then
+                            tui_error "IP address cannot be empty"
+                            sleep 1
+                            continue
+                        fi
+                        IP="$input_ip"
+                        DOMAIN=""
+                        SSL_MODE="selfsigned"
+                        current_step=3  # Skip SSL step for IP (always self-signed)
+                        ;;
+                    "Domain name"*)
+                        access_type="domain"
+                        echo ""
+                        local input_domain
+                        input_domain=$(tui_input "Enter your domain name:" "proving-ground.example.com" "${DOMAIN:-}")
+                        if [ -z "$input_domain" ]; then
+                            tui_error "Domain name cannot be empty"
+                            sleep 1
+                            continue
+                        fi
+                        DOMAIN="$input_domain"
+                        IP=""
+                        current_step=2
+                        ;;
+                    *)
+                        tui_error "Invalid choice"
+                        sleep 1
+                        continue
+                        ;;
+                esac
+                ;;
+
+            2)
+                # Step 2: SSL Certificate (only for domain)
+                tui_title "Step 2: SSL Certificate"
+                echo ""
+
+                local ssl_choice
+                if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+                    ssl_choice=$(gum choose --header "Choose SSL certificate type:" \
+                        "Let's Encrypt (automatic, free, requires public domain)" \
+                        "Self-signed (works immediately, browser warning)" \
+                        "← Back") || true
+                    if [ -z "$ssl_choice" ]; then continue; fi
+                else
+                    ssl_choice=$(tui_choose "Choose SSL certificate type:" \
+                        "Let's Encrypt (automatic, free, requires public domain)" \
+                        "Self-signed (works immediately, browser warning)" \
+                        "← Back")
+                fi
+
+                case "$ssl_choice" in
+                    "← Back"*)
+                        current_step=1
+                        continue
+                        ;;
+                    "Let's Encrypt"*)
+                        SSL_MODE="letsencrypt"
+                        echo ""
+                        EMAIL=$(tui_input "Email for Let's Encrypt notifications:" "admin@$DOMAIN" "${EMAIL:-admin@$DOMAIN}")
+                        current_step=3
+                        ;;
+                    "Self-signed"*)
+                        SSL_MODE="selfsigned"
+                        EMAIL=""
+                        current_step=3
+                        ;;
+                    *)
+                        continue
+                        ;;
+                esac
+                ;;
+
+            3)
+                # Step 3: Data directory
+                tui_title "Step 3: Data Storage"
+                echo ""
+
+                if [ -z "$DATA_DIR" ]; then
+                    DATA_DIR=$(get_default_data_dir)
+                fi
+
+                if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+                    # Show back option first
+                    local data_choice
+                    data_choice=$(gum choose --header "Configure data storage location:" \
+                        "Use default: $DATA_DIR" \
+                        "Enter custom path" \
+                        "← Back") || true
+                    if [ -z "$data_choice" ]; then continue; fi
+
+                    case "$data_choice" in
+                        "← Back"*)
+                            if [ "$access_type" = "ip" ]; then
+                                current_step=1  # IP skips SSL step
+                            else
+                                current_step=2
+                            fi
+                            continue
+                            ;;
+                        "Use default"*)
+                            # Keep default DATA_DIR
+                            current_step=4
+                            ;;
+                        "Enter custom"*)
+                            local input_data_dir
+                            input_data_dir=$(gum input --placeholder "$DATA_DIR" --value "$DATA_DIR" --header "Data directory for PROVING GROUND storage:") || true
+                            if [ -n "$input_data_dir" ]; then
+                                DATA_DIR="$input_data_dir"
+                            fi
+                            current_step=4
+                            ;;
+                        *)
+                            continue
+                            ;;
+                    esac
+                else
+                    local input_data_dir
+                    input_data_dir=$(tui_input "Data directory for PROVING GROUND storage:" "$DATA_DIR" "$DATA_DIR")
+                    if [ -n "$input_data_dir" ]; then
+                        DATA_DIR="$input_data_dir"
+                    fi
+                    current_step=4
+                fi
+                ;;
+
+            4)
+                # Step 4: Version selection
+                tui_title "Step 4: Version Selection"
+                echo ""
+
+                if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+                    tui_info "Fetching available versions from GitHub..."
+                    echo ""
+
+                    local releases=$(get_available_releases)
+                    local tags=$(get_available_tags)
+
+                    # Get the latest version to display
+                    local latest_version=""
+                    if [ -n "$releases" ]; then
+                        latest_version=$(echo "$releases" | head -1)
+                    elif [ -n "$tags" ]; then
+                        latest_version=$(echo "$tags" | head -1)
+                    fi
+
+                    local latest_label="Latest (recommended)"
+                    if [ -n "$latest_version" ]; then
+                        latest_label="Latest (recommended) - $latest_version"
+                    fi
+
+                    local version_choice
+                    version_choice=$(gum choose --header "Select version to deploy:" \
+                        "$latest_label" \
+                        "Choose from releases" \
+                        "Choose from all tags" \
+                        "Enter version manually" \
+                        "← Back") || true
+                    if [ -z "$version_choice" ]; then continue; fi
+
+                    case "$version_choice" in
+                        "← Back"*)
+                            current_step=3
+                            continue
+                            ;;
+                        "Latest"*)
+                            VERSION="latest"
+                            tui_success "Using latest version${latest_version:+ ($latest_version)}"
+                            sleep 1
+                            current_step=5
+                            ;;
+                        "Choose from releases"*)
+                            if [ -n "$releases" ]; then
+                                echo ""
+                                # Add back option to releases list
+                                local release_choice
+                                release_choice=$(echo -e "← Back\n$releases" | gum choose --header "Select a release:") || true
+                                if [ "$release_choice" = "← Back" ]; then
+                                    continue
+                                elif [ -n "$release_choice" ]; then
+                                    VERSION="$release_choice"
+                                    tui_success "Selected: $VERSION"
+                                    sleep 1
+                                    current_step=5
+                                else
+                                    continue
+                                fi
+                            else
+                                tui_warn "No releases found"
+                                sleep 1
+                                continue
+                            fi
+                            ;;
+                        "Choose from all tags"*)
+                            if [ -n "$tags" ]; then
+                                echo ""
+                                local tag_choice
+                                tag_choice=$(echo -e "← Back\n$tags" | gum choose --header "Select a tag:") || true
+                                if [ "$tag_choice" = "← Back" ]; then
+                                    continue
+                                elif [ -n "$tag_choice" ]; then
+                                    VERSION="$tag_choice"
+                                    tui_success "Selected: $VERSION"
+                                    sleep 1
+                                    current_step=5
+                                else
+                                    continue
+                                fi
+                            else
+                                tui_warn "No tags found"
+                                sleep 1
+                                continue
+                            fi
+                            ;;
+                        "Enter"*)
+                            VERSION=$(gum input --placeholder "v0.32.0" --header "Enter version (e.g., v0.32.0):") || true
+                            if [ -z "$VERSION" ]; then
+                                VERSION="latest"
+                            fi
+                            tui_success "Using version: $VERSION"
+                            sleep 1
+                            current_step=5
+                            ;;
+                        *)
+                            continue
+                            ;;
+                    esac
+                else
+                    # Non-TUI fallback
+                    echo "Version options:"
+                    echo "  1) Latest (recommended)"
+                    echo "  2) Enter specific version"
+                    echo "  b) Back"
+                    echo ""
+                    read -p "Choice [1]: " choice
+
+                    case "$choice" in
+                        b|B)
+                            current_step=3
+                            continue
+                            ;;
+                        2)
+                            read -p "Enter version (e.g., v0.32.0): " VERSION
+                            VERSION="${VERSION:-latest}"
+                            current_step=5
+                            ;;
+                        *)
+                            VERSION="latest"
+                            current_step=5
+                            ;;
+                    esac
+                fi
+                ;;
+
+            5)
+                # Summary
+                tui_title "Configuration Summary"
+
+                local version_display="$VERSION"
+                if [ "$VERSION" = "latest" ]; then
+                    version_display="latest (newest)"
+                fi
+
+                local summary="Address:     ${DOMAIN:-$IP}
+SSL Mode:    $SSL_MODE
+Data Dir:    $DATA_DIR
+Version:     $version_display"
+
+                if [ -n "$EMAIL" ]; then
+                    summary="$summary
+Email:       $EMAIL"
+                fi
+
+                tui_summary_box "$summary"
+
+                echo ""
+
+                if [ "$USE_TUI" = true ] && command -v gum &> /dev/null; then
+                    local confirm_choice
+                    confirm_choice=$(gum choose --header "Ready to deploy?" \
+                        "Yes, proceed with deployment" \
+                        "← Back to version selection" \
+                        "Cancel deployment") || true
+                    if [ -z "$confirm_choice" ]; then continue; fi
+
+                    case "$confirm_choice" in
+                        "Yes"*)
+                            current_step=6  # Exit loop
+                            ;;
+                        "← Back"*)
+                            current_step=4
+                            continue
+                            ;;
+                        "Cancel"*)
+                            tui_info "Deployment cancelled"
+                            exit 0
+                            ;;
+                        *)
+                            continue
+                            ;;
+                    esac
+                else
+                    echo "Options:"
+                    echo "  1) Proceed with deployment"
+                    echo "  b) Back"
+                    echo "  c) Cancel"
+                    read -p "Choice [1]: " choice
+
+                    case "$choice" in
+                        b|B)
+                            current_step=4
+                            continue
+                            ;;
+                        c|C)
+                            echo "Deployment cancelled"
+                            exit 0
+                            ;;
+                        *)
+                            current_step=6  # Exit loop
+                            ;;
+                    esac
+                fi
+                ;;
+        esac
+    done
+
+    tui_clear
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --domain)
+            DOMAIN="$2"
+            shift 2
+            ;;
+        --ip)
+            IP="$2"
+            shift 2
+            ;;
+        --email)
+            EMAIL="$2"
+            shift 2
+            ;;
+        --ssl)
+            SSL_MODE="$2"
+            shift 2
+            ;;
+        --version)
+            VERSION="$2"
+            shift 2
+            ;;
+        --data-dir)
+            DATA_DIR="$2"
+            shift 2
+            ;;
+        --update)
+            ACTION="update"
+            shift
+            ;;
+        --start)
+            ACTION="start"
+            shift
+            ;;
+        --stop)
+            ACTION="stop"
+            shift
+            ;;
+        --restart)
+            ACTION="restart"
+            shift
+            ;;
+        --status)
+            ACTION="status"
+            shift
+            ;;
+        --backup)
+            ACTION="backup"
+            # Check if next arg is a backup name (not another option)
+            if [ $# -gt 1 ] && [[ ! "$2" =~ ^-- ]]; then
+                BACKUP_NAME="$2"
+                shift 2
+            else
+                BACKUP_NAME=""
+                shift
+            fi
+            ;;
+        --restore)
+            ACTION="restore"
+            # Check if next arg is a backup name (not another option)
+            if [ $# -gt 1 ] && [[ ! "$2" =~ ^-- ]]; then
+                BACKUP_NAME="$2"
+                shift 2
+            else
+                BACKUP_NAME=""
+                shift
+            fi
+            ;;
+        --self-update)
+            ACTION="self-update"
+            shift
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        -y|--yes|--non-interactive)
+            NON_INTERACTIVE=true
+            shift
+            ;;
+        --admin-user)
+            CLI_ADMIN_USER="$2"
+            shift 2
+            ;;
+        --admin-password)
+            CLI_ADMIN_PASSWORD="$2"
+            shift 2
+            ;;
+        --admin-email)
+            CLI_ADMIN_EMAIL="$2"
+            shift 2
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Bootstrap: download required files if running standalone
+bootstrap_standalone
+
+# Reconnect stdin to terminal if piped (for curl | bash support)
+# This allows interactive TUI features to work when run via: curl ... | bash
+if [ ! -t 0 ] && [ -e /dev/tty ]; then
+    exec < /dev/tty
+fi
+
+# Check for gum (TUI tool) early - before any TUI functions are called
+check_gum
+
+# Set OS-specific default for DATA_DIR if not specified
+if [ -z "$DATA_DIR" ]; then
+    DATA_DIR=$(get_default_data_dir)
+fi
+
+# Change to project root
+cd "$PROJECT_ROOT"
+
+# Check for script updates (unless running self-update or in non-interactive mode)
+if [ "$ACTION" != "self-update" ] && [ "$NON_INTERACTIVE" = false ]; then
+    if remote_version=$(check_for_script_update 2>/dev/null); then
+        prompt_for_update "$remote_version"
+    fi
+fi
+
+# Execute action
+case "$ACTION" in
+    deploy)
+        do_deploy
+        ;;
+    update)
+        do_update
+        ;;
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart)
+        do_stop
+        do_start
+        ;;
+    status)
+        do_status
+        ;;
+    backup)
+        if [ -n "$BACKUP_NAME" ]; then
+            backup_images "$BACKUP_NAME"
+        else
+            backup_images
+        fi
+        ;;
+    restore)
+        if [ -n "$BACKUP_NAME" ]; then
+            restore_images "$BACKUP_NAME"
+        else
+            restore_images
+        fi
+        ;;
+    self-update)
+        do_self_update
+        ;;
+esac

@@ -1,0 +1,10 @@
+# Development and CI-only dependencies.
+# Runtime deps live in requirements.txt; nothing here ships in an image.
+-r requirements.txt
+
+# Test
+pytest-cov==4.1.0
+
+# Lint / format — configured in pyproject.toml
+ruff==0.6.9
+black==24.8.0

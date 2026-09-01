@@ -1,0 +1,43 @@
+# Traefik dynamic configuration
+http:
+  routers:
+    # The dashboard, now that api.insecure no longer serves it on a listener of
+    # its own. Bound to the internal `traefik` entrypoint (:8082), which is
+    # published on loopback only -- so this adds no public surface.
+    #
+    # PathPrefix(`/api`) here is Traefik's own API, not the platform's: the
+    # platform's /api router is bound to the web and websecure entrypoints, and
+    # entrypoints are what keep the two apart. /ping is untouched and still
+    # answers on this entrypoint via ping@internal, which is what the
+    # container healthcheck probes.
+    dashboard:
+      rule: "PathPrefix(`/dashboard`) || PathPrefix(`/api`)"
+      entryPoints:
+        - traefik
+      service: api@internal
+
+  serversTransports:
+    # Transport for containers with self-signed certs (KasmVNC, etc.)
+    insecure-transport:
+      insecureSkipVerify: true
+
+tls:
+  # Default certificate store
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/certs/cert.pem
+        keyFile: /etc/traefik/certs/key.pem
+
+  # Certificate configuration
+  certificates:
+    - certFile: /etc/traefik/certs/cert.pem
+      keyFile: /etc/traefik/certs/key.pem
+      stores:
+        - default
+
+  # TLS options
+  options:
+    default:
+      minVersion: VersionTLS12
+      sniStrict: false

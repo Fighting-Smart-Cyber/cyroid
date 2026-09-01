@@ -1,0 +1,73 @@
+# Docker Compose overrides for Linux development
+#
+# Usage: Run ./scripts/dev-setup.sh to automatically copy this file
+#   Or manually: cp docker-compose.override.linux.yml docker-compose.override.yml
+#
+# This file maps volume paths to local ./data/proving-ground instead of /data/proving-ground
+# for development convenience (no need for system-wide directories).
+
+services:
+  api:
+    environment:
+      # DinD containers mount from the Docker HOST, not this container, so the
+      # DinD service needs the real host paths. ${PWD} is the repo root where
+      # `docker compose` runs. Without these, range DinDs bind a wrong/empty
+      # source and cached Windows ISOs never reach the range.
+      DIND_HOST_ISO_CACHE: ${PWD}/data/proving-ground/iso-cache
+      DIND_HOST_VM_STORAGE: ${PWD}/data/proving-ground/vm-storage
+      DIND_HOST_TEMPLATE_STORAGE: ${PWD}/data/proving-ground/template-storage
+      DIND_HOST_SHARED: ${PWD}/data/proving-ground/shared
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data/proving-ground/iso-cache:/data/proving-ground/iso-cache
+      - ./data/proving-ground/template-storage:/data/proving-ground/template-storage
+      - ./data/proving-ground/vm-storage:/data/proving-ground/vm-storage
+      - ./data/proving-ground/shared:/data/proving-ground/shared
+      - ./data/proving-ground/catalogs:/data/proving-ground/catalogs
+      # Runtime directories for catalog-installed content
+      - ./data/proving-ground/scenarios:/data/scenarios
+      - ./data/proving-ground/images:/data/images
+
+  worker:
+    environment:
+      DIND_HOST_ISO_CACHE: ${PWD}/data/proving-ground/iso-cache
+      DIND_HOST_VM_STORAGE: ${PWD}/data/proving-ground/vm-storage
+      DIND_HOST_TEMPLATE_STORAGE: ${PWD}/data/proving-ground/template-storage
+      DIND_HOST_SHARED: ${PWD}/data/proving-ground/shared
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data/proving-ground/iso-cache:/data/proving-ground/iso-cache
+      - ./data/proving-ground/template-storage:/data/proving-ground/template-storage
+      - ./data/proving-ground/vm-storage:/data/proving-ground/vm-storage
+      - ./data/proving-ground/shared:/data/proving-ground/shared
+      - ./data/proving-ground/catalogs:/data/proving-ground/catalogs
+      # Runtime directories for catalog-installed content
+      - ./data/proving-ground/scenarios:/data/scenarios
+      - ./data/proving-ground/images:/data/images
+
+  worker-deploy:
+    # Same dev mounts and DinD host-path env as worker; the base compose
+    # supplies the throttled --queues deploys command.
+    environment:
+      DIND_HOST_ISO_CACHE: ${PWD}/data/proving-ground/iso-cache
+      DIND_HOST_VM_STORAGE: ${PWD}/data/proving-ground/vm-storage
+      DIND_HOST_TEMPLATE_STORAGE: ${PWD}/data/proving-ground/template-storage
+      DIND_HOST_SHARED: ${PWD}/data/proving-ground/shared
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data/proving-ground/iso-cache:/data/proving-ground/iso-cache
+      - ./data/proving-ground/template-storage:/data/proving-ground/template-storage
+      - ./data/proving-ground/vm-storage:/data/proving-ground/vm-storage
+      - ./data/proving-ground/shared:/data/proving-ground/shared
+      - ./data/proving-ground/catalogs:/data/proving-ground/catalogs
+      # Runtime directories for catalog-installed content
+      - ./data/proving-ground/scenarios:/data/scenarios
+      - ./data/proving-ground/images:/data/images
+
+  registry:
+    volumes:
+      - ./data/proving-ground/registry:/var/lib/registry
+      - ./config/registry-config.yml:/etc/docker/registry/config.yml:ro

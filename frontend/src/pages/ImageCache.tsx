@@ -1,0 +1,3775 @@
+// frontend/src/pages/ImageCache.tsx
+import { useState, useEffect, useRef } from 'react'
+import { cacheApi, registryApi, DockerPullStatus, DockerBuildStatus, BuildableImage, ImageStatusResponse } from '../services/api'
+import { useAuthStore } from '../stores/authStore'
+import type {
+  CachedImage,
+  CacheStats,
+  RecommendedImages,
+  RecommendedImage,
+  WindowsVersionsResponse,
+  WindowsVersion,
+  WindowsISODownloadStatus,
+  CustomISOList,
+  CustomISOStatusResponse,
+  LinuxVersionsResponse,
+  LinuxVersion,
+  LinuxISODownloadStatus,
+  MacOSVersionsResponse,
+  MacOSVersion,
+  MacOSISODownloadStatus,
+} from '../types'
+import {
+  HardDrive,
+  Trash2,
+  RefreshCw,
+  Plus,
+  Server,
+  Monitor,
+  AlertCircle,
+  CheckCircle,
+  Loader2,
+  Info,
+  Download,
+  Link,
+  Upload,
+  Check,
+  X,
+  Terminal,
+  Hammer,
+  FolderEdit,
+  Database,
+  Cog,
+  Cloud,
+  CloudOff,
+} from 'lucide-react'
+import clsx from 'clsx'
+import { ConfirmDialog } from '../components/common/ConfirmDialog'
+import { toast } from '../stores/toastStore'
+import { FileBrowser } from '../components/files/FileBrowser'
+import { BRANDING } from '../lib/branding'
+
+type TabType = 'overview' | 'docker' | 'isos' | 'linux-isos' | 'macos-isos' | 'custom-isos'
+
+export default function ImageCache() {
+  const { user } = useAuthStore()
+  const isAdmin = user?.roles?.includes('admin') ?? false
+  const [activeTab, setActiveTab] = useState<TabType>('overview')
+  const [stats, setStats] = useState<CacheStats | null>(null)
+  const [images, setImages] = useState<CachedImage[]>([])
+  const [recommended, setRecommended] = useState<RecommendedImages | null>(null)
+  const [windowsVersions, setWindowsVersions] = useState<WindowsVersionsResponse | null>(null)
+  const [linuxVersions, setLinuxVersions] = useState<LinuxVersionsResponse | null>(null)
+  const [macosVersions, setMacosVersions] = useState<MacOSVersionsResponse | null>(null)
+  const [customISOs, setCustomISOs] = useState<CustomISOList | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [actionLoading, setActionLoading] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
+
+  // Modal state for caching new images
+  const [showCacheModal, setShowCacheModal] = useState(false)
+  const [newImageName, setNewImageName] = useState('')
+  const [selectedRecommended, setSelectedRecommended] = useState<string[]>([])
+
+  // Custom ISO modal state
+  const [showCustomISOModal, setShowCustomISOModal] = useState(false)
+  const [customISOName, setCustomISOName] = useState('')
+  const [customISOUrl, setCustomISOUrl] = useState('')
+
+  // macOS download modal state (for custom URL downloads)
+  const [showMacOSDownloadModal, setShowMacOSDownloadModal] = useState<MacOSVersion | null>(null)
+  const [macosDownloadUrl, setMacosDownloadUrl] = useState('')
+
+  // Upload modal state
+  const [showUploadModal, setShowUploadModal] = useState<'windows' | 'linux' | 'macos' | 'custom' | 'docker' | null>(null)
+  const [uploadFile, setUploadFile] = useState<File | null>(null)
+  const [uploadName, setUploadName] = useState('')
+  const [uploadCategory, setUploadCategory] = useState('')
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Download state for tracking Windows ISO downloads
+  const [downloadStatus, setDownloadStatus] = useState<Record<string, WindowsISODownloadStatus>>({})
+  // Download state for tracking Linux ISO downloads
+  const [linuxDownloadStatus, setLinuxDownloadStatus] = useState<Record<string, LinuxISODownloadStatus>>({})
+  // Download state for tracking macOS ISO downloads
+  const [macosDownloadStatus, setMacosDownloadStatus] = useState<Record<string, MacOSISODownloadStatus>>({})
+  // Download state for tracking Custom ISO downloads
+  const [customISODownloadStatus, setCustomISODownloadStatus] = useState<Record<string, CustomISOStatusResponse>>({})
+  // Pull state for tracking Docker image pulls
+  const [dockerPullStatus, setDockerPullStatus] = useState<Record<string, DockerPullStatus>>({})
+  // Build state for tracking Docker image builds
+  const [buildableImages, setBuildableImages] = useState<BuildableImage[]>([])
+  const [dockerBuildStatus, setDockerBuildStatus] = useState<Record<string, DockerBuildStatus>>({})
+  // Registry images for checking if built images are in registry
+  const [registryImages, setRegistryImages] = useState<string[]>([])
+
+  // Registry status for cached images (keyed by image tag)
+  const [registryStatus, setRegistryStatus] = useState<Record<string, ImageStatusResponse>>({})
+  const [registryStatusLoading, setRegistryStatusLoading] = useState<Record<string, boolean>>({})
+
+  // Registry push status (keyed by image tag) for progress tracking
+  const [registryPushStatus, setRegistryPushStatus] = useState<Record<string, {
+    operation_id: string
+    status: string
+    progress_percent: number
+    current_layer?: number
+    total_layers?: number
+    error_message?: string
+  }>>({})
+
+  // Selected images for batch push
+  const [selectedForPush, setSelectedForPush] = useState<Set<string>>(new Set())
+
+  // Delete confirmation state
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    type: 'docker' | 'windows-iso' | 'linux-iso' | 'macos-iso' | 'custom-iso' | null
+    name: string
+    id?: string
+    arch?: string  // For linux-iso architecture-specific delete
+    isLoading: boolean
+  }>({ type: null, name: '', isLoading: false })
+
+  // Prune state
+  const [isPruning, setIsPruning] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+
+  const loadData = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const [statsRes, imagesRes, recommendedRes, windowsRes, linuxRes, macosRes, customISOsRes, buildableRes, registryRes] = await Promise.all([
+        cacheApi.getStats(),
+        cacheApi.listImages(),
+        cacheApi.getRecommendedImages(),
+        cacheApi.getWindowsVersions(),
+        cacheApi.getLinuxVersions(),
+        cacheApi.getMacOSVersions(),
+        cacheApi.listCustomISOs(),
+        cacheApi.listBuildableImages(),
+        registryApi.listImages(),
+      ])
+      setStats(statsRes.data)
+      setImages(imagesRes.data)
+      setRecommended(recommendedRes.data)
+      setWindowsVersions(windowsRes.data)
+      setLinuxVersions(linuxRes.data)
+      setMacosVersions(macosRes.data)
+      setCustomISOs(customISOsRes.data)
+      setBuildableImages(buildableRes.data.images || [])
+      // Extract repository names from registry images for checking if built images are in registry
+      const repoNames = (registryRes.data || []).map((img: any) => img.repository || img.name || '')
+      setRegistryImages(repoNames)
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to load cache data')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Load registry status for an image
+  const loadRegistryStatus = async (imageTag: string) => {
+    if (registryStatusLoading[imageTag]) return
+    setRegistryStatusLoading(prev => ({ ...prev, [imageTag]: true }))
+    try {
+      const res = await registryApi.getImageStatus(imageTag)
+      setRegistryStatus(prev => ({ ...prev, [imageTag]: res.data }))
+    } catch {
+      // Ignore errors - registry may not be available
+    } finally {
+      setRegistryStatusLoading(prev => ({ ...prev, [imageTag]: false }))
+    }
+  }
+
+  // Load registry status for all cached images
+  const loadAllRegistryStatus = async (cachedImages: { tags: string[] }[]) => {
+    // Only load for images that have proving_ground/ prefix or are likely range-related
+    const imageTags = cachedImages
+      .flatMap(img => img.tags)
+      .filter(tag => tag && !tag.startsWith('<none>'))
+      .slice(0, 50) // Limit to avoid too many requests
+
+    // Load in parallel with limited concurrency
+    const batchSize = 5
+    for (let i = 0; i < imageTags.length; i += batchSize) {
+      const batch = imageTags.slice(i, i + batchSize)
+      await Promise.all(batch.map(tag => loadRegistryStatus(tag)))
+    }
+  }
+
+  // Handler for pushing an image to registry (async with progress)
+  const handlePushToRegistry = async (imageTag: string) => {
+    try {
+      const res = await registryApi.pushImage(imageTag)
+      // Initialize push status and start polling
+      setRegistryPushStatus(prev => ({
+        ...prev,
+        [imageTag]: {
+          operation_id: res.data.operation_id,
+          status: 'starting',
+          progress_percent: 0,
+        }
+      }))
+      startRegistryPushPolling(res.data.operation_id, imageTag)
+    } catch (err: any) {
+      toast.error(err.response?.data?.detail || 'Failed to start push to registry')
+    }
+  }
+
+  // Handler for batch pushing selected images to registry
+  const handleBatchPush = async () => {
+    const imagesToPush = Array.from(selectedForPush)
+    for (const imageTag of imagesToPush) {
+      await handlePushToRegistry(imageTag)
+    }
+  }
+
+  // Toggle selection for batch push
+  const togglePushSelection = (imageTag: string) => {
+    setSelectedForPush(prev => {
+      const newSet = new Set(prev)
+      if (newSet.has(imageTag)) {
+        newSet.delete(imageTag)
+      } else {
+        newSet.add(imageTag)
+      }
+      return newSet
+    })
+  }
+
+  // Clear selection
+  const clearPushSelection = () => {
+    setSelectedForPush(new Set())
+  }
+
+  // Handler for refreshing all data
+  const handleRefreshAll = async () => {
+    setIsRefreshing(true)
+    try {
+      await loadData()
+      toast.success('Cache data refreshed')
+    } catch {
+      toast.error('Failed to refresh data')
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
+  // Handler for pruning unused Docker images
+  const handlePruneImages = async () => {
+    setIsPruning(true)
+    try {
+      const result = await cacheApi.pruneImages()
+      const { images_deleted, space_reclaimed_gb } = result.data
+      if (images_deleted > 0) {
+        toast.success(`Pruned ${images_deleted} image${images_deleted !== 1 ? 's' : ''}, reclaimed ${space_reclaimed_gb} GB`)
+        await loadData() // Refresh to show updated state
+      } else {
+        toast.info('No unused images to prune')
+      }
+    } catch (err: any) {
+      toast.error(err.response?.data?.detail || 'Failed to prune images')
+    } finally {
+      setIsPruning(false)
+    }
+  }
+
+  // Store polling intervals so we can clear them
+  const pollingIntervalsRef = useRef<Record<string, ReturnType<typeof setInterval>>>({})
+
+  // Check for active downloads on mount and restore polling
+  const checkActiveDownloads = async () => {
+    // Check Linux downloads
+    if (linuxVersions) {
+      const allLinuxVersions = [
+        ...(linuxVersions.desktop || []),
+        ...(linuxVersions.server || []),
+        ...(linuxVersions.security || []),
+      ]
+      for (const v of allLinuxVersions) {
+        try {
+          const statusRes = await cacheApi.getLinuxISODownloadStatus(v.version)
+          if (statusRes.data.status === 'downloading') {
+            setLinuxDownloadStatus(prev => ({ ...prev, [v.version]: statusRes.data }))
+            // Start polling for this download
+            startLinuxDownloadPolling(v.version)
+          }
+        } catch {
+          // Ignore errors for individual status checks
+        }
+      }
+    }
+
+    // Check Windows downloads
+    if (windowsVersions) {
+      const allWindowsVersions = [
+        ...(windowsVersions.desktop || []),
+        ...(windowsVersions.server || []),
+        ...(windowsVersions.legacy || []),
+      ]
+      for (const v of allWindowsVersions) {
+        try {
+          const statusRes = await cacheApi.getWindowsISODownloadStatus(v.version)
+          if (statusRes.data.status === 'downloading') {
+            setDownloadStatus(prev => ({ ...prev, [v.version]: statusRes.data }))
+            // Start polling for this download
+            startWindowsDownloadPolling(v.version)
+          }
+        } catch {
+          // Ignore errors for individual status checks
+        }
+      }
+    }
+
+    // Check Custom ISO downloads
+    if (customISOs) {
+      for (const iso of customISOs.isos) {
+        try {
+          const statusRes = await cacheApi.getCustomISOStatus(iso.filename)
+          if (statusRes.data.status === 'downloading') {
+            setCustomISODownloadStatus(prev => ({ ...prev, [iso.filename]: statusRes.data }))
+            // Start polling for this download
+            startCustomISODownloadPolling(iso.filename)
+          }
+        } catch {
+          // Ignore errors for individual status checks
+        }
+      }
+    }
+
+    // Check active Docker pulls
+    try {
+      const activePullsRes = await cacheApi.getActivePulls()
+      for (const pull of activePullsRes.data.pulls) {
+        if (pull.image) {
+          const imageKey = pull.image.replace(/\//g, '_').replace(/:/g, '_')
+          setDockerPullStatus(prev => ({ ...prev, [imageKey]: pull }))
+          startDockerPullPolling(imageKey, pull.image)
+        }
+      }
+    } catch {
+      // Ignore errors for active pull check
+    }
+  }
+
+  const startLinuxDownloadPolling = (version: string) => {
+    // Clear any existing interval for this version
+    if (pollingIntervalsRef.current[`linux-${version}`]) {
+      clearInterval(pollingIntervalsRef.current[`linux-${version}`])
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusRes = await cacheApi.getLinuxISODownloadStatus(version)
+        setLinuxDownloadStatus(prev => ({ ...prev, [version]: statusRes.data }))
+
+        if (statusRes.data.status === 'completed' || statusRes.data.status === 'failed') {
+          clearInterval(pollInterval)
+          delete pollingIntervalsRef.current[`linux-${version}`]
+
+          if (statusRes.data.status === 'completed') {
+            setSuccess(`Downloaded Linux ISO: ${version}`)
+            await loadData()
+          } else if (statusRes.data.error) {
+            setError(`Download failed: ${statusRes.data.error}`)
+          }
+
+          // Clear download status after a delay
+          setTimeout(() => {
+            setLinuxDownloadStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[version]
+              return newStatus
+            })
+          }, 5000)
+        }
+      } catch {
+        clearInterval(pollInterval)
+        delete pollingIntervalsRef.current[`linux-${version}`]
+      }
+    }, 2000)
+
+    pollingIntervalsRef.current[`linux-${version}`] = pollInterval
+  }
+
+  const startWindowsDownloadPolling = (version: string) => {
+    // Clear any existing interval for this version
+    if (pollingIntervalsRef.current[`windows-${version}`]) {
+      clearInterval(pollingIntervalsRef.current[`windows-${version}`])
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusRes = await cacheApi.getWindowsISODownloadStatus(version)
+        setDownloadStatus(prev => ({ ...prev, [version]: statusRes.data }))
+
+        if (statusRes.data.status === 'completed' || statusRes.data.status === 'failed') {
+          clearInterval(pollInterval)
+          delete pollingIntervalsRef.current[`windows-${version}`]
+
+          if (statusRes.data.status === 'completed') {
+            setSuccess(`Downloaded Windows ISO: ${version}`)
+            await loadData()
+          } else if (statusRes.data.error) {
+            setError(`Download failed: ${statusRes.data.error}`)
+          }
+
+          // Clear download status after a delay
+          setTimeout(() => {
+            setDownloadStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[version]
+              return newStatus
+            })
+          }, 5000)
+        }
+      } catch {
+        clearInterval(pollInterval)
+        delete pollingIntervalsRef.current[`windows-${version}`]
+      }
+    }, 2000)
+
+    pollingIntervalsRef.current[`windows-${version}`] = pollInterval
+  }
+
+  const startCustomISODownloadPolling = (filename: string) => {
+    // Clear any existing interval for this filename
+    if (pollingIntervalsRef.current[`custom-${filename}`]) {
+      clearInterval(pollingIntervalsRef.current[`custom-${filename}`])
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusRes = await cacheApi.getCustomISOStatus(filename)
+        setCustomISODownloadStatus(prev => ({ ...prev, [filename]: statusRes.data }))
+
+        if (statusRes.data.status === 'completed' || statusRes.data.status === 'failed') {
+          clearInterval(pollInterval)
+          delete pollingIntervalsRef.current[`custom-${filename}`]
+
+          if (statusRes.data.status === 'completed') {
+            setSuccess(`Downloaded custom ISO: ${statusRes.data.name || filename}`)
+            await loadData()
+          } else if (statusRes.data.error) {
+            setError(`Download failed: ${statusRes.data.error}`)
+          }
+
+          // Clear download status after a delay
+          setTimeout(() => {
+            setCustomISODownloadStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[filename]
+              return newStatus
+            })
+          }, 5000)
+        }
+      } catch {
+        clearInterval(pollInterval)
+        delete pollingIntervalsRef.current[`custom-${filename}`]
+      }
+    }, 2000)
+
+    pollingIntervalsRef.current[`custom-${filename}`] = pollInterval
+  }
+
+  const startDockerPullPolling = (imageKey: string, imageName: string) => {
+    // Clear any existing interval for this image
+    if (pollingIntervalsRef.current[`docker-${imageKey}`]) {
+      clearInterval(pollingIntervalsRef.current[`docker-${imageKey}`])
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusRes = await cacheApi.getPullStatus(imageKey)
+        setDockerPullStatus(prev => ({ ...prev, [imageKey]: statusRes.data }))
+
+        if (statusRes.data.status === 'completed' || statusRes.data.status === 'failed' || statusRes.data.status === 'cancelled') {
+          clearInterval(pollInterval)
+          delete pollingIntervalsRef.current[`docker-${imageKey}`]
+
+          if (statusRes.data.status === 'completed') {
+            setSuccess(`Pulled Docker image: ${imageName}`)
+            await loadData()
+          } else if (statusRes.data.status === 'failed' && statusRes.data.error) {
+            setError(`Pull failed: ${statusRes.data.error}`)
+          }
+
+          // Clear pull status after a delay
+          setTimeout(() => {
+            setDockerPullStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[imageKey]
+              return newStatus
+            })
+          }, 5000)
+        }
+      } catch {
+        clearInterval(pollInterval)
+        delete pollingIntervalsRef.current[`docker-${imageKey}`]
+      }
+    }, 1000) // Poll every second for Docker pulls (they can be fast)
+
+    pollingIntervalsRef.current[`docker-${imageKey}`] = pollInterval
+  }
+
+  const handlePullDockerImage = async (image: string) => {
+    const imageKey = image.replace(/\//g, '_').replace(/:/g, '_')
+    setActionLoading(`pull-${imageKey}`)
+    setError(null)
+
+    try {
+      const res = await cacheApi.pullImage(image)
+
+      if (res.data.status === 'already_cached') {
+        setSuccess(`${image} is already cached`)
+        setActionLoading(null)
+        return
+      }
+
+      if (res.data.status === 'already_pulling') {
+        setSuccess(`${image} is already being pulled`)
+        setActionLoading(null)
+        return
+      }
+
+      // Start polling for pull status
+      setDockerPullStatus(prev => ({
+        ...prev,
+        [imageKey]: { status: 'pulling', image, progress_percent: 0 }
+      }))
+      startDockerPullPolling(imageKey, image)
+      setSuccess(`Started pulling ${image}`)
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to start pull')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleCancelDockerPull = async (imageKey: string) => {
+    setActionLoading(`cancel-docker-${imageKey}`)
+    setError(null)
+    try {
+      await cacheApi.cancelPull(imageKey)
+      setSuccess(`Cancelled pull`)
+      setDockerPullStatus(prev => {
+        const newStatus = { ...prev }
+        delete newStatus[imageKey]
+        return newStatus
+      })
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to cancel pull')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  // ============ Docker Image Build Functions ============
+
+  const startDockerBuildPolling = (buildKey: string, imageName: string) => {
+    // Clear any existing polling for this build
+    if (pollingIntervalsRef.current[`build-${buildKey}`]) {
+      clearInterval(pollingIntervalsRef.current[`build-${buildKey}`])
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusRes = await cacheApi.getBuildStatus(buildKey)
+
+        setDockerBuildStatus(prev => ({
+          ...prev,
+          [buildKey]: statusRes.data
+        }))
+
+        // Stop polling if build is complete, failed, or cancelled
+        if (['completed', 'failed', 'cancelled'].includes(statusRes.data.status)) {
+          clearInterval(pollInterval)
+          delete pollingIntervalsRef.current[`build-${buildKey}`]
+
+          if (statusRes.data.status === 'completed') {
+            const fullImageTag = statusRes.data.full_tag || `proving_ground/${imageName}:latest`
+            // Build complete - auto-push is handled by backend, just show success
+            toast.success(`Built ${imageName} successfully`)
+            await loadData()
+            // Refresh registry status for this image
+            loadRegistryStatus(fullImageTag)
+          } else if (statusRes.data.status === 'failed' && statusRes.data.error) {
+            toast.error(`Build failed: ${statusRes.data.error}`)
+          }
+
+          // Clear build status after a delay
+          setTimeout(() => {
+            setDockerBuildStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[buildKey]
+              return newStatus
+            })
+          }, 10000) // Keep visible for 10s after completion
+        }
+      } catch {
+        clearInterval(pollInterval)
+        delete pollingIntervalsRef.current[`build-${buildKey}`]
+      }
+    }, 2000) // Poll every 2 seconds for builds (they take longer)
+
+    pollingIntervalsRef.current[`build-${buildKey}`] = pollInterval
+  }
+
+  // Start polling for registry push progress
+  const startRegistryPushPolling = (operationId: string, imageTag: string) => {
+    // Clear any existing interval for this image
+    if (pollingIntervalsRef.current[`push-${imageTag}`]) {
+      clearInterval(pollingIntervalsRef.current[`push-${imageTag}`])
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusRes = await registryApi.getPushStatus(operationId)
+        setRegistryPushStatus(prev => ({ ...prev, [imageTag]: statusRes.data }))
+
+        if (statusRes.data.status === 'completed' || statusRes.data.status === 'failed') {
+          clearInterval(pollInterval)
+          delete pollingIntervalsRef.current[`push-${imageTag}`]
+
+          if (statusRes.data.status === 'completed') {
+            toast.success(`Pushed ${imageTag} to registry`)
+            // Update registry status to reflect the push
+            setRegistryStatus(prev => ({
+              ...prev,
+              [imageTag]: { image_tag: imageTag, in_registry: true, needs_push: false, on_host: false }
+            }))
+            // Preserve scroll position during refresh
+            const scrollY = window.scrollY
+            await loadData()
+            window.scrollTo(0, scrollY)
+          } else {
+            toast.error(statusRes.data.error_message || `Failed to push ${imageTag}`)
+          }
+
+          // Remove from selected set
+          setSelectedForPush(prev => {
+            const newSet = new Set(prev)
+            newSet.delete(imageTag)
+            return newSet
+          })
+
+          // Clear push status after delay
+          setTimeout(() => {
+            setRegistryPushStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[imageTag]
+              return newStatus
+            })
+          }, 5000)
+        }
+      } catch {
+        clearInterval(pollInterval)
+        delete pollingIntervalsRef.current[`push-${imageTag}`]
+      }
+    }, 1000) // Poll every second for push progress
+
+    pollingIntervalsRef.current[`push-${imageTag}`] = pollInterval
+  }
+
+  const handleBuildImage = async (imageName: string, noCache = false) => {
+    const buildKey = `${imageName}_latest`
+    setActionLoading(`build-${buildKey}`)
+    setError(null)
+
+    try {
+      const res = await cacheApi.buildImage({
+        image_name: imageName,
+        tag: 'latest',
+        no_cache: noCache,
+      })
+
+      if (res.data.status === 'already_building') {
+        toast.info(`${imageName} is already being built`)
+        setActionLoading(null)
+        return
+      }
+
+      // Start polling for build status
+      setDockerBuildStatus(prev => ({
+        ...prev,
+        [buildKey]: {
+          status: 'building',
+          image_name: imageName,
+          tag: 'latest',
+          full_tag: `proving_ground/${imageName}:latest`,
+          progress_percent: 0,
+          current_step: 0,
+          total_steps: 0,
+          current_step_name: 'Starting build...',
+        }
+      }))
+      startDockerBuildPolling(buildKey, imageName)
+      toast.success(`Started building proving_ground/${imageName}:latest`)
+    } catch (err: any) {
+      toast.error(err.response?.data?.detail || 'Failed to start build')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleCancelDockerBuild = async (buildKey: string) => {
+    setActionLoading(`cancel-build-${buildKey}`)
+    setError(null)
+    try {
+      await cacheApi.cancelBuild(buildKey)
+      toast.success(`Cancelled build`)
+      setDockerBuildStatus(prev => {
+        const newStatus = { ...prev }
+        delete newStatus[buildKey]
+        return newStatus
+      })
+    } catch (err: any) {
+      toast.error(err.response?.data?.detail || 'Failed to cancel build')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  // Check for active builds on mount
+  const checkActiveBuilds = async () => {
+    try {
+      const res = await cacheApi.getActiveBuilds()
+      if (res.data.builds && res.data.builds.length > 0) {
+        for (const build of res.data.builds) {
+          if (build.build_key && build.status === 'building') {
+            setDockerBuildStatus(prev => ({
+              ...prev,
+              [build.build_key!]: build
+            }))
+            startDockerBuildPolling(build.build_key, build.image_name || '')
+          }
+        }
+      }
+    } catch {
+      // Ignore errors checking for active builds
+    }
+  }
+
+  // Check for active registry pushes on mount
+  const checkActivePushes = async () => {
+    try {
+      const res = await registryApi.getActivePushes()
+      if (res.data.pushes && res.data.pushes.length > 0) {
+        for (const push of res.data.pushes) {
+          if (push.operation_id && push.image_tag) {
+            setRegistryPushStatus(prev => ({
+              ...prev,
+              [push.image_tag]: push
+            }))
+            startRegistryPushPolling(push.operation_id, push.image_tag)
+          }
+        }
+      }
+    } catch {
+      // Ignore errors checking for active pushes
+    }
+  }
+
+  useEffect(() => {
+    loadData()
+    checkActiveBuilds()
+    checkActivePushes()
+  }, [])
+
+  // Check for active downloads after data is loaded
+  useEffect(() => {
+    if (linuxVersions || windowsVersions || customISOs) {
+      checkActiveDownloads()
+    }
+  }, [linuxVersions, windowsVersions, customISOs])
+
+  // Load registry status when images are loaded
+  useEffect(() => {
+    if (images.length > 0) {
+      loadAllRegistryStatus(images)
+    }
+  }, [images])
+
+  // Cleanup polling intervals on unmount
+  useEffect(() => {
+    return () => {
+      Object.values(pollingIntervalsRef.current).forEach(clearInterval)
+    }
+  }, [])
+
+  const handleCacheBatch = async () => {
+    if (selectedRecommended.length === 0 && !newImageName) return
+
+    const imagesToCache = [...selectedRecommended]
+    if (newImageName) imagesToCache.push(newImageName)
+
+    setActionLoading('batch')
+    setError(null)
+    try {
+      await cacheApi.cacheBatchImages(imagesToCache)
+      setSuccess(`Started caching ${imagesToCache.length} images in background`)
+      setShowCacheModal(false)
+      setSelectedRecommended([])
+      setNewImageName('')
+      setTimeout(() => loadData(), 2000)
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to start batch caching')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleRemoveImage = (imageId: string, tag: string) => {
+    setDeleteConfirm({ type: 'docker', name: tag, id: imageId, isLoading: false })
+  }
+
+  const handleDownloadCustomISO = async () => {
+    if (!customISOName || !customISOUrl) return
+
+    setActionLoading('custom-iso-download')
+    setError(null)
+    try {
+      const res = await cacheApi.downloadCustomISO(customISOName, customISOUrl)
+      const filename = res.data.filename
+
+      // Start polling for download status
+      setCustomISODownloadStatus(prev => ({
+        ...prev,
+        [filename]: { status: 'downloading', filename, name: customISOName, progress_gb: 0 }
+      }))
+      startCustomISODownloadPolling(filename)
+
+      setSuccess(`Started downloading ${customISOName}`)
+      setShowCustomISOModal(false)
+      setCustomISOName('')
+      setCustomISOUrl('')
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to start ISO download')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleCancelCustomISODownload = async (filename: string) => {
+    setActionLoading(`cancel-custom-${filename}`)
+    setError(null)
+    try {
+      await cacheApi.cancelCustomISODownload(filename)
+      setSuccess(`Cancelled download for ${filename}`)
+      setCustomISODownloadStatus(prev => {
+        const newStatus = { ...prev }
+        delete newStatus[filename]
+        return newStatus
+      })
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to cancel download')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleDeleteCustomISO = (filename: string, name: string) => {
+    setDeleteConfirm({ type: 'custom-iso', name, id: filename, isLoading: false })
+  }
+
+  const handleDeleteWindowsISO = (version: string, name: string, arch?: 'x86_64' | 'arm64') => {
+    const archSuffix = arch ? ` (${arch})` : ''
+    setDeleteConfirm({ type: 'windows-iso', name: `${name}${archSuffix}`, id: version, arch, isLoading: false })
+  }
+
+  const handleDownloadWindowsISO = async (version: WindowsVersion, customUrl?: string, arch?: 'x86_64' | 'arm64') => {
+    // Use architecture-specific key for tracking
+    const downloadKey = arch ? `${version.version}-${arch}` : version.version
+    setActionLoading(`download-windows-${downloadKey}`)
+    setError(null)
+
+    try {
+      const res = await cacheApi.downloadWindowsISO(version.version, customUrl, arch)
+
+      // Handle no direct download available
+      if (res.data.status === 'no_direct_download') {
+        setError(res.data.message || 'No direct download available for this version')
+        setActionLoading(null)
+        return
+      }
+
+      // Start polling for download status
+      setDownloadStatus(prev => ({
+        ...prev,
+        [downloadKey]: { status: 'downloading', version: version.version, progress_gb: 0 }
+      }))
+
+      // Poll for status
+      const pollInterval = setInterval(async () => {
+        try {
+          const statusRes = await cacheApi.getWindowsISODownloadStatus(version.version, arch)
+          setDownloadStatus(prev => ({
+            ...prev,
+            [downloadKey]: statusRes.data
+          }))
+
+          if (statusRes.data.status === 'completed' || statusRes.data.status === 'failed') {
+            clearInterval(pollInterval)
+            setActionLoading(null)
+
+            if (statusRes.data.status === 'completed') {
+              const archLabel = arch ? ` (${arch})` : ''
+              setSuccess(`Downloaded ${version.name}${archLabel} ISO successfully!`)
+              await loadData()
+            } else if (statusRes.data.error) {
+              setError(`Download failed: ${statusRes.data.error}`)
+            }
+
+            // Clear download status after a delay
+            setTimeout(() => {
+              setDownloadStatus(prev => {
+                const newStatus = { ...prev }
+                delete newStatus[downloadKey]
+                return newStatus
+              })
+            }, 5000)
+          }
+        } catch (err) {
+          clearInterval(pollInterval)
+          setActionLoading(null)
+        }
+      }, 2000) // Poll every 2 seconds
+
+    } catch (err: any) {
+      const detail = err.response?.data?.detail
+      if (typeof detail === 'object' && detail.status === 'no_direct_download') {
+        // Show error with download page link
+        const msg = detail.message || 'No direct download available'
+        if (detail.download_page) {
+          setError(`${msg}. Visit the download page to get the ISO manually.`)
+        } else {
+          setError(msg)
+        }
+      } else {
+        setError(typeof detail === 'string' ? detail : 'Failed to start download')
+      }
+      setActionLoading(null)
+    }
+  }
+
+  const handleDownloadLinuxISO = async (version: LinuxVersion, customUrl?: string, arch?: string) => {
+    // Use architecture-specific key for tracking
+    const downloadKey = arch ? `${version.version}-${arch}` : version.version
+    setActionLoading(`download-linux-${downloadKey}`)
+    setError(null)
+
+    try {
+      const res = await cacheApi.downloadLinuxISO(version.version, customUrl, arch)
+
+      // Handle no direct download available
+      if (res.data.status === 'no_direct_download') {
+        setError(res.data.message || 'No direct download available for this distribution')
+        setActionLoading(null)
+        return
+      }
+
+      // Start polling for download status
+      setLinuxDownloadStatus(prev => ({
+        ...prev,
+        [downloadKey]: { status: 'downloading', version: version.version, progress_gb: 0 }
+      }))
+
+      // Poll for status
+      const pollInterval = setInterval(async () => {
+        try {
+          const statusRes = await cacheApi.getLinuxISODownloadStatus(version.version, arch)
+          setLinuxDownloadStatus(prev => ({
+            ...prev,
+            [downloadKey]: statusRes.data
+          }))
+
+          if (statusRes.data.status === 'completed' || statusRes.data.status === 'failed') {
+            clearInterval(pollInterval)
+            setActionLoading(null)
+
+            if (statusRes.data.status === 'completed') {
+              setSuccess(`Downloaded ${version.name} (${arch || 'default'}) ISO successfully!`)
+              await loadData()
+            } else if (statusRes.data.error) {
+              setError(`Download failed: ${statusRes.data.error}`)
+            }
+
+            // Clear download status after a delay
+            setTimeout(() => {
+              setLinuxDownloadStatus(prev => {
+                const newStatus = { ...prev }
+                delete newStatus[downloadKey]
+                return newStatus
+              })
+            }, 5000)
+          }
+        } catch (err) {
+          clearInterval(pollInterval)
+          setActionLoading(null)
+        }
+      }, 2000) // Poll every 2 seconds
+
+    } catch (err: any) {
+      const detail = err.response?.data?.detail
+      if (typeof detail === 'object' && detail.status === 'no_direct_download') {
+        setError(detail.message || 'No direct download available')
+      } else {
+        setError(typeof detail === 'string' ? detail : 'Failed to start download')
+      }
+      setActionLoading(null)
+    }
+  }
+
+  const handleDeleteLinuxISO = (version: string, arch?: string) => {
+    const displayName = arch ? `${version} (${arch})` : version
+    const id = arch ? `${version}-${arch}` : version
+    setDeleteConfirm({ type: 'linux-iso', name: displayName, id: id, arch: arch, isLoading: false })
+  }
+
+  const confirmDelete = async () => {
+    if (!deleteConfirm.type) return
+    setDeleteConfirm(prev => ({ ...prev, isLoading: true }))
+    setError(null)
+
+    try {
+      switch (deleteConfirm.type) {
+        case 'docker':
+          if (deleteConfirm.id) {
+            await cacheApi.removeImage(deleteConfirm.id)
+            toast.success(`Removed ${deleteConfirm.name}`)
+          }
+          break
+        case 'custom-iso':
+          if (deleteConfirm.id) {
+            await cacheApi.deleteCustomISO(deleteConfirm.id)
+            setCustomISODownloadStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[deleteConfirm.id!]
+              return newStatus
+            })
+            toast.success(`Deleted custom ISO: ${deleteConfirm.name}`)
+          }
+          break
+        case 'windows-iso':
+          if (deleteConfirm.id) {
+            await cacheApi.deleteWindowsISO(deleteConfirm.id, deleteConfirm.arch as 'x86_64' | 'arm64' | undefined)
+            // Clear download status if exists
+            const downloadKey = deleteConfirm.arch ? `${deleteConfirm.id}-${deleteConfirm.arch}` : deleteConfirm.id
+            setDownloadStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[downloadKey]
+              return newStatus
+            })
+            toast.success(`Deleted Windows ISO: ${deleteConfirm.name}`)
+          }
+          break
+        case 'linux-iso':
+          if (deleteConfirm.id) {
+            // Extract version from id (format: version or version-arch)
+            const version = deleteConfirm.arch ? deleteConfirm.id.replace(`-${deleteConfirm.arch}`, '') : deleteConfirm.id
+            await cacheApi.deleteLinuxISO(version, deleteConfirm.arch)
+            setLinuxDownloadStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[deleteConfirm.id!]
+              return newStatus
+            })
+            toast.success(`Deleted Linux ISO: ${deleteConfirm.name}`)
+          }
+          break
+        case 'macos-iso':
+          if (deleteConfirm.id) {
+            await cacheApi.deleteMacOSISO(deleteConfirm.id)
+            setMacosDownloadStatus(prev => {
+              const newStatus = { ...prev }
+              delete newStatus[deleteConfirm.id!]
+              return newStatus
+            })
+            toast.success(`Deleted macOS ISO: ${deleteConfirm.name}`)
+          }
+          break
+      }
+      setDeleteConfirm({ type: null, name: '', isLoading: false })
+      await loadData()
+    } catch (err: any) {
+      setDeleteConfirm({ type: null, name: '', isLoading: false })
+      toast.error(err.response?.data?.detail || `Failed to delete ${deleteConfirm.name}`)
+    }
+  }
+
+  const handleCancelLinuxDownload = async (version: string, arch?: string) => {
+    const downloadKey = arch ? `${version}-${arch}` : version
+    setActionLoading(`cancel-linux-${downloadKey}`)
+    setError(null)
+    try {
+      await cacheApi.cancelLinuxISODownload(version, arch)
+      setSuccess(`Cancelled download for ${version}${arch ? ` (${arch})` : ''}`)
+      setLinuxDownloadStatus(prev => {
+        const newStatus = { ...prev }
+        delete newStatus[downloadKey]
+        return newStatus
+      })
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to cancel download')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleCancelWindowsDownload = async (version: string, arch?: 'x86_64' | 'arm64') => {
+    const downloadKey = arch ? `${version}-${arch}` : version
+    setActionLoading(`cancel-windows-${downloadKey}`)
+    setError(null)
+    try {
+      await cacheApi.cancelWindowsISODownload(version, arch)
+      setSuccess(`Cancelled download for ${version}${arch ? ` (${arch})` : ''}`)
+      setDownloadStatus(prev => {
+        const newStatus = { ...prev }
+        delete newStatus[downloadKey]
+        return newStatus
+      })
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to cancel download')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  // macOS ISO handlers
+  const handleDownloadMacOSISO = async (version: MacOSVersion, customUrl?: string) => {
+    setActionLoading(`download-macos-${version.version}`)
+    setError(null)
+
+    try {
+      await cacheApi.downloadMacOSISO(version.version, customUrl)
+
+      // Start polling for download status
+      setMacosDownloadStatus(prev => ({
+        ...prev,
+        [version.version]: { status: 'downloading', version: version.version, progress_gb: 0 }
+      }))
+
+      // Poll for status
+      const pollInterval = setInterval(async () => {
+        try {
+          const statusRes = await cacheApi.getMacOSISODownloadStatus(version.version)
+          setMacosDownloadStatus(prev => ({
+            ...prev,
+            [version.version]: statusRes.data
+          }))
+
+          if (statusRes.data.status === 'completed' || statusRes.data.status === 'failed' || statusRes.data.status === 'cancelled') {
+            clearInterval(pollInterval)
+            if (statusRes.data.status === 'completed') {
+              toast.success(`Downloaded macOS ${version.name} ISO`)
+              loadData()
+            } else if (statusRes.data.status === 'failed') {
+              toast.error(`Failed to download macOS ${version.name}: ${statusRes.data.error || 'Unknown error'}`)
+            }
+          }
+        } catch (pollErr) {
+          console.error('Error polling macOS ISO status:', pollErr)
+        }
+      }, 2000)
+
+      setSuccess(`Started downloading macOS ${version.name}`)
+    } catch (err: any) {
+      const detail = err.response?.data?.detail
+      if (typeof detail === 'object') {
+        setError(detail.message || detail.detail || 'Failed to start download')
+      } else {
+        setError(detail || 'Failed to start download')
+      }
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleDeleteMacOSISO = (version: string) => {
+    setDeleteConfirm({ type: 'macos-iso', name: version, id: version, isLoading: false })
+  }
+
+  const handleCancelMacOSDownload = async (version: string) => {
+    setActionLoading(`cancel-macos-${version}`)
+    setError(null)
+    try {
+      await cacheApi.cancelMacOSISODownload(version)
+      setSuccess(`Cancelled download for macOS ${version}`)
+      setMacosDownloadStatus(prev => {
+        const newStatus = { ...prev }
+        delete newStatus[version]
+        return newStatus
+      })
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to cancel download')
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleUploadISO = async () => {
+    if (!uploadFile) return
+
+    setActionLoading('upload')
+    setError(null)
+    try {
+      if (showUploadModal === 'windows') {
+        if (!uploadCategory) {
+          setError('Please select a category')
+          setActionLoading(null)
+          return
+        }
+        if (!uploadName) {
+          setError('Please enter a name for the ISO')
+          setActionLoading(null)
+          return
+        }
+        await cacheApi.uploadWindowsISOCustom(uploadFile, uploadCategory, uploadName)
+        setSuccess(`Uploaded Windows ISO: ${uploadName}`)
+      } else if (showUploadModal === 'linux') {
+        if (!uploadCategory) {
+          setError('Please select a category')
+          setActionLoading(null)
+          return
+        }
+        if (!uploadName) {
+          setError('Please enter a name for the ISO')
+          setActionLoading(null)
+          return
+        }
+        await cacheApi.uploadLinuxISOCustom(uploadFile, uploadCategory, uploadName)
+        setSuccess(`Uploaded Linux ISO: ${uploadName}`)
+      } else if (showUploadModal === 'macos') {
+        if (!uploadName) {
+          setError('Please enter a name for the ISO')
+          setActionLoading(null)
+          return
+        }
+        await cacheApi.uploadMacOSISOCustom(uploadFile, uploadName)
+        setSuccess(`Uploaded macOS ISO: ${uploadName}`)
+      } else if (showUploadModal === 'docker') {
+        const result = await cacheApi.uploadDockerImage(uploadFile)
+        setSuccess(`Loaded ${result.data.count} image(s): ${result.data.images.join(', ')}`)
+      } else {
+        if (!uploadName) {
+          setError('Please enter a name for the ISO')
+          setActionLoading(null)
+          return
+        }
+        await cacheApi.uploadCustomISO(uploadFile, uploadName)
+        setSuccess(`Uploaded custom ISO: ${uploadName}`)
+      }
+      setShowUploadModal(null)
+      setUploadFile(null)
+            setUploadName('')
+      setUploadCategory('')
+      await loadData()
+    } catch (err: any) {
+      setError(err.response?.data?.detail || `Failed to upload ${showUploadModal === 'docker' ? 'Docker image' : 'ISO'}`)
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const tabs = [
+    { id: 'overview' as const, name: 'Overview', icon: HardDrive },
+    { id: 'docker' as const, name: 'Docker Images', icon: Server },
+    { id: 'isos' as const, name: 'Windows ISOs', icon: Monitor },
+    { id: 'linux-isos' as const, name: 'Linux ISOs', icon: Terminal },
+    { id: 'macos-isos' as const, name: 'macOS ISOs', icon: Monitor },
+    { id: 'custom-isos' as const, name: 'Custom ISOs', icon: Download },
+  ]
+
+  // Categorize cached Docker images
+  const categorizeImages = () => {
+    const desktop: CachedImage[] = []       // GUI desktop environments with VNC/RDP/web access
+    const server: CachedImage[] = []        // Headless server/CLI images
+    const services: CachedImage[] = []      // Purpose-built service containers
+    const proving_ground: CachedImage[] = []        // PROVING GROUND platform infrastructure
+    const other: CachedImage[] = []
+
+    // Patterns for categorization
+    const proving_groundPatterns = ['pg-proxy', 'pg-dind', 'pg-storage', 'pg-api', 'pg-frontend', 'pg-worker']
+    const servicePatterns = ['nginx', 'httpd', 'apache', 'mysql', 'postgres', 'redis', 'mongo', 'mariadb', 'elasticsearch', 'rabbitmq', 'memcached']
+    // Desktop = images with GUI/VNC/RDP/web access
+    const desktopPatterns = ['webtop', 'vnc', 'xfce', 'kde', 'lxde', 'xrdp', 'kasm', 'guacamole', 'x11', 'desktop']
+    // Server/CLI = headless base OS images
+    const serverPatterns = ['alpine', 'centos', 'rocky', 'server', 'kali', 'fedora:', 'debian:', 'ubuntu:']
+
+    images.forEach(img => {
+      const tags = img.tags.join(' ').toLowerCase()
+      if (tags.includes('dockur/windows') || tags.includes('windows')) {
+        // Skip Windows images in Docker section
+        return
+      }
+      // Check proving_ground first (most specific)
+      // Then desktop (before services/server to avoid xfce/kde images being caught by alpine/ubuntu patterns)
+      // Then services, then server, then other
+      if (proving_groundPatterns.some(p => tags.includes(p))) {
+        proving_ground.push(img)
+      } else if (desktopPatterns.some(p => tags.includes(p))) {
+        desktop.push(img)
+      } else if (servicePatterns.some(p => tags.includes(p))) {
+        services.push(img)
+      } else if (serverPatterns.some(p => tags.includes(p))) {
+        server.push(img)
+      } else {
+        other.push(img)
+      }
+    })
+
+    return { desktop, server, services, proving_ground, other }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="h-8 w-8 animate-spin text-primary-600" />
+      </div>
+    )
+  }
+
+  const categorizedImages = categorizeImages()
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Image Cache</h1>
+          <p className="mt-1 text-sm text-gray-500">
+            Manage cached Docker images, Windows ISOs, and golden images for offline deployment
+          </p>
+        </div>
+        <button
+          onClick={loadData}
+          className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+        >
+          <RefreshCw className="h-4 w-4 mr-2" />
+          Refresh
+        </button>
+      </div>
+
+      {/* Alerts */}
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-md p-4 flex items-start">
+          <AlertCircle className="h-5 w-5 text-red-500 mt-0.5 mr-3" />
+          <div>
+            <p className="text-sm text-red-700">{error}</p>
+          </div>
+          <button onClick={() => setError(null)} className="ml-auto text-red-500 hover:text-red-700">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+      {success && (
+        <div className="bg-green-50 border border-green-200 rounded-md p-4 flex items-start">
+          <CheckCircle className="h-5 w-5 text-green-500 mt-0.5 mr-3" />
+          <div>
+            <p className="text-sm text-green-700">{success}</p>
+          </div>
+          <button onClick={() => setSuccess(null)} className="ml-auto text-green-500 hover:text-green-700">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div className="border-b border-gray-200">
+        <nav className="-mb-px flex space-x-8">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={clsx(
+                'flex items-center py-4 px-1 border-b-2 font-medium text-sm',
+                activeTab === tab.id
+                  ? 'border-primary-500 text-primary-600'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+              )}
+            >
+              <tab.icon className="h-5 w-5 mr-2" />
+              {tab.name}
+            </button>
+          ))}
+        </nav>
+      </div>
+
+      {/* Overview Tab */}
+      {activeTab === 'overview' && stats && (
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
+            <div className="bg-white rounded-lg shadow p-6">
+              <div className="flex items-center">
+                <Server className="h-8 w-8 text-blue-500" />
+                <div className="ml-4">
+                  <p className="text-sm font-medium text-gray-500">Docker Images</p>
+                  <p className="text-2xl font-semibold text-gray-900">{stats.docker_images.count}</p>
+                  <p className="text-sm text-gray-500">{stats.docker_images.total_size_gb} GB</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow p-6">
+              <div className="flex items-center">
+                <Monitor className="h-8 w-8 text-purple-500" />
+                <div className="ml-4">
+                  <p className="text-sm font-medium text-gray-500">Windows ISOs</p>
+                  <p className="text-2xl font-semibold text-gray-900">
+                    {windowsVersions?.cached_count || 0}/{windowsVersions?.total_count || 17}
+                  </p>
+                  <p className="text-sm text-gray-500">{stats.windows_isos.total_size_gb} GB cached</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow p-6">
+              <div className="flex items-center">
+                <Terminal className="h-8 w-8 text-green-500" />
+                <div className="ml-4">
+                  <p className="text-sm font-medium text-gray-500">Linux ISOs</p>
+                  <p className="text-2xl font-semibold text-gray-900">
+                    {linuxVersions?.cached_count || 0}/{linuxVersions?.total_count || 0}
+                  </p>
+                  <p className="text-sm text-gray-500">{linuxVersions?.total_size_gb || 0} GB cached</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow p-6">
+              <div className="flex items-center">
+                <Monitor className="h-8 w-8 text-gray-500" />
+                <div className="ml-4">
+                  <p className="text-sm font-medium text-gray-500">macOS ISOs</p>
+                  <p className="text-2xl font-semibold text-gray-900">
+                    {macosVersions?.cached_count || 0}/{macosVersions?.total_count || 5}
+                  </p>
+                  <p className="text-sm text-gray-500">{macosVersions?.total_size_gb || 0} GB cached</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow p-6">
+              <div className="flex items-center">
+                <Download className="h-8 w-8 text-teal-500" />
+                <div className="ml-4">
+                  <p className="text-sm font-medium text-gray-500">Custom ISOs</p>
+                  <p className="text-2xl font-semibold text-gray-900">
+                    {customISOs?.total_count || 0}
+                  </p>
+                  <p className="text-sm text-gray-500">{customISOs?.total_size_gb || 0} GB cached</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow p-6">
+              <div className="flex items-center">
+                <HardDrive className="h-8 w-8 text-orange-500" />
+                <div className="ml-4">
+                  <p className="text-sm font-medium text-gray-500">Total Cache</p>
+                  <p className="text-2xl font-semibold text-gray-900">{stats.total_cache_size_gb} GB</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Quick Actions Section */}
+          <div className="bg-white rounded-lg shadow p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-medium text-gray-900">Quick Actions</h3>
+              {/* Active Operations Indicator */}
+              {(Object.keys(dockerPullStatus).some(k => dockerPullStatus[k].status === 'pulling') ||
+                Object.keys(dockerBuildStatus).some(k => dockerBuildStatus[k].status === 'building') ||
+                Object.keys(downloadStatus).some(k => downloadStatus[k].status === 'downloading') ||
+                Object.keys(linuxDownloadStatus).some(k => linuxDownloadStatus[k].status === 'downloading') ||
+                Object.keys(macosDownloadStatus).some(k => macosDownloadStatus[k].status === 'downloading') ||
+                Object.keys(customISODownloadStatus).some(k => customISODownloadStatus[k].status === 'downloading')) && (
+                <div className="flex items-center text-sm text-blue-600">
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  <span>
+                    {[
+                      Object.values(dockerPullStatus).filter(s => s.status === 'pulling').length > 0 &&
+                        `${Object.values(dockerPullStatus).filter(s => s.status === 'pulling').length} pulling`,
+                      Object.values(dockerBuildStatus).filter(s => s.status === 'building').length > 0 &&
+                        `${Object.values(dockerBuildStatus).filter(s => s.status === 'building').length} building`,
+                      Object.values(downloadStatus).filter(s => s.status === 'downloading').length > 0 &&
+                        `${Object.values(downloadStatus).filter(s => s.status === 'downloading').length} downloading`,
+                      Object.values(linuxDownloadStatus).filter(s => s.status === 'downloading').length > 0 &&
+                        `${Object.values(linuxDownloadStatus).filter(s => s.status === 'downloading').length} Linux ISOs`,
+                      Object.values(macosDownloadStatus).filter(s => s.status === 'downloading').length > 0 &&
+                        `${Object.values(macosDownloadStatus).filter(s => s.status === 'downloading').length} macOS ISOs`,
+                      Object.values(customISODownloadStatus).filter(s => s.status === 'downloading').length > 0 &&
+                        `${Object.values(customISODownloadStatus).filter(s => s.status === 'downloading').length} custom ISOs`,
+                    ].filter(Boolean).join(', ')}
+                  </span>
+                </div>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-3">
+              {/* Refresh All Button */}
+              <button
+                onClick={handleRefreshAll}
+                disabled={isRefreshing}
+                className="inline-flex items-center px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 disabled:opacity-50"
+              >
+                {isRefreshing ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                )}
+                Refresh All
+              </button>
+              {isAdmin && (
+                <>
+                  <button
+                    onClick={() => setShowCacheModal(true)}
+                    className="inline-flex items-center px-4 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700"
+                  >
+                    <Plus className="h-4 w-4 mr-2" />
+                    Cache Docker Images
+                  </button>
+                  <button
+                    onClick={() => setShowUploadModal('windows')}
+                    className="inline-flex items-center px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700"
+                  >
+                    <Upload className="h-4 w-4 mr-2" />
+                    Upload Windows ISO
+                  </button>
+                  <button
+                    onClick={() => setShowUploadModal('linux')}
+                    className="inline-flex items-center px-4 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700"
+                  >
+                    <Upload className="h-4 w-4 mr-2" />
+                    Upload Linux ISO
+                  </button>
+                  <button
+                    onClick={() => setShowUploadModal('macos')}
+                    className="inline-flex items-center px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700"
+                  >
+                    <Upload className="h-4 w-4 mr-2" />
+                    Upload macOS ISO
+                  </button>
+                  <button
+                    onClick={() => setShowUploadModal('custom')}
+                    className="inline-flex items-center px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700"
+                  >
+                    <Upload className="h-4 w-4 mr-2" />
+                    Upload Custom ISO
+                  </button>
+                  <button
+                    onClick={handlePruneImages}
+                    disabled={isPruning}
+                    className="inline-flex items-center px-4 py-2 bg-orange-600 text-white rounded-md hover:bg-orange-700 disabled:opacity-50"
+                    title="Remove dangling and unused Docker images"
+                  >
+                    {isPruning ? (
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-4 w-4 mr-2" />
+                    )}
+                    Prune Unused Images
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Docker Images Tab */}
+      {activeTab === 'docker' && recommended && (
+        <div className="space-y-6">
+          <div className="flex justify-between items-center">
+            <div>
+              <h3 className="text-lg font-medium text-gray-900">Docker Images</h3>
+              <p className="text-sm text-gray-500">
+                {images.length} images cached
+              </p>
+            </div>
+            {isAdmin && (
+              <div className="flex gap-2">
+                {selectedForPush.size > 0 && (
+                  <>
+                    <button
+                      onClick={handleBatchPush}
+                      disabled={Object.values(registryPushStatus).some(s => ['starting', 'pushing', 'verifying', 'cleaning'].includes(s.status))}
+                      className="inline-flex items-center px-3 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 text-sm disabled:opacity-50"
+                    >
+                      <Upload className="h-4 w-4 mr-2" />
+                      Push Selected ({selectedForPush.size})
+                    </button>
+                    <button
+                      onClick={clearPushSelection}
+                      className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+                    >
+                      Clear Selection
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => setShowCacheModal(true)}
+                  className="inline-flex items-center px-3 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700 text-sm"
+                >
+                  <Plus className="h-4 w-4 mr-2" />
+                  Pull Image
+                </button>
+                <button
+                  onClick={() => setShowUploadModal('docker')}
+                  className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+                >
+                  <Upload className="h-4 w-4 mr-2" />
+                  Upload Image
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Info */}
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+            <div className="flex">
+              <Info className="h-5 w-5 text-blue-500 mt-0.5 mr-3" />
+              <div>
+                <h4 className="text-sm font-medium text-blue-800">Docker Image Cache</h4>
+                <p className="mt-1 text-sm text-blue-700">
+                  Recommended images for cyber range operations. Cached images deploy instantly without network download.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Desktop Images Section */}
+          <DockerImageSection
+            title="Desktop"
+            description="Images with GUI desktop environment (VNC/RDP/Web)"
+            images={recommended.desktop}
+            cachedImages={images}
+            icon={Monitor}
+            colorClass="blue"
+            onPull={handlePullDockerImage}
+            onRemove={handleRemoveImage}
+            onCancel={handleCancelDockerPull}
+            onPush={handlePushToRegistry}
+            pullStatus={dockerPullStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            registryStatus={registryStatus}
+            registryStatusLoading={registryStatusLoading}
+          />
+
+          {/* Server/CLI Images Section */}
+          <DockerImageSection
+            title="Server/CLI"
+            description="Headless server and CLI images"
+            images={recommended.server}
+            cachedImages={images}
+            icon={Server}
+            colorClass="purple"
+            onPull={handlePullDockerImage}
+            onRemove={handleRemoveImage}
+            onCancel={handleCancelDockerPull}
+            onPush={handlePushToRegistry}
+            pullStatus={dockerPullStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            registryStatus={registryStatus}
+            registryStatusLoading={registryStatusLoading}
+          />
+
+          {/* Services Images Section */}
+          <DockerImageSection
+            title="Services"
+            description="Purpose-built service containers (databases, web servers, etc.)"
+            images={recommended.services}
+            cachedImages={images}
+            icon={Database}
+            colorClass="green"
+            onPull={handlePullDockerImage}
+            onRemove={handleRemoveImage}
+            onCancel={handleCancelDockerPull}
+            onPush={handlePushToRegistry}
+            pullStatus={dockerPullStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            registryStatus={registryStatus}
+            registryStatusLoading={registryStatusLoading}
+          />
+
+          {/* PROVING GROUND Services Section */}
+          <DockerImageSection
+            title={`${BRANDING.productName} Services`}
+            description="Platform infrastructure (proxy, storage, isolation)"
+            images={recommended.proving_ground || []}
+            cachedImages={images}
+            icon={Cog}
+            colorClass="indigo"
+            onPull={handlePullDockerImage}
+            onRemove={handleRemoveImage}
+            onCancel={handleCancelDockerPull}
+            onPush={handlePushToRegistry}
+            pullStatus={dockerPullStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            registryStatus={registryStatus}
+            registryStatusLoading={registryStatusLoading}
+          />
+
+          {/* Cached Desktop Images (not in recommended list) - Issue #63 */}
+          <div className="bg-white shadow rounded-lg overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200 bg-blue-50">
+              <h4 className="text-sm font-medium text-blue-800 flex items-center">
+                <Monitor className="h-4 w-4 mr-2" />
+                Cached Desktop Images ({categorizedImages.desktop.length})
+              </h4>
+              <p className="text-xs text-blue-600 mt-1">Cached desktop images with GUI/VNC access</p>
+            </div>
+            {categorizedImages.desktop.length > 0 ? (
+              <ImageTable images={categorizedImages.desktop} onRemove={handleRemoveImage} onPush={handlePushToRegistry} actionLoading={actionLoading} isAdmin={isAdmin} registryStatus={registryStatus} registryStatusLoading={registryStatusLoading} pushStatus={registryPushStatus} selectedForPush={selectedForPush} onToggleSelect={togglePushSelection} />
+            ) : (
+              <div className="px-6 py-8 text-center text-gray-500 text-sm">
+                No desktop images cached. Pull images with GUI environments (webtop, xfce, kde, etc.)
+              </div>
+            )}
+          </div>
+
+          {/* Cached Server/CLI Images (not in recommended list) - Issue #63 */}
+          <div className="bg-white shadow rounded-lg overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200 bg-purple-50">
+              <h4 className="text-sm font-medium text-purple-800 flex items-center">
+                <Server className="h-4 w-4 mr-2" />
+                Cached Server/CLI Images ({categorizedImages.server.length})
+              </h4>
+              <p className="text-xs text-purple-600 mt-1">Cached headless server and CLI images</p>
+            </div>
+            {categorizedImages.server.length > 0 ? (
+              <ImageTable images={categorizedImages.server} onRemove={handleRemoveImage} onPush={handlePushToRegistry} actionLoading={actionLoading} isAdmin={isAdmin} registryStatus={registryStatus} registryStatusLoading={registryStatusLoading} pushStatus={registryPushStatus} selectedForPush={selectedForPush} onToggleSelect={togglePushSelection} />
+            ) : (
+              <div className="px-6 py-8 text-center text-gray-500 text-sm">
+                No server/CLI images cached. Pull images like alpine, ubuntu, kali, etc.
+              </div>
+            )}
+          </div>
+
+          {/* Cached Service Images (not in recommended list) - Issue #63 */}
+          <div className="bg-white shadow rounded-lg overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200 bg-green-50">
+              <h4 className="text-sm font-medium text-green-800 flex items-center">
+                <Database className="h-4 w-4 mr-2" />
+                Cached Service Images ({categorizedImages.services.length})
+              </h4>
+              <p className="text-xs text-green-600 mt-1">Cached database and service containers</p>
+            </div>
+            {categorizedImages.services.length > 0 ? (
+              <ImageTable images={categorizedImages.services} onRemove={handleRemoveImage} onPush={handlePushToRegistry} actionLoading={actionLoading} isAdmin={isAdmin} registryStatus={registryStatus} registryStatusLoading={registryStatusLoading} pushStatus={registryPushStatus} selectedForPush={selectedForPush} onToggleSelect={togglePushSelection} />
+            ) : (
+              <div className="px-6 py-8 text-center text-gray-500 text-sm">
+                No service images cached. Pull images like nginx, mysql, postgres, redis, etc.
+              </div>
+            )}
+          </div>
+
+          {/* Cached PROVING GROUND Images (not in recommended list) */}
+          <div className="bg-white shadow rounded-lg overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200 bg-indigo-50">
+              <h4 className="text-sm font-medium text-indigo-800 flex items-center">
+                <Cog className="h-4 w-4 mr-2" />
+                Cached {BRANDING.productName} Services ({categorizedImages.proving_ground.length})
+              </h4>
+              <p className="text-xs text-indigo-600 mt-1">Cached platform infrastructure images</p>
+            </div>
+            {categorizedImages.proving_ground.length > 0 ? (
+              <ImageTable images={categorizedImages.proving_ground} onRemove={handleRemoveImage} onPush={handlePushToRegistry} actionLoading={actionLoading} isAdmin={isAdmin} registryStatus={registryStatus} registryStatusLoading={registryStatusLoading} pushStatus={registryPushStatus} selectedForPush={selectedForPush} onToggleSelect={togglePushSelection} />
+            ) : (
+              <div className="px-6 py-8 text-center text-gray-500 text-sm">
+                No {BRANDING.productName} infrastructure images cached.
+              </div>
+            )}
+          </div>
+
+          {/* Other Cached Images (not in recommended list) */}
+          <div className="bg-white shadow rounded-lg overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200 bg-gray-50">
+              <h4 className="text-sm font-medium text-gray-800 flex items-center">
+                <HardDrive className="h-4 w-4 mr-2" />
+                Other Cached ({categorizedImages.other.length})
+              </h4>
+              <p className="text-xs text-gray-600 mt-1">Additional cached images not in recommended list</p>
+            </div>
+            {categorizedImages.other.length > 0 ? (
+              <ImageTable images={categorizedImages.other} onRemove={handleRemoveImage} onPush={handlePushToRegistry} actionLoading={actionLoading} isAdmin={isAdmin} registryStatus={registryStatus} registryStatusLoading={registryStatusLoading} pushStatus={registryPushStatus} selectedForPush={selectedForPush} onToggleSelect={togglePushSelection} />
+            ) : (
+              <div className="px-6 py-8 text-center text-gray-500 text-sm">
+                No other images cached.
+              </div>
+            )}
+          </div>
+
+          {/* Build Custom Images Section (consolidated from Build Images tab) */}
+          <div className="border-t border-gray-200 pt-6 mt-6">
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h3 className="text-lg font-medium text-gray-900 flex items-center">
+                  <Hammer className="h-5 w-5 mr-2 text-indigo-500" />
+                  Build Custom Images
+                </h3>
+                <p className="text-sm text-gray-500">
+                  Build Docker images from Dockerfiles in the images/ directory
+                </p>
+              </div>
+            </div>
+
+            {/* Active Builds */}
+            {Object.keys(dockerBuildStatus).length > 0 && (
+              <div className="bg-white shadow rounded-lg overflow-hidden mb-4">
+                <div className="px-6 py-4 border-b border-gray-200 bg-yellow-50">
+                  <h4 className="text-sm font-medium text-yellow-800 flex items-center">
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Active Builds ({Object.keys(dockerBuildStatus).length})
+                  </h4>
+                </div>
+                <div className="divide-y divide-gray-200">
+                  {Object.entries(dockerBuildStatus).map(([buildKey, status]) => (
+                    <div key={buildKey} className="px-6 py-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex-1">
+                          <div className="flex items-center">
+                            <span className="font-medium text-gray-900">{status.full_tag}</span>
+                            <span className={clsx(
+                              'ml-2 px-2 py-0.5 text-xs rounded-full',
+                              status.status === 'building' && 'bg-yellow-100 text-yellow-800',
+                              status.status === 'completed' && 'bg-green-100 text-green-800',
+                              status.status === 'failed' && 'bg-red-100 text-red-800',
+                              status.status === 'cancelled' && 'bg-gray-100 text-gray-800'
+                            )}>
+                              {status.status}
+                            </span>
+                          </div>
+                          <div className="mt-1 text-sm text-gray-500">
+                            {status.current_step_name}
+                          </div>
+                          {status.status === 'building' && (
+                            <div className="mt-2">
+                              <div className="flex items-center text-xs text-gray-500 mb-1">
+                                <span>Step {status.current_step || 0}/{status.total_steps || '?'}</span>
+                                <span className="mx-2">-</span>
+                                <span>{status.progress_percent || 0}%</span>
+                              </div>
+                              <div className="w-full bg-gray-200 rounded-full h-2">
+                                <div
+                                  className="bg-indigo-600 h-2 rounded-full transition-all duration-300"
+                                  style={{ width: `${status.progress_percent || 0}%` }}
+                                />
+                              </div>
+                            </div>
+                          )}
+                          {status.error && (
+                            <div className="mt-2 text-sm text-red-600">
+                              {status.error}
+                            </div>
+                          )}
+                          {status.logs && status.logs.length > 0 && (
+                            <details className="mt-2">
+                              <summary className="text-xs text-gray-500 cursor-pointer hover:text-gray-700">
+                                Show build logs ({status.logs.length} lines)
+                              </summary>
+                              <pre className="mt-2 p-2 bg-gray-50 rounded text-xs font-mono overflow-x-auto max-h-40">
+                                {status.logs.join('\n')}
+                              </pre>
+                            </details>
+                          )}
+                        </div>
+                        {status.status === 'building' && (
+                          <button
+                            onClick={() => handleCancelDockerBuild(buildKey)}
+                            disabled={actionLoading === `cancel-build-${buildKey}`}
+                            className="ml-4 p-2 text-gray-400 hover:text-red-600"
+                            title="Cancel build"
+                          >
+                            {actionLoading === `cancel-build-${buildKey}` ? (
+                              <Loader2 className="h-5 w-5 animate-spin" />
+                            ) : (
+                              <X className="h-5 w-5" />
+                            )}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Available Images to Build */}
+            <div className="bg-white shadow rounded-lg overflow-hidden">
+              <div className="px-6 py-4 border-b border-gray-200">
+                <h4 className="text-sm font-medium text-gray-900">
+                  Buildable Images ({buildableImages.length})
+                </h4>
+                <p className="text-xs text-gray-500 mt-1">
+                  Build these images locally for use in ranges
+                </p>
+              </div>
+              {buildableImages.length > 0 ? (
+                <div className="divide-y divide-gray-200">
+                  {buildableImages.map((image) => {
+                    const buildKey = `${image.name}_latest`
+                    const isBuilding = dockerBuildStatus[buildKey]?.status === 'building'
+                    // Check if image is in registry (what matters for deploying ranges)
+                    const inRegistry = registryImages.some(repo => repo.includes(`proving_ground/${image.name}`))
+
+                    return (
+                      <div key={image.name} className="px-6 py-4">
+                        <div className="flex items-center justify-between">
+                          <div className="flex-1">
+                            <div className="flex items-center">
+                              <Hammer className="h-5 w-5 text-gray-400 mr-3" />
+                              <div>
+                                <span className="font-medium text-gray-900">proving_ground/{image.name}</span>
+                                {inRegistry && (
+                                  <span className="ml-2 px-2 py-0.5 text-xs bg-green-100 text-green-800 rounded-full">
+                                    In Registry
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            {image.description && (
+                              <p className="mt-1 text-sm text-gray-500 ml-8">{image.description}</p>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {inRegistry && (
+                              <button
+                                onClick={() => handleBuildImage(image.name, true)}
+                                disabled={isBuilding || actionLoading === `build-${buildKey}`}
+                                className="inline-flex items-center px-3 py-1.5 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50"
+                                title="Rebuild without cache"
+                              >
+                                <RefreshCw className="h-4 w-4 mr-1" />
+                                Rebuild
+                              </button>
+                            )}
+                            <button
+                              onClick={() => handleBuildImage(image.name, false)}
+                              disabled={isBuilding || actionLoading === `build-${buildKey}`}
+                              className="inline-flex items-center px-3 py-1.5 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50"
+                            >
+                              {actionLoading === `build-${buildKey}` || isBuilding ? (
+                                <>
+                                  <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                                  Building...
+                                </>
+                              ) : (
+                                <>
+                                  <Hammer className="h-4 w-4 mr-1" />
+                                  Build
+                                </>
+                              )}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="px-6 py-12 text-center text-gray-500">
+                  <Hammer className="h-12 w-12 text-gray-300 mx-auto mb-4" />
+                  <p className="text-lg font-medium text-gray-900">No buildable images found</p>
+                  <p className="text-sm mt-1">
+                    Add Dockerfiles to the <code className="bg-gray-100 px-1 rounded">images/</code> directory
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Image Project Files Section (consolidated from Image Files tab) */}
+          <div className="border-t border-gray-200 pt-6 mt-6">
+            <div className="mb-4">
+              <h3 className="text-lg font-medium text-gray-900 flex items-center">
+                <FolderEdit className="h-5 w-5 mr-2 text-amber-500" />
+                Image Project Files
+              </h3>
+              <p className="text-sm text-gray-500">
+                Browse and edit Dockerfiles, scripts, and configuration files for custom images
+              </p>
+            </div>
+            <FileBrowser basePath="images" title="" />
+          </div>
+        </div>
+      )}
+
+      {/* Windows ISOs Tab */}
+      {activeTab === 'isos' && windowsVersions && (
+        <div className="space-y-6">
+          <div className="flex justify-between items-center">
+            <div>
+              <h3 className="text-lg font-medium text-gray-900">Windows ISOs (dockur/windows)</h3>
+              <p className="text-sm text-gray-500">
+                {windowsVersions.cached_count} of {windowsVersions.total_count} versions cached
+                {windowsVersions.host_arch && (
+                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
+                    Host: {windowsVersions.host_arch}
+                  </span>
+                )}
+              </p>
+            </div>
+            {isAdmin && (
+              <button
+                onClick={() => setShowUploadModal('windows')}
+                className="inline-flex items-center px-3 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 text-sm"
+              >
+                <Upload className="h-4 w-4 mr-2" />
+                Upload ISO
+              </button>
+            )}
+          </div>
+
+          {/* Cache Directory Info */}
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+            <div className="flex">
+              <Info className="h-5 w-5 text-blue-500 mt-0.5 mr-3" />
+              <div>
+                <h4 className="text-sm font-medium text-blue-800">ISO Cache Directory</h4>
+                <p className="mt-1 text-sm text-blue-700">
+                  <code className="bg-blue-100 px-2 py-0.5 rounded">{windowsVersions.cache_dir}</code>
+                </p>
+                <p className="mt-2 text-sm text-blue-700">
+                  {windowsVersions.note}
+                </p>
+                {windowsVersions.arm64_note && (
+                  <p className="mt-2 text-sm text-purple-700">
+                    {windowsVersions.arm64_note}
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Desktop Versions */}
+          <WindowsVersionSection
+            title="Desktop"
+            versions={windowsVersions.desktop}
+            icon={Monitor}
+            colorClass="blue"
+            onDelete={handleDeleteWindowsISO}
+            onDownload={handleDownloadWindowsISO}
+            onCancel={handleCancelWindowsDownload}
+            downloadStatus={downloadStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            hostArch={windowsVersions.host_arch}
+          />
+
+          {/* Server Versions */}
+          <WindowsVersionSection
+            title="Server"
+            versions={windowsVersions.server}
+            icon={Server}
+            colorClass="purple"
+            onDelete={handleDeleteWindowsISO}
+            onDownload={handleDownloadWindowsISO}
+            onCancel={handleCancelWindowsDownload}
+            downloadStatus={downloadStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            hostArch={windowsVersions.host_arch}
+          />
+
+          {/* Legacy Versions */}
+          <WindowsVersionSection
+            title="Legacy"
+            versions={windowsVersions.legacy}
+            icon={Database}
+            colorClass="orange"
+            onDelete={handleDeleteWindowsISO}
+            onDownload={handleDownloadWindowsISO}
+            onCancel={handleCancelWindowsDownload}
+            downloadStatus={downloadStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            hostArch={windowsVersions.host_arch}
+          />
+        </div>
+      )}
+
+      {/* Linux ISOs Tab */}
+      {activeTab === 'linux-isos' && linuxVersions && (
+        <div className="space-y-6">
+          <div className="flex justify-between items-center">
+            <div>
+              <h3 className="text-lg font-medium text-gray-900">Linux Distributions (qemux/qemu)</h3>
+              <p className="text-sm text-gray-500">
+                {linuxVersions.cached_count} of {linuxVersions.total_count} distributions cached
+                {linuxVersions.host_arch && (
+                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
+                    Host: {linuxVersions.host_arch}
+                  </span>
+                )}
+              </p>
+            </div>
+            {isAdmin && (
+              <button
+                onClick={() => setShowUploadModal('linux')}
+                className="inline-flex items-center px-3 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700 text-sm"
+              >
+                <Upload className="h-4 w-4 mr-2" />
+                Upload ISO
+              </button>
+            )}
+          </div>
+
+          {/* Cache Directory Info */}
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+            <div className="flex">
+              <Info className="h-5 w-5 text-blue-500 mt-0.5 mr-3" />
+              <div>
+                <h4 className="text-sm font-medium text-blue-800">Linux ISO Cache Directory</h4>
+                <p className="mt-1 text-sm text-blue-700">
+                  <code className="bg-blue-100 px-2 py-0.5 rounded">{linuxVersions.cache_dir}</code>
+                </p>
+                <p className="mt-2 text-sm text-blue-700">
+                  {linuxVersions.note}
+                </p>
+                {linuxVersions.arm64_supported_distros && linuxVersions.arm64_supported_distros.length > 0 && (
+                  <p className="mt-2 text-sm text-purple-700">
+                    ARM64 supported: {linuxVersions.arm64_supported_distros.join(', ')}
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Desktop Distributions */}
+          <LinuxVersionSection
+            title="Desktop"
+            versions={linuxVersions.desktop}
+            icon={Monitor}
+            colorClass="blue"
+            onDelete={handleDeleteLinuxISO}
+            onDownload={handleDownloadLinuxISO}
+            onCancel={handleCancelLinuxDownload}
+            downloadStatus={linuxDownloadStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            hostArch={linuxVersions.host_arch}
+          />
+
+          {/* Security Distributions (for cyber range training) */}
+          <LinuxVersionSection
+            title="Security"
+            versions={linuxVersions.security}
+            icon={AlertCircle}
+            colorClass="red"
+            onDelete={handleDeleteLinuxISO}
+            onDownload={handleDownloadLinuxISO}
+            onCancel={handleCancelLinuxDownload}
+            downloadStatus={linuxDownloadStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            hostArch={linuxVersions.host_arch}
+          />
+
+          {/* Server Distributions */}
+          <LinuxVersionSection
+            title="Server"
+            versions={linuxVersions.server}
+            icon={Server}
+            colorClass="purple"
+            onDelete={handleDeleteLinuxISO}
+            onDownload={handleDownloadLinuxISO}
+            onCancel={handleCancelLinuxDownload}
+            downloadStatus={linuxDownloadStatus}
+            actionLoading={actionLoading}
+            isAdmin={isAdmin}
+            hostArch={linuxVersions.host_arch}
+          />
+        </div>
+      )}
+
+      {/* macOS ISOs Tab */}
+      {activeTab === 'macos-isos' && macosVersions && (
+        <div className="space-y-6">
+          <div className="flex justify-between items-center">
+            <div>
+              <h3 className="text-lg font-medium text-gray-900">macOS ISOs</h3>
+              <p className="text-sm text-gray-500">
+                Pre-cache macOS ISOs for dockur/macos VMs ({macosVersions.cached_count}/{macosVersions.total_count} cached)
+              </p>
+              {/* x86_64 only warning */}
+              {macosVersions.host_arch === 'arm64' && (
+                <div className="mt-2 flex items-center text-sm text-yellow-600">
+                  <AlertCircle className="h-4 w-4 mr-1" />
+                  macOS VMs only work on x86_64 hosts. Your host is ARM64.
+                </div>
+              )}
+            </div>
+            {isAdmin && (
+              <button
+                onClick={() => setShowUploadModal('macos')}
+                className="inline-flex items-center px-3 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 text-sm"
+              >
+                <Upload className="h-4 w-4 mr-2" />
+                Upload ISO
+              </button>
+            )}
+          </div>
+
+          {/* macOS info banner */}
+          <div className="bg-blue-50 border border-blue-200 rounded-md p-4">
+            <div className="flex">
+              <Info className="h-5 w-5 text-blue-400 mt-0.5" />
+              <div className="ml-3 text-sm text-blue-700">
+                <p className="font-medium">About macOS ISOs</p>
+                <p className="mt-1">
+                  dockur/macos downloads macOS images at runtime if not pre-cached.
+                  Pre-caching is optional but speeds up first boot. macOS VMs require x86_64 hosts with KVM support.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* macOS Versions Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {macosVersions.versions.map((version) => {
+              const downloadStatusData = macosDownloadStatus[version.version]
+              const isDownloading = downloadStatusData?.status === 'downloading'
+              const isCached = version.cached
+
+              return (
+                <div
+                  key={version.version}
+                  className={clsx(
+                    'bg-white rounded-lg shadow p-4 border-2',
+                    isCached ? 'border-green-200' : 'border-transparent'
+                  )}
+                >
+                  <div className="flex items-start justify-between">
+                    <div className="flex items-center">
+                      <Monitor className={clsx('h-8 w-8', isCached ? 'text-green-500' : 'text-gray-400')} />
+                      <div className="ml-3">
+                        <h4 className="font-medium text-gray-900">{version.name}</h4>
+                        <p className="text-sm text-gray-500">Version {version.version}</p>
+                      </div>
+                    </div>
+                    {isCached && (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+                        <Check className="h-3 w-3 mr-1" />
+                        Cached
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="mt-3 text-sm text-gray-500">
+                    <p>~{version.size_gb} GB</p>
+                    {version.note && <p className="text-xs text-gray-400 mt-1">{version.note}</p>}
+                  </div>
+
+                  {/* Download Progress */}
+                  {isDownloading && downloadStatusData && (
+                    <div className="mt-3">
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="text-blue-600">Downloading...</span>
+                        <span className="text-gray-500">
+                          {downloadStatusData.progress_gb?.toFixed(2) || 0} GB
+                          {downloadStatusData.total_gb && ` / ${downloadStatusData.total_gb.toFixed(2)} GB`}
+                        </span>
+                      </div>
+                      {downloadStatusData.progress_percent !== undefined && (
+                        <div className="mt-1 h-2 bg-gray-200 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-blue-500 transition-all duration-300"
+                            style={{ width: `${downloadStatusData.progress_percent}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Actions */}
+                  {isAdmin && (
+                    <div className="mt-3 flex gap-2">
+                      {isCached ? (
+                        <button
+                          onClick={() => handleDeleteMacOSISO(version.version)}
+                          disabled={actionLoading === `delete-macos-${version.version}`}
+                          className="inline-flex items-center px-2 py-1 text-xs font-medium text-red-700 bg-red-50 rounded hover:bg-red-100"
+                        >
+                          <Trash2 className="h-3 w-3 mr-1" />
+                          Delete
+                        </button>
+                      ) : isDownloading ? (
+                        <button
+                          onClick={() => handleCancelMacOSDownload(version.version)}
+                          disabled={actionLoading === `cancel-macos-${version.version}`}
+                          className="inline-flex items-center px-2 py-1 text-xs font-medium text-red-700 bg-red-50 rounded hover:bg-red-100"
+                        >
+                          <X className="h-3 w-3 mr-1" />
+                          Cancel
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => setShowUploadModal('macos')}
+                            className="inline-flex items-center px-2 py-1 text-xs font-medium text-gray-700 bg-gray-50 rounded hover:bg-gray-100"
+                          >
+                            <Upload className="h-3 w-3 mr-1" />
+                            Upload
+                          </button>
+                          <button
+                            onClick={() => setShowMacOSDownloadModal(version)}
+                            className="inline-flex items-center px-2 py-1 text-xs font-medium text-blue-700 bg-blue-50 rounded hover:bg-blue-100"
+                          >
+                            <Download className="h-3 w-3 mr-1" />
+                            URL
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Custom ISOs Tab */}
+      {activeTab === 'custom-isos' && customISOs && (
+        <div className="space-y-4">
+          <div className="flex justify-between items-center">
+            <div>
+              <h3 className="text-lg font-medium text-gray-900">Custom ISOs</h3>
+              <p className="text-sm text-gray-500">
+                Download or upload custom ISOs from URLs for VM deployment
+              </p>
+            </div>
+            {isAdmin && (
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowCustomISOModal(true)}
+                  className="inline-flex items-center px-3 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700 text-sm"
+                >
+                  <Download className="h-4 w-4 mr-2" />
+                  Download from URL
+                </button>
+                <button
+                  onClick={() => setShowUploadModal('custom')}
+                  className="inline-flex items-center px-3 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 text-sm"
+                >
+                  <Upload className="h-4 w-4 mr-2" />
+                  Upload ISO
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Cache Directory Info */}
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+            <div className="flex">
+              <Info className="h-5 w-5 text-blue-500 mt-0.5 mr-3" />
+              <div>
+                <h4 className="text-sm font-medium text-blue-800">Custom ISO Cache</h4>
+                <p className="mt-1 text-sm text-blue-700">
+                  <code className="bg-blue-100 px-2 py-0.5 rounded">{customISOs.cache_dir}</code>
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Active Downloads */}
+          {Object.keys(customISODownloadStatus).length > 0 && (
+            <div className="bg-white shadow rounded-lg overflow-hidden">
+              <div className="px-6 py-4 border-b border-gray-200 bg-blue-50">
+                <h4 className="text-sm font-medium text-blue-800 flex items-center">
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Active Downloads ({Object.keys(customISODownloadStatus).length})
+                </h4>
+              </div>
+              <div className="p-4 space-y-4">
+                {Object.entries(customISODownloadStatus).map(([filename, status]) => (
+                  <div key={filename} className="border rounded-lg p-4 bg-blue-50 border-blue-200">
+                    <div className="flex items-start justify-between">
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium text-gray-900">{status.name || filename}</p>
+                        <div className="text-xs text-gray-500 font-mono mt-1">{filename}</div>
+                      </div>
+                      <div className="flex items-center gap-1 ml-2 flex-shrink-0">
+                        <div className="flex items-center gap-1 text-blue-600">
+                          <Loader2 className="h-4 w-4 animate-spin flex-shrink-0" />
+                          <span className="text-xs font-medium">
+                            {status.progress_percent ? `${status.progress_percent}%` : 'Starting...'}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    {/* Download progress bar */}
+                    <div className="mt-3 space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="text-blue-700 font-medium">
+                          {status.progress_gb?.toFixed(2) || '0.00'} GB
+                          {status.total_gb ? ` / ${status.total_gb.toFixed(2)} GB` : ''}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          {status.progress_percent && (
+                            <span className="text-blue-600 font-semibold">{status.progress_percent}%</span>
+                          )}
+                          {isAdmin && (
+                            <button
+                              onClick={() => handleCancelCustomISODownload(filename)}
+                              disabled={actionLoading === `cancel-custom-${filename}`}
+                              className="text-red-500 hover:text-red-700 p-0.5 rounded hover:bg-red-50"
+                              title="Cancel download"
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="w-full bg-blue-100 rounded-full h-2.5 overflow-hidden">
+                        {status.total_bytes && status.progress_bytes ? (
+                          <div
+                            className="bg-gradient-to-r from-blue-500 to-blue-600 h-2.5 rounded-full transition-all duration-500 ease-out"
+                            style={{ width: `${(status.progress_bytes / status.total_bytes) * 100}%` }}
+                          />
+                        ) : (
+                          <div className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-400 h-2.5 rounded-full animate-pulse w-full opacity-60" />
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Custom ISOs List */}
+          <div className="bg-white shadow rounded-lg overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200">
+              <h4 className="text-sm font-medium text-gray-900">
+                Cached Custom ISOs ({customISOs.total_count})
+              </h4>
+            </div>
+            {customISOs.isos.length > 0 ? (
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Size</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Source</th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {customISOs.isos.map((iso) => (
+                    <tr key={iso.filename}>
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <div className="text-sm font-medium text-gray-900">{iso.name}</div>
+                        <div className="text-xs text-gray-500 font-mono">{iso.filename}</div>
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        {iso.size_gb} GB
+                      </td>
+                      <td className="px-6 py-4 text-sm text-gray-500">
+                        {iso.url?.startsWith('uploaded:') ? (
+                          <span className="text-green-600">Uploaded locally</span>
+                        ) : iso.url ? (
+                          <a href={iso.url} target="_blank" rel="noopener noreferrer"
+                            className="inline-flex items-center text-primary-600 hover:text-primary-700 max-w-[200px] truncate">
+                            <Link className="h-3 w-3 mr-1 flex-shrink-0" />
+                            <span className="truncate">{iso.url}</span>
+                          </a>
+                        ) : 'Unknown'}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-right">
+                        {isAdmin && (
+                          <button
+                            onClick={() => handleDeleteCustomISO(iso.filename, iso.name)}
+                            disabled={actionLoading === `custom-iso-${iso.filename}`}
+                            className="text-red-600 hover:text-red-900 disabled:opacity-50"
+                          >
+                            {actionLoading === `custom-iso-${iso.filename}` ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <Trash2 className="h-4 w-4" />
+                            )}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="px-6 py-8 text-center text-gray-500">
+                <Download className="h-12 w-12 text-gray-300 mx-auto mb-3" />
+                <p>No custom ISOs cached yet.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Upload ISO Modal */}
+      {showUploadModal && (
+        <div className="fixed inset-0 z-50 overflow-y-auto">
+          <div className="flex items-center justify-center min-h-screen px-4">
+            <div className="fixed inset-0 bg-gray-500 bg-opacity-75" onClick={() => setShowUploadModal(null)} />
+            <div className="relative bg-white rounded-lg shadow-xl max-w-lg w-full">
+              <div className="px-6 py-4 border-b border-gray-200">
+                <h3 className="text-lg font-medium text-gray-900">
+                  Upload {showUploadModal === 'docker' ? 'Docker Image' : showUploadModal === 'windows' ? 'Windows' : showUploadModal === 'linux' ? 'Linux' : showUploadModal === 'macos' ? 'macOS' : 'Custom'} {showUploadModal !== 'docker' && 'ISO'}
+                </h3>
+              </div>
+              <div className="px-6 py-4 space-y-4">
+                {showUploadModal === 'windows' && (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">Category</label>
+                      <select
+                        value={uploadCategory}
+                        onChange={(e) => setUploadCategory(e.target.value)}
+                        className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                      >
+                        <option value="">Select category...</option>
+                        <option value="desktop">Desktop (Windows 10, 11)</option>
+                        <option value="server">Server (Windows Server)</option>
+                        <option value="legacy">Legacy (Windows 7, 8, XP)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">ISO Name</label>
+                      <input
+                        type="text"
+                        value={uploadName}
+                        onChange={(e) => setUploadName(e.target.value)}
+                        placeholder="e.g., Windows 11 Pro"
+                        className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                      />
+                    </div>
+                  </>
+                )}
+
+                {showUploadModal === 'linux' && (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">Category</label>
+                      <select
+                        value={uploadCategory}
+                        onChange={(e) => setUploadCategory(e.target.value)}
+                        className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                      >
+                        <option value="">Select category...</option>
+                        <option value="desktop">Desktop (Ubuntu, Mint, Fedora)</option>
+                        <option value="security">Security (Kali, Parrot, BlackArch)</option>
+                        <option value="server">Server (Ubuntu Server, Rocky, Debian)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">ISO Name</label>
+                      <input
+                        type="text"
+                        value={uploadName}
+                        onChange={(e) => setUploadName(e.target.value)}
+                        placeholder="e.g., Ubuntu 24.04 LTS"
+                        className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                      />
+                    </div>
+                  </>
+                )}
+
+                {showUploadModal === 'macos' && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">ISO Name</label>
+                    <input
+                      type="text"
+                      value={uploadName}
+                      onChange={(e) => setUploadName(e.target.value)}
+                      placeholder="e.g., macOS Sonoma 14.2"
+                      className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                    />
+                    <p className="mt-1 text-xs text-gray-500">
+                      macOS VMs only work on x86_64 hosts
+                    </p>
+                  </div>
+                )}
+
+                {showUploadModal === 'custom' && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">ISO Name</label>
+                    <input
+                      type="text"
+                      value={uploadName}
+                      onChange={(e) => setUploadName(e.target.value)}
+                      placeholder="e.g., Ubuntu 22.04 Server"
+                      className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                    />
+                  </div>
+                )}
+
+                {showUploadModal === 'docker' && (
+                  <div className="bg-blue-50 border border-blue-200 rounded-md p-3">
+                    <p className="text-sm text-blue-700">
+                      Upload a Docker image archive (.tar or .tar.gz) to load into the host Docker daemon.
+                      The image will appear in "Other Cached" after loading.
+                    </p>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    {showUploadModal === 'docker' ? 'Docker Image Archive' : 'ISO File'}
+                  </label>
+                  <div className="flex items-center gap-3">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept={showUploadModal === 'docker' ? '.tar,.tar.gz,.tgz' : '.iso'}
+                      onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="px-4 py-2 border border-gray-300 rounded-md text-sm hover:bg-gray-50"
+                    >
+                      Choose File
+                    </button>
+                    <span className="text-sm text-gray-500 truncate">
+                      {uploadFile ? uploadFile.name : 'No file chosen'}
+                    </span>
+                  </div>
+                  {uploadFile && (
+                    <p className="mt-1 text-xs text-gray-500">
+                      Size: {(uploadFile.size / (1024 * 1024 * 1024)).toFixed(2)} GB
+                    </p>
+                  )}
+                </div>
+
+                <div className="bg-yellow-50 border border-yellow-200 rounded-md p-3">
+                  <div className="flex">
+                    <AlertCircle className="h-4 w-4 text-yellow-500 mt-0.5 mr-2" />
+                    <p className="text-xs text-yellow-700">
+                      Large files may take several minutes to upload depending on file size and connection speed.
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div className="px-6 py-4 border-t border-gray-200 flex justify-end space-x-3">
+                <button
+                  onClick={() => {
+                    setShowUploadModal(null)
+                    setUploadFile(null)
+                                        setUploadName('')
+                    setUploadCategory('')
+                  }}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleUploadISO}
+                  disabled={
+                    actionLoading === 'upload' ||
+                    !uploadFile ||
+                    (showUploadModal === 'docker' ? false :
+                     showUploadModal === 'windows' || showUploadModal === 'linux' ? (!uploadCategory || !uploadName) :
+                     showUploadModal === 'macos' || showUploadModal === 'custom' ? !uploadName : true)
+                  }
+                  className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700 disabled:opacity-50"
+                >
+                  {actionLoading === 'upload' ? (
+                    <>
+                      <Loader2 className="inline h-4 w-4 mr-2 animate-spin" />
+                      Uploading...
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="inline h-4 w-4 mr-2" />
+                      Upload
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Download Custom ISO Modal */}
+      {showCustomISOModal && (
+        <div className="fixed inset-0 z-50 overflow-y-auto">
+          <div className="flex items-center justify-center min-h-screen px-4">
+            <div className="fixed inset-0 bg-gray-500 bg-opacity-75" onClick={() => setShowCustomISOModal(false)} />
+            <div className="relative bg-white rounded-lg shadow-xl max-w-lg w-full">
+              <div className="px-6 py-4 border-b border-gray-200">
+                <h3 className="text-lg font-medium text-gray-900">Download Custom ISO</h3>
+              </div>
+              <div className="px-6 py-4 space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">ISO Name</label>
+                  <input
+                    type="text"
+                    value={customISOName}
+                    onChange={(e) => setCustomISOName(e.target.value)}
+                    placeholder="e.g., Ubuntu 22.04 Server"
+                    className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Download URL</label>
+                  <input
+                    type="url"
+                    value={customISOUrl}
+                    onChange={(e) => setCustomISOUrl(e.target.value)}
+                    placeholder="https://releases.ubuntu.com/22.04/ubuntu-22.04.3-live-server-amd64.iso"
+                    className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                  />
+                </div>
+              </div>
+              <div className="px-6 py-4 border-t border-gray-200 flex justify-end space-x-3">
+                <button
+                  onClick={() => { setShowCustomISOModal(false); setCustomISOName(''); setCustomISOUrl(''); }}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleDownloadCustomISO}
+                  disabled={actionLoading === 'custom-iso-download' || !customISOName || !customISOUrl}
+                  className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700 disabled:opacity-50"
+                >
+                  {actionLoading === 'custom-iso-download' ? (
+                    <><Loader2 className="inline h-4 w-4 mr-2 animate-spin" />Starting...</>
+                  ) : (
+                    <><Download className="inline h-4 w-4 mr-2" />Download</>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* macOS ISO Download Modal */}
+      {showMacOSDownloadModal && (
+        <div className="fixed inset-0 z-50 overflow-y-auto">
+          <div className="flex items-center justify-center min-h-screen px-4">
+            <div className="fixed inset-0 bg-gray-500 bg-opacity-75" onClick={() => setShowMacOSDownloadModal(null)} />
+            <div className="relative bg-white rounded-lg shadow-xl max-w-lg w-full">
+              <div className="px-6 py-4 border-b border-gray-200">
+                <h3 className="text-lg font-medium text-gray-900">Download macOS ISO from URL</h3>
+                <p className="text-sm text-gray-500 mt-1">
+                  {showMacOSDownloadModal.name} ({showMacOSDownloadModal.version})
+                </p>
+              </div>
+              <div className="px-6 py-4 space-y-4">
+                <div className="bg-yellow-50 border border-yellow-200 rounded-md p-3">
+                  <p className="text-sm text-yellow-700">
+                    macOS ISOs typically don't have direct download URLs. You'll need to provide a URL
+                    from a trusted source. Alternatively, upload an ISO file directly.
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">ISO URL</label>
+                  <input
+                    type="url"
+                    value={macosDownloadUrl}
+                    onChange={(e) => setMacosDownloadUrl(e.target.value)}
+                    placeholder="https://example.com/macos-{version}.iso"
+                    className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                  />
+                </div>
+              </div>
+              <div className="px-6 py-4 border-t border-gray-200 flex justify-end space-x-3">
+                <button
+                  onClick={() => { setShowMacOSDownloadModal(null); setMacosDownloadUrl(''); }}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={async () => {
+                    if (showMacOSDownloadModal && macosDownloadUrl) {
+                      await handleDownloadMacOSISO(showMacOSDownloadModal, macosDownloadUrl)
+                      setShowMacOSDownloadModal(null)
+                      setMacosDownloadUrl('')
+                    }
+                  }}
+                  disabled={actionLoading?.startsWith('download-macos') || !macosDownloadUrl}
+                  className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700 disabled:opacity-50"
+                >
+                  {actionLoading?.startsWith('download-macos') ? (
+                    <><Loader2 className="inline h-4 w-4 mr-2 animate-spin" />Starting...</>
+                  ) : (
+                    <><Download className="inline h-4 w-4 mr-2" />Download</>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Cache Docker Images Modal */}
+      {showCacheModal && recommended && (
+        <div className="fixed inset-0 z-50 overflow-y-auto">
+          <div className="flex items-center justify-center min-h-screen px-4">
+            <div className="fixed inset-0 bg-gray-500 bg-opacity-75" onClick={() => setShowCacheModal(false)} />
+            <div className="relative bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+              <div className="px-6 py-4 border-b border-gray-200 sticky top-0 bg-white">
+                <h3 className="text-lg font-medium text-gray-900">Cache Docker Images</h3>
+              </div>
+              <div className="px-6 py-4 space-y-6">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Custom Image Name</label>
+                  <input
+                    type="text"
+                    value={newImageName}
+                    onChange={(e) => setNewImageName(e.target.value)}
+                    placeholder="e.g., nginx:latest"
+                    className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm"
+                  />
+                </div>
+
+                {/* Desktop Images */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <Monitor className="inline h-4 w-4 mr-1" /> Desktop Images
+                    <span className="text-xs text-gray-500 ml-2">(with VNC/RDP/Web access)</span>
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {recommended.desktop.map((img) => (
+                      <ImageCheckbox key={img.image} img={img} selected={selectedRecommended} setSelected={setSelectedRecommended} />
+                    ))}
+                  </div>
+                </div>
+
+                {/* Server/CLI Images */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <Server className="inline h-4 w-4 mr-1" /> Server/CLI Images
+                    <span className="text-xs text-gray-500 ml-2">(headless)</span>
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {recommended.server.map((img) => (
+                      <ImageCheckbox key={img.image} img={img} selected={selectedRecommended} setSelected={setSelectedRecommended} />
+                    ))}
+                  </div>
+                </div>
+
+                {/* Service Images */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <Database className="inline h-4 w-4 mr-1" /> Service Images
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {recommended.services.map((img) => (
+                      <ImageCheckbox key={img.image} img={img} selected={selectedRecommended} setSelected={setSelectedRecommended} />
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="px-6 py-4 border-t border-gray-200 flex justify-end space-x-3 sticky bottom-0 bg-white">
+                <button
+                  onClick={() => setShowCacheModal(false)}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleCacheBatch}
+                  disabled={actionLoading === 'batch' || (selectedRecommended.length === 0 && !newImageName)}
+                  className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700 disabled:opacity-50"
+                >
+                  {actionLoading === 'batch' ? (
+                    <><Loader2 className="inline h-4 w-4 mr-2 animate-spin" />Caching...</>
+                  ) : (
+                    `Cache ${selectedRecommended.length + (newImageName ? 1 : 0)} Images`
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={deleteConfirm.type !== null}
+        title={
+          deleteConfirm.type === 'docker' ? 'Remove Docker Image' :
+          deleteConfirm.type === 'windows-iso' ? 'Delete Windows ISO' :
+          deleteConfirm.type === 'linux-iso' ? 'Delete Linux ISO' :
+          deleteConfirm.type === 'custom-iso' ? 'Delete Custom ISO' : 'Delete'
+        }
+        message={`Are you sure you want to delete "${deleteConfirm.name}"? This action cannot be undone.`}
+        confirmLabel="Delete"
+        variant="danger"
+        onConfirm={confirmDelete}
+        onCancel={() => setDeleteConfirm({ type: null, name: '', isLoading: false })}
+        isLoading={deleteConfirm.isLoading}
+      />
+    </div>
+  )
+}
+
+// Helper Components
+
+function DockerImageSection({ title, description, images, cachedImages, icon: Icon, colorClass, onPull, onRemove, onCancel, onPush, pullStatus, actionLoading, isAdmin, registryStatus, registryStatusLoading }: {
+  title: string
+  description: string
+  images: RecommendedImage[]
+  cachedImages: CachedImage[]
+  icon: typeof Monitor
+  colorClass: string
+  onPull: (image: string) => void
+  onRemove: (id: string, tag: string) => void
+  onCancel: (imageKey: string) => void
+  onPush: (imageTag: string) => void
+  pullStatus: Record<string, DockerPullStatus>
+  actionLoading: string | null
+  isAdmin: boolean
+  registryStatus: Record<string, ImageStatusResponse>
+  registryStatusLoading: Record<string, boolean>
+}) {
+  const bgClass = `bg-${colorClass}-50`
+  const textClass = `text-${colorClass}-800`
+
+  // Check if an image is cached
+  const isImageCached = (imageName: string): CachedImage | undefined => {
+    return cachedImages.find(cached =>
+      cached.tags.some(tag => tag === imageName || tag.startsWith(imageName.split(':')[0]))
+    )
+  }
+
+  if (!images || images.length === 0) return null
+
+  return (
+    <div className="bg-white shadow rounded-lg overflow-hidden">
+      <div className={clsx("px-6 py-4 border-b border-gray-200", bgClass)}>
+        <h4 className={clsx("text-sm font-medium flex items-center", textClass)}>
+          <Icon className="h-4 w-4 mr-2" />
+          {title} ({images.length})
+        </h4>
+        <p className={clsx("text-xs mt-1", textClass.replace('800', '600'))}>{description}</p>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 p-4">
+        {images.filter(img => img.image).map((img) => {
+          const imageName = img.image!
+          const imageKey = imageName.replace(/\//g, '_').replace(/:/g, '_')
+          const cached = isImageCached(imageName)
+          const pullState = pullStatus[imageKey]
+          const isPulling = pullState?.status === 'pulling'
+          const isLoading = actionLoading === `pull-${imageKey}`
+          const regStatus = registryStatus[imageName]
+          const regLoading = registryStatusLoading[imageName]
+
+          return (
+            <div key={imageName} className={clsx(
+              "border rounded-lg p-4",
+              cached ? "bg-green-50 border-green-200" :
+              isPulling ? "bg-blue-50 border-blue-200" : "hover:bg-gray-50"
+            )}>
+              <div className="flex items-start justify-between">
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium text-gray-900 truncate" title={img.name || imageName}>{img.name || imageName}</p>
+                  <p className="text-xs text-gray-600 truncate" title={imageName}>{imageName}</p>
+                  <p className="text-xs text-gray-500 mt-1 line-clamp-2">{img.description}</p>
+                  {/* Registry status for cached images */}
+                  {cached && (
+                    <div className="mt-2">
+                      {regLoading ? (
+                        <Loader2 className="h-3 w-3 animate-spin text-gray-400" />
+                      ) : regStatus?.in_registry ? (
+                        <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700">
+                          <Cloud className="h-3 w-3 mr-1" />
+                          In Registry
+                        </span>
+                      ) : regStatus?.needs_push ? (
+                        <div className="flex items-center gap-1">
+                          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-700">
+                            <CloudOff className="h-3 w-3 mr-1" />
+                            Host Only
+                          </span>
+                          {isAdmin && (
+                            <button
+                              onClick={() => onPush(imageName)}
+                              disabled={regLoading}
+                              className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-700 hover:bg-blue-200"
+                              title="Push to Registry"
+                            >
+                              <Upload className="h-3 w-3 mr-0.5" />
+                              Push
+                            </button>
+                          )}
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 ml-2 flex-shrink-0">
+                  {isPulling ? (
+                    <div className="flex items-center gap-1 text-blue-600">
+                      <Loader2 className="h-4 w-4 animate-spin flex-shrink-0" />
+                      <span className="text-xs font-medium">
+                        {pullState.progress_percent ? `${pullState.progress_percent}%` : 'Starting...'}
+                      </span>
+                    </div>
+                  ) : cached ? (
+                    <>
+                      <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                        <Check className="h-3 w-3 mr-1" />
+                        Cached
+                      </span>
+                      {isAdmin && (
+                        <button
+                          onClick={() => onRemove(cached.id, cached.tags[0] || cached.id)}
+                          disabled={actionLoading === cached.id}
+                          className="text-red-600 hover:text-red-900 disabled:opacity-50 p-1"
+                          title="Remove cached image"
+                        >
+                          {actionLoading === cached.id ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-4 w-4" />
+                          )}
+                        </button>
+                      )}
+                    </>
+                  ) : isAdmin ? (
+                    <button
+                      onClick={() => onPull(imageName)}
+                      disabled={isLoading}
+                      className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-blue-100 text-blue-700 hover:bg-blue-200 disabled:opacity-50"
+                      title="Pull image"
+                    >
+                      {isLoading ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <>
+                          <Download className="h-3 w-3 mr-1" />
+                          Pull
+                        </>
+                      )}
+                    </button>
+                  ) : (
+                    <span className="text-xs text-gray-400">Not cached</span>
+                  )}
+                </div>
+              </div>
+              {/* Pull progress bar */}
+              {isPulling && pullState && (
+                <div className="mt-3 space-y-1.5">
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="text-blue-700 font-medium">
+                      {pullState.layers_completed || 0} / {pullState.layers_total || '?'} layers
+                    </span>
+                    <div className="flex items-center gap-2">
+                      {pullState.progress_percent !== undefined && (
+                        <span className="text-blue-600 font-semibold">{pullState.progress_percent}%</span>
+                      )}
+                      {isAdmin && (
+                        <button
+                          onClick={() => onCancel(imageKey)}
+                          disabled={actionLoading === `cancel-docker-${imageKey}`}
+                          className="text-red-500 hover:text-red-700 p-0.5 rounded hover:bg-red-50"
+                          title="Cancel pull"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="w-full bg-blue-100 rounded-full h-2.5 overflow-hidden">
+                    {pullState.progress_percent !== undefined && pullState.progress_percent > 0 ? (
+                      <div
+                        className="bg-gradient-to-r from-blue-500 to-blue-600 h-2.5 rounded-full transition-all duration-500 ease-out"
+                        style={{ width: `${pullState.progress_percent}%` }}
+                      />
+                    ) : (
+                      <div className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-400 h-2.5 rounded-full animate-pulse w-full opacity-60" />
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function ImageTable({ images, onRemove, onPush, actionLoading, isAdmin, registryStatus, registryStatusLoading, pushStatus, selectedForPush, onToggleSelect }: {
+  images: CachedImage[]
+  onRemove: (id: string, tag: string) => void
+  onPush: (imageTag: string) => void
+  actionLoading: string | null
+  isAdmin: boolean
+  registryStatus: Record<string, ImageStatusResponse>
+  registryStatusLoading: Record<string, boolean>
+  pushStatus?: Record<string, { status: string; progress_percent: number; current_layer?: number; total_layers?: number }>
+  selectedForPush?: Set<string>
+  onToggleSelect?: (imageTag: string) => void
+}) {
+  // Count how many images need push
+  const pushableCount = images.filter(img => {
+    const tag = img.tags[0] || img.id.substring(0, 12)
+    return registryStatus[tag]?.needs_push && !pushStatus?.[tag]
+  }).length
+
+  return (
+    <table className="min-w-full divide-y divide-gray-200">
+      <thead className="bg-gray-50">
+        <tr>
+          {isAdmin && onToggleSelect && pushableCount > 0 && (
+            <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase w-10">
+              <span className="sr-only">Select</span>
+            </th>
+          )}
+          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Image</th>
+          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Registry</th>
+          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Size</th>
+          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Created</th>
+          {isAdmin && <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actions</th>}
+        </tr>
+      </thead>
+      <tbody className="bg-white divide-y divide-gray-200">
+        {images.map((image) => {
+          const imageTag = image.tags[0] || image.id.substring(0, 12)
+          const status = registryStatus[imageTag]
+          const isLoading = registryStatusLoading[imageTag]
+          const activePush = pushStatus?.[imageTag]
+          const isPushing = activePush && ['starting', 'pushing', 'verifying', 'cleaning'].includes(activePush.status)
+          const canSelect = status?.needs_push && !isPushing
+          const isSelected = selectedForPush?.has(imageTag)
+
+          return (
+            <tr key={image.id} className={isSelected ? 'bg-blue-50' : undefined}>
+              {isAdmin && onToggleSelect && pushableCount > 0 && (
+                <td className="px-3 py-4 whitespace-nowrap">
+                  {canSelect && (
+                    <input
+                      type="checkbox"
+                      checked={isSelected || false}
+                      onChange={() => onToggleSelect(imageTag)}
+                      className="h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                    />
+                  )}
+                </td>
+              )}
+              <td className="px-6 py-4 whitespace-nowrap">
+                <div className="text-sm font-medium text-gray-900">{imageTag}</div>
+                {image.tags.length > 1 && <div className="text-xs text-gray-500">+{image.tags.length - 1} more</div>}
+              </td>
+              <td className="px-6 py-4 whitespace-nowrap">
+                {isPushing ? (
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 min-w-[100px]">
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="text-blue-600 font-medium">
+                          {activePush.current_layer && activePush.total_layers
+                            ? `Layer ${activePush.current_layer}/${activePush.total_layers}`
+                            : activePush.status === 'verifying' ? 'Verifying...'
+                            : activePush.status === 'cleaning' ? 'Cleaning up...'
+                            : 'Pushing...'}
+                        </span>
+                        <span className="text-blue-700 font-semibold">{activePush.progress_percent}%</span>
+                      </div>
+                      <div className="w-full bg-blue-100 rounded-full h-1.5">
+                        <div
+                          className="bg-blue-600 h-1.5 rounded-full transition-all duration-300"
+                          style={{ width: `${activePush.progress_percent}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : isLoading ? (
+                  <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+                ) : status?.in_registry ? (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                    <Cloud className="h-3 w-3 mr-1" />
+                    In Registry
+                  </span>
+                ) : status?.needs_push ? (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
+                    <CloudOff className="h-3 w-3 mr-1" />
+                    Host Only
+                  </span>
+                ) : (
+                  <span className="text-xs text-gray-400">-</span>
+                )}
+              </td>
+              <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{image.size_gb} GB</td>
+              <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                {image.created ? new Date(image.created).toLocaleDateString() : 'Unknown'}
+              </td>
+              {isAdmin && (
+                <td className="px-6 py-4 whitespace-nowrap text-right">
+                  <div className="flex items-center justify-end gap-2">
+                    {status?.needs_push && !isPushing && (
+                      <button
+                        onClick={() => onPush(imageTag)}
+                        disabled={isLoading || isPushing}
+                        className="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-blue-100 text-blue-700 hover:bg-blue-200 disabled:opacity-50"
+                        title="Push to Registry"
+                      >
+                        <Upload className="h-3 w-3 mr-1" />
+                        Push
+                      </button>
+                    )}
+                    <button
+                      onClick={() => onRemove(image.id, image.tags[0] || image.id)}
+                      disabled={actionLoading === image.id}
+                      className="text-red-600 hover:text-red-900 disabled:opacity-50"
+                      title="Remove image"
+                    >
+                      {actionLoading === image.id ? <Loader2 className="h-4 w-4 animate-spin inline" /> : <Trash2 className="h-4 w-4 inline" />}
+                    </button>
+                  </div>
+                </td>
+              )}
+            </tr>
+          )
+        })}
+      </tbody>
+    </table>
+  )
+}
+
+function WindowsVersionSection({ title, versions, icon: Icon, colorClass, onDelete, onDownload, onCancel, downloadStatus, actionLoading, isAdmin, hostArch }: {
+  title: string
+  versions: WindowsVersion[]
+  icon: typeof Monitor
+  colorClass: string
+  onDelete: (version: string, name: string, arch?: 'x86_64' | 'arm64') => void
+  onDownload: (version: WindowsVersion, customUrl?: string, arch?: 'x86_64' | 'arm64') => Promise<void>
+  onCancel: (version: string, arch?: 'x86_64' | 'arm64') => Promise<void>
+  downloadStatus: Record<string, WindowsISODownloadStatus>
+  actionLoading: string | null
+  isAdmin: boolean
+  hostArch?: 'x86_64' | 'arm64'
+}) {
+  const bgClass = `bg-${colorClass}-50`
+  const textClass = `text-${colorClass}-800`
+  const badgeBgClass = `bg-${colorClass}-100`
+  const badgeTextClass = `text-${colorClass}-800`
+
+  return (
+    <div className="bg-white shadow rounded-lg overflow-hidden">
+      <div className={clsx("px-6 py-4 border-b border-gray-200", bgClass)}>
+        <h4 className={clsx("text-sm font-medium flex items-center", textClass)}>
+          <Icon className="h-4 w-4 mr-2" />
+          {title} ({versions.length})
+        </h4>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 p-4">
+        {versions.map((v) => {
+          // Check for architecture-specific downloads
+          const x86Key = `${v.version}-x86_64`
+          const arm64Key = `${v.version}-arm64`
+          const x86Status = downloadStatus[x86Key] || downloadStatus[v.version]
+          const arm64Status = downloadStatus[arm64Key]
+          const isDownloadingX86 = x86Status?.status === 'downloading'
+          const isDownloadingArm64 = arm64Status?.status === 'downloading'
+
+          // Architecture-specific loading states
+          const isLoadingX86 = actionLoading === `download-windows-${x86Key}` ||
+                              actionLoading === `download-windows-${v.version}` ||
+                              actionLoading === `cancel-windows-${x86Key}` ||
+                              actionLoading === `cancel-windows-${v.version}`
+          const isLoadingArm64 = actionLoading === `download-windows-${arm64Key}` ||
+                                actionLoading === `cancel-windows-${arm64Key}`
+
+          // Check cached status
+          const cachedX86 = v.cached_x86_64 || (hostArch === 'x86_64' && v.cached)
+          const cachedArm64 = v.cached_arm64 || (hostArch === 'arm64' && v.cached)
+
+          return (
+            <div key={v.version} className={clsx(
+              "border rounded-lg p-4",
+              (cachedX86 || cachedArm64) ? "bg-green-50 border-green-200" :
+              (isDownloadingX86 || isDownloadingArm64) ? "bg-blue-50 border-blue-200" : "hover:bg-gray-50"
+            )}>
+              <div className="flex items-start justify-between">
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium text-gray-900 truncate">{v.name}</p>
+                  <div className="flex items-center gap-2 mt-1 flex-wrap">
+                    <code className={clsx("px-2 py-0.5 rounded text-xs font-mono", badgeBgClass, badgeTextClass)}>
+                      {v.version}
+                    </code>
+                    <span className="text-sm text-gray-500">{v.size_gb} GB</span>
+                    {v.arm64_available && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-700" title="ARM64 version available">
+                        ARM64
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Architecture-specific cache status */}
+                  <div className="flex items-center gap-2 mt-2 flex-wrap">
+                    {cachedX86 && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">
+                        <Check className="h-2.5 w-2.5 mr-0.5" />
+                        x86_64
+                      </span>
+                    )}
+                    {cachedArm64 && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">
+                        <Check className="h-2.5 w-2.5 mr-0.5" />
+                        ARM64
+                      </span>
+                    )}
+                  </div>
+
+                  {/* x86_64 Download progress */}
+                  {isDownloadingX86 && x86Status && (
+                    <div className="mt-3 space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="text-blue-700 font-medium">
+                          x86_64: {x86Status.progress_gb?.toFixed(2) || '0.00'} GB
+                          {x86Status.total_gb ? ` / ${x86Status.total_gb.toFixed(2)} GB` : ''}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          {x86Status.progress_percent && (
+                            <span className="text-blue-600 font-semibold">{x86Status.progress_percent}%</span>
+                          )}
+                          {isAdmin && (
+                            <button
+                              onClick={() => onCancel(v.version, 'x86_64')}
+                              disabled={actionLoading === `cancel-windows-${x86Key}`}
+                              className="text-red-500 hover:text-red-700 p-0.5 rounded hover:bg-red-50"
+                              title="Cancel download"
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="w-full bg-blue-100 rounded-full h-2 overflow-hidden">
+                        {x86Status.total_bytes && x86Status.progress_bytes ? (
+                          <div
+                            className="bg-gradient-to-r from-blue-500 to-blue-600 h-2 rounded-full transition-all duration-500 ease-out"
+                            style={{ width: `${x86Status.progress_percent || 0}%` }}
+                          />
+                        ) : (
+                          <div className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-400 h-2 rounded-full animate-pulse w-full opacity-60" />
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ARM64 Download progress */}
+                  {isDownloadingArm64 && arm64Status && (
+                    <div className="mt-3 space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="text-purple-700 font-medium">
+                          ARM64: {arm64Status.progress_gb?.toFixed(2) || '0.00'} GB
+                          {arm64Status.total_gb ? ` / ${arm64Status.total_gb.toFixed(2)} GB` : ''}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          {arm64Status.progress_percent && (
+                            <span className="text-purple-600 font-semibold">{arm64Status.progress_percent}%</span>
+                          )}
+                          {isAdmin && (
+                            <button
+                              onClick={() => onCancel(v.version, 'arm64')}
+                              disabled={actionLoading === `cancel-windows-${arm64Key}`}
+                              className="text-red-500 hover:text-red-700 p-0.5 rounded hover:bg-red-50"
+                              title="Cancel download"
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="w-full bg-purple-100 rounded-full h-2 overflow-hidden">
+                        {arm64Status.total_bytes && arm64Status.progress_bytes ? (
+                          <div
+                            className="bg-gradient-to-r from-purple-500 to-purple-600 h-2 rounded-full transition-all duration-500 ease-out"
+                            style={{ width: `${arm64Status.progress_percent || 0}%` }}
+                          />
+                        ) : (
+                          <div className="bg-gradient-to-r from-purple-400 via-purple-500 to-purple-400 h-2 rounded-full animate-pulse w-full opacity-60" />
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Action buttons */}
+              <div className="mt-3 flex items-center gap-2 flex-wrap">
+                {/* x86_64 actions */}
+                {cachedX86 ? (
+                  <div className="flex items-center gap-1">
+                    <span className="text-xs text-gray-500">x86_64</span>
+                    {isAdmin && (
+                      <button
+                        onClick={() => onDelete(v.version, v.name, 'x86_64')}
+                        disabled={isLoadingX86}
+                        className="p-1 text-red-600 hover:bg-red-50 rounded"
+                        title="Delete x86_64 ISO"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                ) : isDownloadingX86 ? (
+                  <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                    <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                    x86_64
+                  </span>
+                ) : v.download_url && isAdmin ? (
+                  <button
+                    onClick={() => onDownload(v, undefined, 'x86_64')}
+                    disabled={isLoadingX86}
+                    className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-blue-50 text-blue-700 hover:bg-blue-100"
+                  >
+                    {isLoadingX86 ? (
+                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                    ) : (
+                      <Download className="h-3 w-3 mr-1" />
+                    )}
+                    x86_64
+                  </button>
+                ) : (
+                  <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-600" title="Auto-downloaded on first use">
+                    x86_64 (auto)
+                  </span>
+                )}
+
+                {/* ARM64 actions (only if available) */}
+                {v.arm64_available && (
+                  <>
+                    {cachedArm64 ? (
+                      <div className="flex items-center gap-1">
+                        <span className="text-xs text-gray-500">ARM64</span>
+                        {isAdmin && (
+                          <button
+                            onClick={() => onDelete(v.version, v.name, 'arm64')}
+                            disabled={isLoadingArm64}
+                            className="p-1 text-red-600 hover:bg-red-50 rounded"
+                            title="Delete ARM64 ISO"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    ) : isDownloadingArm64 ? (
+                      <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        ARM64
+                      </span>
+                    ) : v.arm64_has_url && isAdmin ? (
+                      <button
+                        onClick={() => onDownload(v, undefined, 'arm64')}
+                        disabled={isLoadingArm64}
+                        className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-purple-50 text-purple-700 hover:bg-purple-100"
+                      >
+                        {isLoadingArm64 ? (
+                          <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        ) : (
+                          <Download className="h-3 w-3 mr-1" />
+                        )}
+                        ARM64
+                      </button>
+                    ) : (
+                      <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-600" title="ARM64 ISO built on first use (no direct download)">
+                        ARM64 (auto)
+                      </span>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function ImageCheckbox({ img, selected, setSelected }: {
+  img: { name?: string; image?: string; description: string; cached?: boolean }
+  selected: string[]
+  setSelected: (s: string[]) => void
+}) {
+  if (!img.image) return null
+  const isSelected = selected.includes(img.image)
+  const isCached = img.cached
+
+  return (
+    <label className={clsx(
+      "flex items-center p-2 border rounded cursor-pointer",
+      isCached ? "bg-green-50 border-green-200" : "hover:bg-gray-50",
+      isSelected && !isCached && "bg-primary-50 border-primary-200"
+    )}>
+      <input
+        type="checkbox"
+        checked={isSelected}
+        disabled={isCached}
+        onChange={(e) => {
+          if (e.target.checked) {
+            setSelected([...selected, img.image!])
+          } else {
+            setSelected(selected.filter((i) => i !== img.image))
+          }
+        }}
+        className="mr-2"
+      />
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium truncate" title={img.name || img.image}>{img.name || img.image}</p>
+        <p className="text-xs text-gray-500 truncate" title={img.image}>{img.image}</p>
+      </div>
+      {isCached && (
+        <Check className="h-4 w-4 text-green-600 ml-2 flex-shrink-0" />
+      )}
+    </label>
+  )
+}
+
+function LinuxVersionSection({ title, versions, icon: Icon, colorClass, onDelete, onDownload, onCancel, downloadStatus, actionLoading, isAdmin, hostArch }: {
+  title: string
+  versions: LinuxVersion[]
+  icon: typeof Monitor
+  colorClass: string
+  onDelete: (version: string, arch?: string) => void
+  onDownload: (version: LinuxVersion, customUrl?: string, arch?: string) => Promise<void>
+  onCancel: (version: string, arch?: string) => Promise<void>
+  downloadStatus: Record<string, LinuxISODownloadStatus>
+  actionLoading: string | null
+  isAdmin: boolean
+  hostArch?: 'x86_64' | 'arm64'
+}) {
+  const bgClass = `bg-${colorClass}-50`
+  const textClass = `text-${colorClass}-800`
+  const badgeBgClass = `bg-${colorClass}-100`
+  const badgeTextClass = `text-${colorClass}-800`
+
+  return (
+    <div className="bg-white shadow rounded-lg overflow-hidden">
+      <div className={clsx("px-6 py-4 border-b border-gray-200", bgClass)}>
+        <h4 className={clsx("text-sm font-medium flex items-center", textClass)}>
+          <Icon className="h-4 w-4 mr-2" />
+          {title} ({versions.length})
+        </h4>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 p-4">
+        {versions.map((v) => {
+          // Check for architecture-specific downloads
+          const x86Key = `${v.version}-x86_64`
+          const arm64Key = `${v.version}-arm64`
+          const x86Status = downloadStatus[x86Key] || downloadStatus[v.version]
+          const arm64Status = downloadStatus[arm64Key]
+          const isDownloadingX86 = x86Status?.status === 'downloading'
+          const isDownloadingArm64 = arm64Status?.status === 'downloading'
+
+          // Architecture-specific loading states
+          const isLoadingX86 = actionLoading === `download-linux-${x86Key}` ||
+                              actionLoading === `delete-linux-${x86Key}` ||
+                              actionLoading === `download-linux-${v.version}` ||
+                              actionLoading === `delete-linux-${v.version}`
+          const isLoadingArm64 = actionLoading === `download-linux-${arm64Key}` ||
+                                actionLoading === `delete-linux-${arm64Key}`
+
+          // Check cached status
+          const cachedX86 = v.cached_x86_64 || (hostArch === 'x86_64' && v.cached)
+          const cachedArm64 = v.cached_arm64 || (hostArch === 'arm64' && v.cached)
+
+          return (
+            <div key={v.version} className={clsx(
+              "border rounded-lg p-4",
+              (cachedX86 || cachedArm64) ? "bg-green-50 border-green-200" : "hover:bg-gray-50"
+            )}>
+              <div className="flex items-start justify-between">
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium text-gray-900 truncate">{v.name}</p>
+                  <div className="flex items-center gap-2 mt-1 flex-wrap">
+                    <code className={clsx("px-2 py-0.5 rounded text-xs font-mono", badgeBgClass, badgeTextClass)}>
+                      {v.version}
+                    </code>
+                    <span className="text-sm text-gray-500">{v.size_gb} GB</span>
+                    {v.arm64_available && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-700" title="ARM64 version available">
+                        ARM64
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-500 mt-2">{v.description}</p>
+
+                  {/* Architecture-specific cache status */}
+                  <div className="flex items-center gap-2 mt-2 flex-wrap">
+                    {cachedX86 && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">
+                        <Check className="h-2.5 w-2.5 mr-0.5" />
+                        x86_64
+                      </span>
+                    )}
+                    {cachedArm64 && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">
+                        <Check className="h-2.5 w-2.5 mr-0.5" />
+                        ARM64
+                      </span>
+                    )}
+                  </div>
+
+                  {/* x86_64 Download progress */}
+                  {isDownloadingX86 && x86Status && (
+                    <div className="mt-3 space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="text-blue-700 font-medium">
+                          x86_64: {x86Status.progress_gb?.toFixed(2) || '0.00'} GB
+                          {x86Status.total_gb ? ` / ${x86Status.total_gb.toFixed(2)} GB` : ''}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          {x86Status.progress_percent && (
+                            <span className="text-blue-600 font-semibold">{x86Status.progress_percent}%</span>
+                          )}
+                          {isAdmin && (
+                            <button
+                              onClick={() => onCancel(v.version, 'x86_64')}
+                              disabled={actionLoading === `cancel-linux-${x86Key}`}
+                              className="text-red-500 hover:text-red-700 p-0.5 rounded hover:bg-red-50"
+                              title="Cancel download"
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="w-full bg-blue-100 rounded-full h-2 overflow-hidden">
+                        {x86Status.total_bytes && x86Status.progress_bytes ? (
+                          <div
+                            className="bg-gradient-to-r from-blue-500 to-blue-600 h-2 rounded-full transition-all duration-500 ease-out"
+                            style={{ width: `${x86Status.progress_percent || 0}%` }}
+                          />
+                        ) : (
+                          <div className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-400 h-2 rounded-full animate-pulse w-full opacity-60" />
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ARM64 Download progress */}
+                  {isDownloadingArm64 && arm64Status && (
+                    <div className="mt-3 space-y-1.5">
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="text-purple-700 font-medium">
+                          ARM64: {arm64Status.progress_gb?.toFixed(2) || '0.00'} GB
+                          {arm64Status.total_gb ? ` / ${arm64Status.total_gb.toFixed(2)} GB` : ''}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          {arm64Status.progress_percent && (
+                            <span className="text-purple-600 font-semibold">{arm64Status.progress_percent}%</span>
+                          )}
+                          {isAdmin && (
+                            <button
+                              onClick={() => onCancel(v.version, 'arm64')}
+                              disabled={actionLoading === `cancel-linux-${arm64Key}`}
+                              className="text-red-500 hover:text-red-700 p-0.5 rounded hover:bg-red-50"
+                              title="Cancel download"
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="w-full bg-purple-100 rounded-full h-2 overflow-hidden">
+                        {arm64Status.total_bytes && arm64Status.progress_bytes ? (
+                          <div
+                            className="bg-gradient-to-r from-purple-500 to-purple-600 h-2 rounded-full transition-all duration-500 ease-out"
+                            style={{ width: `${arm64Status.progress_percent || 0}%` }}
+                          />
+                        ) : (
+                          <div className="bg-gradient-to-r from-purple-400 via-purple-500 to-purple-400 h-2 rounded-full animate-pulse w-full opacity-60" />
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Action buttons */}
+              <div className="mt-3 flex items-center gap-2 flex-wrap">
+                {/* x86_64 actions */}
+                {cachedX86 ? (
+                  <div className="flex items-center gap-1">
+                    {isAdmin && (
+                      <button
+                        onClick={() => onDelete(v.version, 'x86_64')}
+                        disabled={isLoadingX86}
+                        className="p-1 text-red-600 hover:bg-red-50 rounded"
+                        title="Delete x86_64 ISO"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                ) : isDownloadingX86 ? (
+                  <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                    <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                    x86_64
+                  </span>
+                ) : v.download_url ? (
+                  isAdmin && (
+                    <button
+                      onClick={() => onDownload(v, undefined, 'x86_64')}
+                      disabled={isLoadingX86}
+                      className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-blue-50 text-blue-700 hover:bg-blue-100"
+                    >
+                      {isLoadingX86 ? (
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                      ) : (
+                        <Download className="h-3 w-3 mr-1" />
+                      )}
+                      x86_64
+                    </button>
+                  )
+                ) : (
+                  <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-600" title={v.download_note}>
+                    Auto-download
+                  </span>
+                )}
+
+                {/* ARM64 actions (only if available) */}
+                {v.arm64_available && (
+                  <>
+                    {cachedArm64 ? (
+                      <div className="flex items-center gap-1">
+                        {isAdmin && (
+                          <button
+                            onClick={() => onDelete(v.version, 'arm64')}
+                            disabled={isLoadingArm64}
+                            className="p-1 text-red-600 hover:bg-red-50 rounded"
+                            title="Delete ARM64 ISO"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    ) : isDownloadingArm64 ? (
+                      <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        ARM64
+                      </span>
+                    ) : (
+                      isAdmin && (
+                        <button
+                          onClick={() => onDownload(v, undefined, 'arm64')}
+                          disabled={isLoadingArm64}
+                          className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-purple-50 text-purple-700 hover:bg-purple-100"
+                        >
+                          {isLoadingArm64 ? (
+                            <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                          ) : (
+                            <Download className="h-3 w-3 mr-1" />
+                          )}
+                          ARM64
+                        </button>
+                      )
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}

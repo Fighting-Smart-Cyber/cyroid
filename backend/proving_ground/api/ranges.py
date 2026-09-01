@@ -1,0 +1,2909 @@
+# backend/proving_ground/api/ranges.py
+import asyncio
+import json
+from datetime import datetime
+from typing import List, Optional
+from uuid import UUID
+import logging
+import os
+
+from fastapi import APIRouter, HTTPException, status, Query, Depends
+from pydantic import BaseModel
+
+from proving_ground.config import get_settings
+
+from proving_ground.api.deps import (
+    DBSession,
+    CurrentUser,
+    filter_by_visibility,
+    check_resource_access,
+    get_student_accessible_range_ids,
+)
+from proving_ground.database import get_db
+from proving_ground.models.range import Range, RangeStatus
+from proving_ground.models.network import Network
+from proving_ground.models.vm import VM, VMStatus
+from proving_ground.models.resource_tag import ResourceTag
+from proving_ground.models.user import User
+from proving_ground.models.router import RangeRouter, RouterStatus
+from proving_ground.models.event_log import EventType
+from proving_ground.models.msel import MSEL
+from proving_ground.models.content import Content, ContentType
+from proving_ground.services.scenario_filesystem import get_scenario
+from proving_ground.models.inject import Inject, InjectStatus
+from proving_ground.models.blueprint import RangeInstance
+from proving_ground.services.event_service import EventService
+from proving_ground.schemas.range import (
+    RangeCreate,
+    RangeUpdate,
+    RangeResponse,
+    RangeDetailResponse,
+    RangeTemplateExport,
+    RangeTemplateImport,
+    NetworkTemplateData,
+    VMTemplateData,
+    BlueprintInstanceInfo,
+)
+from proving_ground.schemas.deployment_status import (
+    DeploymentStatusResponse,
+    DeploymentSummary,
+    ResourceStatus,
+    NetworkStatus,
+    VMStatus as VMStatusSchema,
+)
+from proving_ground.schemas.scenario import ApplyScenarioRequest, ApplyScenarioResponse
+from sqlalchemy.orm import joinedload, Session
+from proving_ground.schemas.user import ResourceTagCreate, ResourceTagsResponse
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/ranges", tags=["Ranges"])
+
+
+def get_docker_service():
+    """Lazy import to avoid Docker connection issues during testing."""
+    from proving_ground.services.docker_service import get_docker_service as _get_docker_service
+
+    return _get_docker_service()
+
+
+def get_vyos_service():
+    """Lazy import for VyOS service."""
+    from proving_ground.services.vyos_service import VyOSService
+
+    return VyOSService()
+
+
+def get_dind_service():
+    """Lazy import for DinD service."""
+    from proving_ground.services.dind_service import get_dind_service as _get_dind_service
+
+    return _get_dind_service()
+
+
+def get_traefik_route_service():
+    """Lazy import for Traefik route service."""
+    from proving_ground.services.traefik_route_service import (
+        get_traefik_route_service as _get_traefik_route_service,
+    )
+
+    return _get_traefik_route_service()
+
+
+def compute_deployment_status(range_obj, events: list) -> DeploymentStatusResponse:
+    """Compute per-resource deployment status from events."""
+    import re
+    from datetime import timezone
+
+    # Stage names for human-readable display
+    STAGE_NAMES = {
+        1: "Creating DinD Container",
+        2: "Creating Networks",
+        3: "Transferring Images",
+        4: "Creating VMs",
+    }
+
+    # Find deployment start time and track latest step message
+    started_at = None
+    current_step = None
+    current_stage = None
+    total_stages = 4  # Default to 4 stages
+
+    for event in events:
+        if event.event_type == EventType.DEPLOYMENT_STARTED:
+            started_at = event.created_at
+        # Track deployment_step events for current progress message
+        elif event.event_type == EventType.DEPLOYMENT_STEP:
+            current_step = event.message
+            # Extract stage info from message like "[Stage 2/4] Creating networks..."
+            stage_match = re.match(r"\[Stage (\d+)/(\d+)\]", event.message)
+            if stage_match:
+                current_stage = int(stage_match.group(1))
+                total_stages = int(stage_match.group(2))
+
+    # Track timestamps for duration calculation
+    resource_start_times = {}
+
+    # Initialize DinD container status (handles routing via iptables)
+    router_status = ResourceStatus(name="dind-container", status="pending")
+
+    # Initialize network statuses
+    network_statuses = {}
+    for n in range_obj.networks:
+        network_statuses[n.id] = NetworkStatus(
+            id=str(n.id), name=n.name, subnet=n.subnet, status="pending"
+        )
+
+    # Initialize VM statuses
+    vm_statuses = {}
+    for v in range_obj.vms:
+        vm_statuses[v.id] = VMStatusSchema(
+            id=str(v.id), name=v.hostname, hostname=v.hostname, ip=v.ip_address, status="pending"
+        )
+
+    # Process events chronologically
+    for event in events:
+        event_type = event.event_type
+
+        # DinD container events (router events map to DinD container)
+        if event_type == EventType.ROUTER_CREATING:
+            router_status.status = "creating"
+            router_status.status_detail = "Creating DinD container..."
+            resource_start_times["router"] = event.created_at
+        elif event_type == EventType.ROUTER_CREATED:
+            router_status.status = "running"
+            router_status.status_detail = "Running"
+            if "router" in resource_start_times:
+                delta = event.created_at - resource_start_times["router"]
+                router_status.duration_ms = int(delta.total_seconds() * 1000)
+
+        # Network events
+        elif event_type == EventType.NETWORK_CREATING:
+            if event.network_id and event.network_id in network_statuses:
+                network_statuses[event.network_id].status = "creating"
+                network_statuses[event.network_id].status_detail = "Creating Docker network..."
+                resource_start_times[f"network_{event.network_id}"] = event.created_at
+        elif event_type == EventType.NETWORK_CREATED:
+            if event.network_id and event.network_id in network_statuses:
+                network_statuses[event.network_id].status = "created"
+                network_statuses[event.network_id].status_detail = "Created"
+                key = f"network_{event.network_id}"
+                if key in resource_start_times:
+                    delta = event.created_at - resource_start_times[key]
+                    network_statuses[event.network_id].duration_ms = int(
+                        delta.total_seconds() * 1000
+                    )
+
+        # VM events
+        elif event_type == EventType.VM_CREATING:
+            if event.vm_id and event.vm_id in vm_statuses:
+                vm_statuses[event.vm_id].status = "creating"
+                vm_statuses[event.vm_id].status_detail = "Creating container..."
+                resource_start_times[f"vm_{event.vm_id}"] = event.created_at
+        elif event_type == EventType.VM_STARTED:
+            if event.vm_id and event.vm_id in vm_statuses:
+                vm_statuses[event.vm_id].status = "running"
+                vm_statuses[event.vm_id].status_detail = "Running"
+                key = f"vm_{event.vm_id}"
+                if key in resource_start_times:
+                    delta = event.created_at - resource_start_times[key]
+                    vm_statuses[event.vm_id].duration_ms = int(delta.total_seconds() * 1000)
+        elif event_type == EventType.VM_ERROR:
+            if event.vm_id and event.vm_id in vm_statuses:
+                vm_statuses[event.vm_id].status = "failed"
+                vm_statuses[event.vm_id].status_detail = event.message
+
+        # Deployment failure
+        elif event_type == EventType.DEPLOYMENT_FAILED:
+            if router_status.status == "creating":
+                router_status.status = "failed"
+                router_status.status_detail = event.message
+
+    # Build summary
+    all_resources = [router_status] + list(network_statuses.values()) + list(vm_statuses.values())
+    summary = DeploymentSummary(
+        total=len(all_resources),
+        completed=sum(1 for r in all_resources if r.status in ["running", "created"]),
+        in_progress=sum(1 for r in all_resources if r.status in ["creating", "starting"]),
+        failed=sum(1 for r in all_resources if r.status == "failed"),
+        pending=sum(1 for r in all_resources if r.status == "pending"),
+    )
+
+    # Calculate elapsed time
+    elapsed_seconds = 0
+    if started_at:
+        from datetime import datetime
+
+        now = datetime.now(timezone.utc) if started_at.tzinfo else datetime.utcnow()
+        elapsed_seconds = int((now - started_at).total_seconds())
+
+    return DeploymentStatusResponse(
+        status=range_obj.status.value if hasattr(range_obj.status, "value") else range_obj.status,
+        elapsed_seconds=elapsed_seconds,
+        started_at=started_at.isoformat() if started_at else None,
+        current_step=current_step,
+        current_stage=current_stage,
+        total_stages=total_stages,
+        stage_name=STAGE_NAMES.get(current_stage) if current_stage else None,
+        summary=summary,
+        router=router_status,
+        networks=list(network_statuses.values()),
+        vms=list(vm_statuses.values()),
+    )
+
+
+@router.get("", response_model=List[RangeResponse])
+def list_ranges(db: DBSession, current_user: CurrentUser):
+    """
+    List ranges visible to the current user.
+
+    Visibility rules:
+    - Admins see ALL ranges
+    - Users see ranges they own
+    - Users see ranges with matching tags (if they have tags)
+    - Users see untagged ranges (public)
+    """
+    # Start with user's own ranges - eager load networks and vms for counts
+    base_options = [joinedload(Range.networks), joinedload(Range.vms)]
+
+    if current_user.is_admin:
+        # Admins see all ranges
+        query = db.query(Range).options(*base_options)
+    else:
+        # Non-admins: own ranges + visibility-filtered shared ranges
+        from sqlalchemy import or_
+
+        shared_query = db.query(Range).filter(Range.created_by != current_user.id)
+        shared_query = filter_by_visibility(shared_query, "range", current_user, db, Range)
+
+        query = (
+            db.query(Range)
+            .options(*base_options)
+            .filter(
+                or_(
+                    Range.created_by == current_user.id,
+                    Range.id.in_(shared_query.with_entities(Range.id).subquery()),
+                )
+            )
+        )
+
+    ranges = query.all()
+    return [RangeResponse.from_orm_with_counts(r) for r in ranges]
+
+
+@router.post("", response_model=RangeResponse, status_code=status.HTTP_201_CREATED)
+def create_range(range_data: RangeCreate, db: DBSession, current_user: CurrentUser):
+    range_obj = Range(
+        **range_data.model_dump(),
+        created_by=current_user.id,
+    )
+    db.add(range_obj)
+    db.commit()
+    db.refresh(range_obj)
+    return range_obj
+
+
+@router.get("/my-ranges", response_model=List[RangeResponse])
+def get_my_ranges(
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """
+    Get ranges assigned to the current user.
+
+    Returns ranges where the user is:
+    1. Directly assigned (Range.assigned_to_user_id)
+    2. Assigned via event participation (EventParticipant.range_id)
+    """
+    accessible_ids = get_student_accessible_range_ids(current_user.id, db)
+
+    if not accessible_ids:
+        return []
+
+    ranges = (
+        db.query(Range)
+        .options(joinedload(Range.networks), joinedload(Range.vms))
+        .filter(Range.id.in_(accessible_ids))
+        .all()
+    )
+
+    return [RangeResponse.from_orm_with_counts(r) for r in ranges]
+
+
+@router.get("/{range_id}", response_model=RangeDetailResponse)
+def get_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    range_obj = (
+        db.query(Range)
+        .options(
+            joinedload(Range.networks),
+            joinedload(Range.vms),
+            joinedload(Range.router),
+        )
+        .filter(Range.id == range_id)
+        .first()
+    )
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    # Check if this range was deployed from a blueprint
+    blueprint_instance = None
+    instance = (
+        db.query(RangeInstance)
+        .options(joinedload(RangeInstance.blueprint))
+        .filter(RangeInstance.range_id == range_id)
+        .first()
+    )
+    if instance and instance.blueprint:
+        blueprint_instance = BlueprintInstanceInfo(
+            instance_id=instance.id,
+            blueprint_id=instance.blueprint.id,
+            blueprint_name=instance.blueprint.name,
+            blueprint_version=instance.blueprint_version,
+            current_blueprint_version=instance.blueprint.version,
+        )
+
+    return RangeDetailResponse(
+        id=range_obj.id,
+        name=range_obj.name,
+        description=range_obj.description,
+        status=range_obj.status,
+        error_message=range_obj.error_message,
+        created_by=range_obj.created_by,
+        created_at=range_obj.created_at,
+        updated_at=range_obj.updated_at,
+        deployed_at=range_obj.deployed_at,
+        started_at=range_obj.started_at,
+        stopped_at=range_obj.stopped_at,
+        network_count=len(range_obj.networks) if range_obj.networks else 0,
+        vm_count=len(range_obj.vms) if range_obj.vms else 0,
+        student_guide_id=range_obj.student_guide_id,
+        networks=range_obj.networks,
+        vms=range_obj.vms,
+        router=range_obj.router,
+        blueprint_instance=blueprint_instance,
+    )
+
+
+@router.put("/{range_id}", response_model=RangeResponse)
+def update_range(
+    range_id: UUID,
+    range_data: RangeUpdate,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    update_data = range_data.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(range_obj, field, value)
+
+    db.commit()
+    db.refresh(range_obj)
+    return range_obj
+
+
+@router.delete("/{range_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Delete a range and clean up all associated Docker resources.
+
+    For DinD-based deployments:
+    - Destroys the DinD container (which automatically cleans up all VMs/networks inside)
+    - Clears Docker client cache for this range
+    - Deletes database record
+
+    For legacy deployments:
+    - Cleans up containers and networks via labels
+    - Deletes database record
+    """
+    import asyncio
+
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    # Cleanup Docker resources before deleting
+    try:
+        docker = get_docker_service()
+        dind = get_dind_service()
+
+        # Always try DinD container cleanup first (defensive - container may exist
+        # even if dind_container_id wasn't stored due to deployment errors)
+        logger.info(f"Attempting DinD container cleanup for range {range_id}")
+        try:
+            asyncio.run(
+                dind.delete_range_container(str(range_id), volume_name=range_obj.dind_volume_name)
+            )
+            logger.info(f"DinD container cleanup completed for range {range_id}")
+            try:
+                from proving_ground.tasks.pool import enqueue_pool_refill
+
+                enqueue_pool_refill()
+            except Exception as refill_err:
+                logger.warning(f"Could not enqueue pool refill: {refill_err}")
+        except Exception as dind_err:
+            logger.debug(f"DinD cleanup skipped or failed (may not exist): {dind_err}")
+
+        # Clear the Docker client cache for this range (always do this)
+        try:
+            docker.dind_service.close_range_client(str(range_id))
+        except Exception:
+            pass  # Ignore if cache doesn't exist
+
+        # Also run legacy label-based cleanup for any orphaned resources
+        # (handles cases where VMs were created outside DinD or partial deployments)
+        logger.info(f"Running legacy cleanup for range {range_id}")
+        docker.cleanup_range(str(range_id))
+
+    except Exception as e:
+        logger.warning(f"Failed to cleanup Docker resources for range {range_id}: {e}")
+        # Continue with database deletion even if Docker cleanup fails
+
+    # Content is no longer deleted with ranges - it's statically defined and shared
+    # across range instances. Content is only deleted when its parent blueprint is deleted.
+
+    # Delete associated range instances (from blueprint deployments) to avoid FK constraint (Issue #73)
+    db.query(RangeInstance).filter(RangeInstance.range_id == range_id).delete()
+
+    db.delete(range_obj)
+    db.commit()
+
+
+@router.get("/{range_id}/deployment-status", response_model=DeploymentStatusResponse)
+def get_deployment_status(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Get detailed per-resource deployment status."""
+    from datetime import datetime, timedelta
+    from proving_ground.models.event_log import EventLog
+
+    range_obj = (
+        db.query(Range)
+        .options(joinedload(Range.networks), joinedload(Range.vms))
+        .filter(Range.id == range_id)
+        .first()
+    )
+
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    # Get deployment events from last hour
+    events = (
+        db.query(EventLog)
+        .filter(
+            EventLog.range_id == range_id,
+            EventLog.created_at > datetime.utcnow() - timedelta(hours=1),
+        )
+        .order_by(EventLog.created_at)
+        .all()
+    )
+
+    return compute_deployment_status(range_obj, events)
+
+
+@router.get("/{range_id}/validate")
+async def validate_range_deployment(
+    range_id: UUID,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """
+    Validate range configuration before deployment.
+
+    Performs the following checks:
+    - Image availability: Verifies Docker images exist for all VMs
+    - Architecture compatibility: Checks for cross-architecture emulation needs
+    - Disk space: Verifies sufficient disk space for deployment
+    - Network configuration: Validates no duplicate IPs within networks
+
+    Returns:
+        Validation result with errors and warnings
+    """
+    from proving_ground.services.deployment_validator import DeploymentValidator
+
+    # Check if range exists
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    # Check access
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+
+    # Create validator and run validation
+    docker = get_docker_service()
+    validator = DeploymentValidator(db, docker)
+    result = await validator.validate_range(range_id)
+
+    return {
+        "valid": result.valid,
+        "errors": [
+            {"message": r.message, "vm_id": r.vm_id, "details": r.details} for r in result.errors
+        ],
+        "warnings": [
+            {"message": r.message, "vm_id": r.vm_id, "details": r.details} for r in result.warnings
+        ],
+        "info": [
+            {"message": r.message, "vm_id": r.vm_id, "details": r.details} for r in result.info
+        ],
+    }
+
+
+@router.post("/{range_id}/deploy", response_model=RangeResponse)
+def deploy_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Deploy a range using DinD isolation - creates isolated Docker environment with networks and VMs.
+
+    This endpoint returns immediately after validation and dispatches deployment
+    to a background worker. Use GET /ranges/{range_id}/deployment-status to poll
+    for real-time progress updates.
+    """
+    from proving_ground.services.deployment_validator import DeploymentValidator
+    from proving_ground.tasks.deployment import deploy_range_task
+    import asyncio
+
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    if range_obj.status not in [RangeStatus.DRAFT, RangeStatus.STOPPED, RangeStatus.ERROR]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot deploy range in {range_obj.status} status",
+        )
+
+    # Enforce strict image validation before deployment
+    # All container images must be pre-cached, QEMU VMs must have boot_source configured
+    docker = get_docker_service()
+    validator = DeploymentValidator(db, docker)
+    validation_result = asyncio.run(validator.validate_range(range_id))
+
+    if not validation_result.valid:
+        error_messages = [e.message for e in validation_result.errors]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "Deployment validation failed. All images must be cached before deployment.",
+                "errors": error_messages,
+                "hint": "Use the Image Cache page to pre-pull container images or configure golden images for QEMU VMs.",
+            },
+        )
+
+    # Set status to DEPLOYING immediately
+    range_obj.status = RangeStatus.DEPLOYING
+    range_obj.error_message = None  # Clear any previous error
+    db.commit()
+
+    # Dispatch deployment to background worker
+    # The worker will log DEPLOYMENT_STARTED and handle all progress events
+    logger.info(f"Dispatching deployment for range {range_id} to background worker")
+    deploy_range_task.send(str(range_id))
+
+    return range_obj
+
+
+@router.post("/{range_id}/sync")
+def sync_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Sync range configuration - provision new networks/VMs into existing DinD container.
+
+    This endpoint provisions any new resources (networks, VMs) that were added after
+    initial deployment. It does NOT recreate the DinD container - only adds missing
+    resources to the existing environment.
+
+    Use this when:
+    - Range is RUNNING and you've added new networks/VMs
+    - You want to incrementally deploy resources without full redeployment
+
+    For each resource:
+    - Networks without docker_network_id → created in DinD
+    - VMs without container_id → created in DinD
+    """
+    from proving_ground.services.range_deployment_service import get_range_deployment_service
+    from proving_ground.services.deployment_validator import DeploymentValidator
+    import asyncio
+    import traceback
+
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    # Sync only works on RUNNING ranges with DinD containers
+    if range_obj.status != RangeStatus.RUNNING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot sync range in {range_obj.status} status. Range must be RUNNING.",
+        )
+
+    if not range_obj.dind_container_id or not range_obj.dind_docker_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Range is missing DinD configuration. Please deploy the range first.",
+        )
+
+    # Find unprovisioned resources
+    networks = db.query(Network).filter(Network.range_id == range_id).all()
+    vms = db.query(VM).filter(VM.range_id == range_id).all()
+
+    new_networks = [n for n in networks if not n.docker_network_id]
+    new_vms = [v for v in vms if not v.container_id]
+
+    if not new_networks and not new_vms:
+        return {
+            "status": "no_changes",
+            "message": "All resources already provisioned",
+            "networks_synced": 0,
+            "vms_synced": 0,
+        }
+
+    # Validate new VMs before syncing
+    docker = get_docker_service()
+    validator = DeploymentValidator(db, docker)
+    validation_result = asyncio.run(validator.validate_range(range_id))
+
+    # Only fail on new VMs that have validation errors
+    new_vm_ids = {str(v.id) for v in new_vms}
+    new_vm_errors = [e for e in validation_result.errors if e.vm_id in new_vm_ids]
+
+    if new_vm_errors:
+        error_messages = [e.message for e in new_vm_errors]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "Validation failed for new VMs",
+                "errors": error_messages,
+                "hint": "Ensure all new VMs have cached images or configured golden images.",
+            },
+        )
+
+    # Initialize event service
+    event_service = EventService(db)
+    event_service.log_event(
+        range_id=range_id,
+        event_type=EventType.DEPLOYMENT_STARTED,
+        message=f"Syncing range: provisioning {len(new_networks)} networks and {len(new_vms)} VMs",
+        user_id=current_user.id,
+        extra_data=json.dumps(
+            {"action": "sync", "new_networks": len(new_networks), "new_vms": len(new_vms)}
+        ),
+    )
+
+    try:
+        deployment_service = get_range_deployment_service()
+        result = asyncio.run(deployment_service.sync_range(db, range_id))
+
+        logger.info(f"Range sync completed for {range_id}: {result}")
+
+        return {
+            "status": "synced",
+            "message": f"Synced {result.get('networks_created', 0)} networks and {result.get('vms_created', 0)} VMs",
+            "networks_synced": result.get("networks_created", 0),
+            "vms_synced": result.get("vms_created", 0),
+            "details": result,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to sync range {range_id}: {type(e).__name__}: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+
+        event_service.log_event(
+            range_id=range_id,
+            event_type=EventType.DEPLOYMENT_FAILED,
+            message=f"Sync failed: {str(e)[:200]}",
+            user_id=current_user.id,
+            extra_data=json.dumps({"error": str(e)}),
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to sync range: {str(e)}",
+        ) from e
+
+
+@router.post("/{range_id}/repair-dind")
+def repair_range_dind(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Admin recovery tool for DinD configuration.
+
+    Note: This endpoint is rarely needed. DinD info is automatically recovered
+    when starting/deleting VMs if the container exists but database info is missing.
+
+    This endpoint is for manual recovery scenarios:
+    - When you need to manually verify/refresh DinD configuration
+    - For debugging purposes
+
+    Returns the recovered DinD info or an error if no container is found.
+    """
+    import asyncio
+
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    # Check if DinD info is already populated
+    if range_obj.dind_container_id and range_obj.dind_docker_url:
+        return {
+            "status": "already_configured",
+            "message": "Range already has DinD configuration",
+            "dind_container_id": range_obj.dind_container_id,
+            "dind_docker_url": range_obj.dind_docker_url,
+        }
+
+    # Try to find a running DinD container for this range
+    dind = get_dind_service()
+    dind_info = asyncio.run(dind.get_container_info(str(range_id)))
+
+    if not dind_info:
+        return {
+            "status": "no_container",
+            "message": "No DinD container found for this range. You may need to deploy the range.",
+        }
+
+    # Recover DinD info
+    range_obj.dind_container_id = dind_info["container_id"]
+    range_obj.dind_container_name = dind_info["container_name"]
+    range_obj.dind_mgmt_ip = dind_info["mgmt_ip"]
+    range_obj.dind_docker_url = dind_info["docker_url"]
+
+    # Update status to RUNNING if container is running
+    if dind_info["status"] == "running":
+        range_obj.status = RangeStatus.RUNNING
+    elif dind_info["status"] == "exited":
+        range_obj.status = RangeStatus.STOPPED
+
+    db.commit()
+
+    # Log the recovery event
+    event_service = EventService(db)
+    event_service.log_event(
+        range_id=range_id,
+        event_type=EventType.DEPLOYMENT_STEP,
+        message=f"Recovered DinD configuration for range {range_obj.name}",
+        user_id=current_user.id,
+    )
+
+    return {
+        "status": "recovered",
+        "message": "DinD configuration recovered successfully",
+        "dind_container_id": dind_info["container_id"],
+        "dind_container_name": dind_info["container_name"],
+        "dind_mgmt_ip": dind_info["mgmt_ip"],
+        "dind_docker_url": dind_info["docker_url"],
+        "container_status": dind_info["status"],
+    }
+
+
+@router.get("/{range_id}/vnc-status")
+def get_vnc_status(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Get detailed VNC status for all VMs in a range.
+
+    Returns diagnostic information about VNC configuration including:
+    - Database VNC mappings
+    - Traefik route file status
+    - iptables rules (for DinD ranges)
+    - Per-VM VNC access URLs
+
+    Use this endpoint to diagnose VNC connectivity issues.
+    """
+    from pathlib import Path
+
+    range_obj = db.query(Range).options(joinedload(Range.vms)).filter(Range.id == range_id).first()
+
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    # Get VNC mappings from database
+    vnc_mappings = range_obj.vnc_proxy_mappings or {}
+
+    # Check Traefik route file
+    traefik_route_file = Path(f"/app/traefik/dynamic/range-{str(range_id)[:8]}.yml")
+    traefik_routes_exist = traefik_route_file.exists()
+    traefik_routes_content = None
+    if traefik_routes_exist:
+        try:
+            traefik_routes_content = traefik_route_file.read_text()
+        except:
+            traefik_routes_content = "Error reading file"
+
+    # Build per-VM VNC status
+    vm_vnc_status = []
+    for vm in range_obj.vms:
+        vm_id_str = str(vm.id)
+        mapping = vnc_mappings.get(vm_id_str)
+
+        status_info = {
+            "vm_id": vm_id_str,
+            "hostname": vm.hostname,
+            "vm_status": vm.status.value if vm.status else "unknown",
+            "container_id": vm.container_id[:12] if vm.container_id else None,
+            "ip_address": vm.ip_address,
+            "has_db_mapping": mapping is not None,
+            "vnc_url": None,
+            "proxy_port": None,
+            "proxy_host": None,
+            "original_port": None,
+            "issues": [],
+        }
+
+        if mapping:
+            status_info["proxy_port"] = mapping.get("proxy_port")
+            status_info["proxy_host"] = mapping.get("proxy_host")
+            status_info["original_port"] = mapping.get("original_port")
+            status_info["vnc_url"] = f"/vnc/{vm_id_str}"
+
+            # Check if route exists in Traefik file
+            if traefik_routes_content and vm_id_str[:12] not in traefik_routes_content:
+                status_info["issues"].append("VNC route not found in Traefik config")
+        else:
+            status_info["issues"].append("No VNC mapping in database")
+
+        if not vm.container_id:
+            status_info["issues"].append("VM has no container ID")
+        if not vm.ip_address:
+            status_info["issues"].append("VM has no IP address")
+
+        vm_vnc_status.append(status_info)
+
+    # Check socat processes and network config for DinD ranges
+    socat_processes = []
+    socat_proxies = []
+    network_interfaces = []
+    network_isolation = {
+        "forward_policy": "unknown",
+        "forward_rules_count": 0,
+        "nat_rules_count": 0,
+        "masquerade_enabled": False,
+    }
+
+    if range_obj.dind_container_id and range_obj.dind_docker_url:
+        try:
+            docker = get_docker_service()
+            host_client = docker.client
+            dind_container = host_client.containers.get(range_obj.dind_container_id)
+
+            # Get running socat VNC proxies
+            exec_result = dind_container.exec_run(
+                "sh -c 'ps 2>/dev/null | grep socat | grep -v grep'", user="root"
+            )
+            if exec_result.exit_code == 0:
+                raw_socat = exec_result.output.decode("utf-8")
+                socat_processes = raw_socat.split("\n")
+                # Parse into structured data
+                socat_proxies = _parse_socat_processes(raw_socat)
+                # Enrich with VM hostnames
+                vm_map = {vm.ip_address: vm.hostname for vm in range_obj.vms if vm.ip_address}
+                for proxy in socat_proxies:
+                    proxy["vm_hostname"] = vm_map.get(proxy.get("vm_ip"), "unknown")
+            else:
+                socat_processes = ["No socat processes running"]
+
+            # Get network interfaces inside DinD
+            exec_result = dind_container.exec_run("ip -br addr", user="root")
+            if exec_result.exit_code == 0:
+                network_interfaces = exec_result.output.decode("utf-8").split("\n")
+
+            # Get network isolation info (iptables FORWARD chain)
+            exec_result = dind_container.exec_run(
+                "iptables -L FORWARD -n", user="root", privileged=True
+            )
+            if exec_result.exit_code == 0:
+                forward_output = exec_result.output.decode("utf-8")
+                if "policy DROP" in forward_output:
+                    network_isolation["forward_policy"] = "DROP"
+                elif "policy ACCEPT" in forward_output:
+                    network_isolation["forward_policy"] = "ACCEPT"
+                # Count non-header lines as rules
+                forward_lines = [
+                    l
+                    for l in forward_output.split("\n")
+                    if l.strip() and not l.startswith("Chain") and not l.startswith("target")
+                ]
+                network_isolation["forward_rules_count"] = len(forward_lines)
+
+            # Check for MASQUERADE
+            exec_result = dind_container.exec_run(
+                "iptables -t nat -L POSTROUTING -n", user="root", privileged=True
+            )
+            if exec_result.exit_code == 0:
+                nat_output = exec_result.output.decode("utf-8")
+                network_isolation["masquerade_enabled"] = "MASQUERADE" in nat_output
+                nat_lines = [
+                    l
+                    for l in nat_output.split("\n")
+                    if l.strip() and not l.startswith("Chain") and not l.startswith("target")
+                ]
+                network_isolation["nat_rules_count"] = len(nat_lines)
+
+        except Exception as e:
+            socat_processes = [f"Error getting socat processes: {str(e)}"]
+
+    return {
+        "range_id": str(range_id),
+        "range_name": range_obj.name,
+        "is_dind": bool(range_obj.dind_container_id),
+        "dind_container_id": (
+            range_obj.dind_container_id[:12] if range_obj.dind_container_id else None
+        ),
+        "dind_docker_url": range_obj.dind_docker_url,
+        "dind_mgmt_ip": range_obj.dind_mgmt_ip,
+        "vnc_mappings_count": len(vnc_mappings),
+        "traefik_routes_exist": traefik_routes_exist,
+        "traefik_route_file": str(traefik_route_file),
+        "socat_processes": socat_processes,
+        "socat_proxies": socat_proxies,
+        "network_interfaces": network_interfaces,
+        "network_isolation": network_isolation,
+        "vms": vm_vnc_status,
+        "summary": {
+            "total_vms": len(range_obj.vms),
+            "vms_with_vnc": len([v for v in vm_vnc_status if v["has_db_mapping"]]),
+            "vms_with_issues": len([v for v in vm_vnc_status if v["issues"]]),
+        },
+    }
+
+
+@router.post("/{range_id}/repair-vnc")
+def repair_vnc_for_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Repair VNC configuration for all VMs in a range.
+
+    This endpoint:
+    1. Creates socat TCP proxies for VNC port forwarding inside DinD
+    2. Re-generates Traefik routing configuration
+    3. Updates database with VNC mappings
+
+    Use this when VMs are running but VNC console is not accessible.
+    """
+    import asyncio
+    from sqlalchemy.orm.attributes import flag_modified
+
+    range_obj = db.query(Range).options(joinedload(Range.vms)).filter(Range.id == range_id).first()
+
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    if not range_obj.dind_container_id or not range_obj.dind_docker_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Range is not using DinD isolation - VNC repair not needed",
+        )
+
+    dind = get_dind_service()
+    traefik_service = get_traefik_route_service()
+
+    # Collect VM VNC port info
+    vm_ports = []
+    for vm in range_obj.vms:
+        if not vm.container_id or not vm.ip_address:
+            continue
+
+        # Determine VNC port based on VM type and image
+        # Get vm_type from related base_image, golden_image, or snapshot
+        vm_type_str = None
+        docker_image_tag = None
+
+        if vm.base_image:
+            vm_type_str = vm.base_image.vm_type
+            docker_image_tag = vm.base_image.docker_image_tag
+        elif vm.golden_image:
+            vm_type_str = vm.golden_image.vm_type
+            docker_image_tag = vm.golden_image.docker_image_tag
+        elif vm.source_snapshot:
+            vm_type_str = vm.source_snapshot.vm_type
+            docker_image_tag = vm.source_snapshot.docker_image_tag
+
+        vnc_port = 8006  # Default for QEMU VMs (linux_vm, windows_vm)
+
+        if vm_type_str == "container":
+            # Container VMs have image-specific VNC ports
+            image = docker_image_tag or ""
+            if "kasmweb" in image:
+                vnc_port = 6901  # KasmVNC (HTTPS)
+            elif "linuxserver/" in image or "lscr.io/linuxserver" in image:
+                vnc_port = 3000  # LinuxServer webtop (HTTP)
+            else:
+                vnc_port = 3000  # Default for other containers
+
+        vm_ports.append(
+            {
+                "vm_id": str(vm.id),
+                "hostname": vm.hostname,
+                "vnc_port": vnc_port,
+                "ip_address": vm.ip_address,
+            }
+        )
+
+    if not vm_ports:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No VMs with container IDs found to repair VNC for",
+        )
+
+    # Setup VNC port forwarding
+    try:
+        port_mappings = asyncio.run(
+            dind.setup_vnc_port_forwarding(
+                range_id=str(range_id),
+                vm_ports=vm_ports,
+                existing_mappings={},  # Start fresh
+            )
+        )
+    except Exception as e:
+        logger.error(f"Failed to setup VNC port forwarding: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to setup VNC port forwarding: {str(e)}",
+        ) from e
+
+    # Update database
+    range_obj.vnc_proxy_mappings = port_mappings
+    flag_modified(range_obj, "vnc_proxy_mappings")
+    db.commit()
+    db.refresh(range_obj)
+
+    # Generate Traefik routes
+    route_file = traefik_service.generate_vnc_routes(str(range_id), port_mappings)
+
+    # Log event
+    event_service = EventService(db)
+    event_service.log_event(
+        range_id=range_id,
+        event_type=EventType.DEPLOYMENT_STEP,
+        message=f"VNC configuration repaired for {len(port_mappings)} VMs",
+        user_id=current_user.id,
+    )
+
+    return {
+        "status": "repaired",
+        "message": f"VNC configuration repaired for {len(port_mappings)} VMs",
+        "vnc_mappings": port_mappings,
+        "traefik_route_file": str(route_file) if route_file else None,
+    }
+
+
+@router.post("/{range_id}/start", response_model=RangeResponse)
+def start_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Start all VMs and router in a stopped range.
+
+    For DinD-based deployments:
+    - Ensures the DinD container itself is running (starts it if stopped)
+    - Waits for Docker daemon inside DinD to be ready
+    - Starts VyOS router container inside DinD first
+    - Starts all VM containers inside DinD
+    """
+    import asyncio
+
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    if range_obj.status != RangeStatus.STOPPED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot start range in {range_obj.status} status",
+        )
+
+    try:
+        docker = get_docker_service()
+        dind = get_dind_service()
+
+        # Check if this is a DinD-based deployment
+        if range_obj.dind_container_id and range_obj.dind_docker_url:
+            # DinD-based deployment
+            logger.info(f"Starting DinD-based range {range_id}")
+
+            # Step 0: Ensure the DinD container itself is running
+            dind_info = asyncio.run(dind.start_range_container(str(range_id)))
+            logger.info(f"DinD container started/confirmed running: {dind_info}")
+
+            # Update docker_url in case IP changed after restart
+            if dind_info.get("docker_url") and dind_info["docker_url"] != range_obj.dind_docker_url:
+                range_obj.dind_docker_url = dind_info["docker_url"]
+                range_obj.dind_mgmt_ip = dind_info.get("mgmt_ip")
+                db.commit()
+                logger.info(f"Updated DinD Docker URL to {dind_info['docker_url']}")
+
+            # Get Docker client for the inner Docker daemon
+            range_client = docker.get_range_client_sync(str(range_id), range_obj.dind_docker_url)
+
+            # Step 1: Start VyOS router first (VMs need networking)
+            range_router = db.query(RangeRouter).filter(RangeRouter.range_id == range_id).first()
+            if range_router and range_router.container_id:
+                try:
+                    container = range_client.containers.get(range_router.container_id)
+                    container.start()
+                    range_router.status = RouterStatus.RUNNING
+                    db.commit()
+                    logger.info(f"Started VyOS router for range {range_id} inside DinD")
+                except Exception as e:
+                    logger.warning(f"Failed to start VyOS router: {e}")
+
+            # Step 2: Start all VM containers inside DinD
+            vms = db.query(VM).filter(VM.range_id == range_id).all()
+            for vm in vms:
+                if vm.container_id:
+                    try:
+                        container = range_client.containers.get(vm.container_id)
+                        container.start()
+                        vm.status = VMStatus.RUNNING
+                        db.commit()
+                        logger.info(f"Started VM {vm.hostname} inside DinD")
+                    except Exception as e:
+                        logger.warning(f"Failed to start VM {vm.hostname}: {e}")
+
+        else:
+            # Try to auto-recover DinD info if a container exists
+            dind_info = asyncio.run(dind.get_container_info(str(range_id)))
+            if dind_info:
+                # Found a DinD container - recover the info
+                logger.info(f"Auto-recovering DinD info for range {range_id}")
+                range_obj.dind_container_id = dind_info["container_id"]
+                range_obj.dind_container_name = dind_info["container_name"]
+                range_obj.dind_mgmt_ip = dind_info["mgmt_ip"]
+                range_obj.dind_docker_url = dind_info["docker_url"]
+                db.commit()
+
+                # Now try to start with the recovered info
+                if dind_info["status"] != "running":
+                    # Start the DinD container first
+                    start_info = asyncio.run(dind.start_range_container(str(range_id)))
+                    if start_info.get("docker_url"):
+                        range_obj.dind_docker_url = start_info["docker_url"]
+                        range_obj.dind_mgmt_ip = start_info.get("mgmt_ip")
+                        db.commit()
+
+                # Start VMs inside DinD
+                range_client = docker.get_range_client_sync(
+                    str(range_id), range_obj.dind_docker_url
+                )
+
+                vms = db.query(VM).filter(VM.range_id == range_id).all()
+                for vm in vms:
+                    if vm.container_id:
+                        try:
+                            container = range_client.containers.get(vm.container_id)
+                            container.start()
+                            vm.status = VMStatus.RUNNING
+                            db.commit()
+                            logger.info(f"Started VM {vm.hostname} inside recovered DinD")
+                        except Exception as e:
+                            logger.warning(f"Failed to start VM {vm.hostname}: {e}")
+            else:
+                # No DinD container found - truly needs redeployment
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Range is missing DinD configuration and no container found. Please redeploy the range.",
+                )
+
+        range_obj.status = RangeStatus.RUNNING
+        # Set lifecycle timestamp
+        from datetime import timezone
+
+        range_obj.started_at = datetime.now(timezone.utc)
+        db.commit()
+
+        # Log the start event
+        event_service = EventService(db)
+        event_service.log_event(
+            range_id=range_id,
+            event_type=EventType.RANGE_STARTED,
+            message=f"Range '{range_obj.name}' started",
+            user_id=current_user.id,
+        )
+        db.refresh(range_obj)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to start range {range_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start range: {str(e)}",
+        ) from e
+
+    return range_obj
+
+
+@router.post("/{range_id}/stop", response_model=RangeResponse)
+def stop_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Stop all VMs and router in a running range.
+
+    This stops all containers but preserves networks for quick restart.
+    Use teardown to fully clean up resources.
+
+    For DinD-based deployments:
+    - Gets Docker client connected to inner Docker daemon
+    - Stops all VM containers inside the DinD container
+    - Stops VyOS router container inside DinD
+    - Does NOT stop the DinD container itself (preserves for restart)
+    """
+
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    if range_obj.status != RangeStatus.RUNNING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot stop range in {range_obj.status} status",
+        )
+
+    try:
+        docker = get_docker_service()
+        get_dind_service()
+
+        # Check if this is a DinD-based deployment
+        if range_obj.dind_container_id and range_obj.dind_docker_url:
+            # DinD-based deployment: operate on containers inside DinD
+            logger.info(f"Stopping DinD-based range {range_id}")
+
+            # Get Docker client for the inner Docker daemon
+            range_client = docker.get_range_client_sync(str(range_id), range_obj.dind_docker_url)
+
+            # Step 1: Stop all VM containers inside DinD
+            vms = db.query(VM).filter(VM.range_id == range_id).all()
+            for vm in vms:
+                if vm.container_id:
+                    try:
+                        container = range_client.containers.get(vm.container_id)
+                        container.stop(timeout=30)
+                        vm.status = VMStatus.STOPPED
+                        db.commit()
+                        logger.info(f"Stopped VM {vm.hostname} inside DinD")
+                    except Exception as e:
+                        logger.warning(f"Failed to stop VM {vm.hostname}: {e}")
+
+            # Step 2: Stop VyOS router container inside DinD
+            range_router = db.query(RangeRouter).filter(RangeRouter.range_id == range_id).first()
+            if range_router and range_router.container_id:
+                try:
+                    container = range_client.containers.get(range_router.container_id)
+                    container.stop(timeout=30)
+                    range_router.status = RouterStatus.STOPPED
+                    db.commit()
+                    logger.info(f"Stopped VyOS router for range {range_id} inside DinD")
+                except Exception as e:
+                    logger.warning(f"Failed to stop VyOS router: {e}")
+
+            # Note: We do NOT stop the DinD container itself - this allows quick restart
+
+        else:
+            # Legacy non-DinD deployment (fallback)
+            logger.info(f"Stopping legacy (non-DinD) range {range_id}")
+            vyos = get_vyos_service()
+
+            # Step 1: Stop all VM containers
+            vms = db.query(VM).filter(VM.range_id == range_id).all()
+            for vm in vms:
+                if vm.container_id:
+                    docker.stop_container(vm.container_id)
+                    vm.status = VMStatus.STOPPED
+                    db.commit()
+                    logger.info(f"Stopped VM {vm.hostname}")
+
+            # Step 2: Stop the router container
+            range_router = db.query(RangeRouter).filter(RangeRouter.range_id == range_id).first()
+            if range_router and range_router.container_id:
+                try:
+                    vyos.stop_router(range_router.container_id)
+                    range_router.status = RouterStatus.STOPPED
+                    db.commit()
+                    logger.info(f"Stopped VyOS router for range {range_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to stop VyOS router: {e}")
+
+        range_obj.status = RangeStatus.STOPPED
+        # Set lifecycle timestamp
+        from datetime import timezone
+
+        range_obj.stopped_at = datetime.now(timezone.utc)
+        db.commit()
+
+        # Log the stop event
+        event_service = EventService(db)
+        event_service.log_event(
+            range_id=range_id,
+            event_type=EventType.RANGE_STOPPED,
+            message=f"Range '{range_obj.name}' stopped",
+            user_id=current_user.id,
+        )
+        db.refresh(range_obj)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to stop range {range_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to stop range: {str(e)}",
+        ) from e
+
+    return range_obj
+
+
+@router.post("/{range_id}/teardown", response_model=RangeResponse)
+def teardown_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Tear down a range - destroy all VMs and networks"""
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    if range_obj.status == RangeStatus.DEPLOYING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot teardown range while deploying",
+        )
+
+    try:
+        docker = get_docker_service()
+        dind = get_dind_service()
+
+        # Check if this is a DinD-deployed range
+        if range_obj.dind_docker_url:
+            logger.info(f"Tearing down DinD range {range_id}")
+
+            # Delete the DinD container (removes all VMs and networks inside it)
+            try:
+                asyncio.run(
+                    dind.delete_range_container(
+                        str(range_id), volume_name=range_obj.dind_volume_name
+                    )
+                )
+                logger.info(f"Deleted DinD container for range {range_id}")
+                try:
+                    from proving_ground.tasks.pool import enqueue_pool_refill
+
+                    enqueue_pool_refill()
+                except Exception as refill_err:
+                    logger.warning(f"Could not enqueue pool refill: {refill_err}")
+            except Exception as e:
+                logger.warning(f"Failed to delete DinD container: {e}")
+
+            # Clear DinD references
+            range_obj.dind_container_id = None
+            range_obj.dind_docker_url = None
+            range_obj.dind_volume_name = None
+
+            # Reset all VM statuses and container IDs
+            vms = db.query(VM).filter(VM.range_id == range_id).all()
+            for vm in vms:
+                vm.container_id = None
+                vm.status = VMStatus.PENDING
+            db.commit()
+
+            # Reset all network docker_network_ids
+            networks = db.query(Network).filter(Network.range_id == range_id).all()
+            for network in networks:
+                network.docker_network_id = None
+                network.vyos_interface = None
+            db.commit()
+
+        else:
+            # Legacy non-DinD deployment (fallback)
+            logger.info(f"Tearing down legacy (non-DinD) range {range_id}")
+            vyos = get_vyos_service()
+
+            # Step 1: Remove all VM containers
+            vms = db.query(VM).filter(VM.range_id == range_id).all()
+            for vm in vms:
+                if vm.container_id:
+                    docker.remove_container(vm.container_id, force=True)
+                    vm.container_id = None
+                    vm.status = VMStatus.PENDING
+                    db.commit()
+
+            # Step 2: Remove VyOS router
+            range_router = db.query(RangeRouter).filter(RangeRouter.range_id == range_id).first()
+            if range_router and range_router.container_id:
+                try:
+                    vyos.remove_router(range_router.container_id)
+                    logger.info(f"Removed VyOS router for range {range_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove VyOS router: {e}")
+                range_router.container_id = None
+                range_router.status = RouterStatus.PENDING
+                db.commit()
+
+            # Step 3: Remove all Docker networks and reset VyOS interface assignments
+            networks = db.query(Network).filter(Network.range_id == range_id).all()
+            for network in networks:
+                if network.docker_network_id:
+                    docker.delete_network(network.docker_network_id)
+                    network.docker_network_id = None
+                    network.vyos_interface = None
+                    db.commit()
+
+        range_obj.status = RangeStatus.DRAFT
+        db.commit()
+        db.refresh(range_obj)
+
+    except Exception as e:
+        logger.error(f"Failed to teardown range {range_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to teardown range: {str(e)}",
+        ) from e
+
+    return range_obj
+
+
+@router.get("/{range_id}/export", response_model=RangeTemplateExport, deprecated=True)
+def export_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """
+    Export a range as a reusable template.
+
+    DEPRECATED: Use POST /blueprints to save as blueprint, then GET /blueprints/{id}/export.
+    This endpoint will be removed in a future version.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    # Get networks
+    networks = db.query(Network).filter(Network.range_id == range_id).all()
+    network_data = [
+        NetworkTemplateData(
+            name=n.name,
+            subnet=n.subnet,
+            gateway=n.gateway,
+            is_isolated=n.is_isolated,
+        )
+        for n in networks
+    ]
+
+    # Build network name lookup
+    network_lookup = {n.id: n.name for n in networks}
+
+    # Get VMs with their image sources
+    vms = db.query(VM).filter(VM.range_id == range_id).all()
+    vm_data = []
+    for vm in vms:
+        vm_data.append(
+            VMTemplateData(
+                hostname=vm.hostname,
+                ip_address=vm.ip_address,
+                network_name=network_lookup.get(vm.network_id, "unknown"),
+                base_image_id=str(vm.base_image_id) if vm.base_image_id else None,
+                golden_image_id=str(vm.golden_image_id) if vm.golden_image_id else None,
+                snapshot_id=str(vm.snapshot_id) if vm.snapshot_id else None,
+                cpu=vm.cpu,
+                ram_mb=vm.ram_mb,
+                disk_gb=vm.disk_gb,
+                position_x=vm.position_x,
+                position_y=vm.position_y,
+            )
+        )
+
+    return RangeTemplateExport(
+        version="1.0",
+        name=range_obj.name,
+        description=range_obj.description,
+        networks=network_data,
+        vms=vm_data,
+    )
+
+
+@router.post(
+    "/import",
+    response_model=RangeDetailResponse,
+    status_code=status.HTTP_201_CREATED,
+    deprecated=True,
+)
+def import_range(
+    import_data: RangeTemplateImport,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """
+    Import a range from a template.
+
+    DEPRECATED: Use POST /blueprints/import instead.
+    This endpoint will be removed in a future version.
+    """
+    template = import_data.template
+    range_name = import_data.name_override or template.name
+
+    # Create range
+    range_obj = Range(
+        name=range_name,
+        description=template.description,
+        created_by=current_user.id,
+    )
+    db.add(range_obj)
+    db.commit()
+    db.refresh(range_obj)
+
+    # Create networks and build lookup
+    network_lookup = {}
+    for net_data in template.networks:
+        network = Network(
+            range_id=range_obj.id,
+            name=net_data.name,
+            subnet=net_data.subnet,
+            gateway=net_data.gateway,
+            is_isolated=net_data.is_isolated,
+        )
+        db.add(network)
+        db.commit()
+        db.refresh(network)
+        network_lookup[net_data.name] = network.id
+
+    # Create VMs
+    for vm_data in template.vms:
+        # Find network by name
+        network_id = network_lookup.get(vm_data.network_name)
+        if not network_id:
+            logger.warning(
+                f"Network '{vm_data.network_name}' not found for VM '{vm_data.hostname}'"
+            )
+            continue
+
+        # Determine image source (base_image_id, golden_image_id, or snapshot_id)
+        base_image_id = UUID(vm_data.base_image_id) if vm_data.base_image_id else None
+        golden_image_id = UUID(vm_data.golden_image_id) if vm_data.golden_image_id else None
+        snapshot_id = UUID(vm_data.snapshot_id) if vm_data.snapshot_id else None
+
+        # Validate at least one image source exists
+        if not any([base_image_id, golden_image_id, snapshot_id]):
+            logger.warning(
+                f"VM '{vm_data.hostname}' has no image source (base_image_id, golden_image_id, or snapshot_id)"
+            )
+            continue
+
+        vm = VM(
+            range_id=range_obj.id,
+            network_id=network_id,
+            base_image_id=base_image_id,
+            golden_image_id=golden_image_id,
+            snapshot_id=snapshot_id,
+            hostname=vm_data.hostname,
+            ip_address=vm_data.ip_address,
+            cpu=vm_data.cpu,
+            ram_mb=vm_data.ram_mb,
+            disk_gb=vm_data.disk_gb,
+            position_x=vm_data.position_x,
+            position_y=vm_data.position_y,
+        )
+        db.add(vm)
+        db.commit()
+
+    db.refresh(range_obj)
+    return range_obj
+
+
+@router.post(
+    "/{range_id}/clone", response_model=RangeDetailResponse, status_code=status.HTTP_201_CREATED
+)
+def clone_range(
+    range_id: UUID,
+    db: DBSession,
+    current_user: CurrentUser,
+    new_name: str = None,
+):
+    """Clone a range with all its networks and VMs."""
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+
+    # Create cloned range
+    cloned_range = Range(
+        name=new_name or f"{range_obj.name} (Copy)",
+        description=range_obj.description,
+        created_by=current_user.id,
+    )
+    db.add(cloned_range)
+    db.commit()
+    db.refresh(cloned_range)
+
+    # Clone networks and build ID mapping
+    old_to_new_network = {}
+    networks = db.query(Network).filter(Network.range_id == range_id).all()
+    for network in networks:
+        cloned_network = Network(
+            range_id=cloned_range.id,
+            name=network.name,
+            subnet=network.subnet,
+            gateway=network.gateway,
+            is_isolated=network.is_isolated,
+        )
+        db.add(cloned_network)
+        db.commit()
+        db.refresh(cloned_network)
+        old_to_new_network[network.id] = cloned_network.id
+
+    # Clone VMs
+    vms = db.query(VM).filter(VM.range_id == range_id).all()
+    for vm in vms:
+        cloned_vm = VM(
+            range_id=cloned_range.id,
+            network_id=old_to_new_network.get(vm.network_id),
+            base_image_id=vm.base_image_id,
+            golden_image_id=vm.golden_image_id,
+            snapshot_id=vm.snapshot_id,
+            hostname=vm.hostname,
+            ip_address=vm.ip_address,
+            cpu=vm.cpu,
+            ram_mb=vm.ram_mb,
+            disk_gb=vm.disk_gb,
+            position_x=vm.position_x,
+            position_y=vm.position_y,
+        )
+        db.add(cloned_vm)
+        db.commit()
+
+    db.refresh(cloned_range)
+    return cloned_range
+
+
+@router.post("/{range_id}/scenario", response_model=ApplyScenarioResponse)
+def apply_scenario(
+    range_id: UUID,
+    request: ApplyScenarioRequest,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """Apply a training scenario to a range, generating MSEL and injects."""
+    # Get range
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    # Get scenario from filesystem
+    scenario = get_scenario(str(request.scenario_id))
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+
+    # Validate role mapping - all required roles must be mapped
+    missing_roles = set(scenario.required_roles) - set(request.role_mapping.keys())
+    if missing_roles:
+        raise HTTPException(
+            status_code=400, detail=f"Missing role mappings: {', '.join(missing_roles)}"
+        )
+
+    # Validate VM IDs exist in this range
+    vm_ids = set(request.role_mapping.values())
+    existing_vms = (
+        db.query(VM).filter(VM.range_id == range_id, VM.id.in_([UUID(vid) for vid in vm_ids])).all()
+    )
+    existing_vm_ids = {str(vm.id) for vm in existing_vms}
+    invalid_vms = vm_ids - existing_vm_ids
+    if invalid_vms:
+        raise HTTPException(status_code=400, detail=f"Invalid VM IDs: {', '.join(invalid_vms)}")
+
+    # Delete existing MSEL if any
+    existing_msel = db.query(MSEL).filter(MSEL.range_id == range_id).first()
+    if existing_msel:
+        db.delete(existing_msel)
+        db.flush()
+
+    # Create MSEL content from scenario
+    msel_content = f"# {scenario.name}\n\n{scenario.description}\n\n"
+    msel_content += "## Events\n\n"
+    for event in scenario.events:
+        msel_content += f"### T+{event['delay_minutes']}min: {event['title']}\n"
+        msel_content += f"{event.get('description', '')}\n\n"
+
+    # Create MSEL
+    msel = MSEL(
+        range_id=range_id,
+        name=f"Scenario: {scenario.name}",
+        content=msel_content,
+    )
+    db.add(msel)
+    db.flush()
+
+    # Create Injects from scenario events
+    inject_count = 0
+    for event in scenario.events:
+        # Map target_role to actual VM ID
+        target_role = event.get("target_role", "")
+        target_vm_id = request.role_mapping.get(target_role)
+
+        inject = Inject(
+            msel_id=msel.id,
+            sequence_number=event["sequence"],
+            inject_time_minutes=event["delay_minutes"],
+            title=event["title"],
+            description=event.get("description"),
+            target_vm_ids=[target_vm_id] if target_vm_id else [],
+            actions=event.get("actions", []),
+            status=InjectStatus.PENDING,
+        )
+        db.add(inject)
+        inject_count += 1
+
+    db.commit()
+
+    return ApplyScenarioResponse(msel_id=msel.id, inject_count=inject_count, status="applied")
+
+
+# ============================================================================
+# Comprehensive Export/Import Endpoints (v2.0)
+# ============================================================================
+
+from pathlib import Path
+from fastapi import UploadFile, File, BackgroundTasks
+from fastapi.responses import FileResponse
+import tempfile
+import redis
+
+from proving_ground.schemas.export import (
+    ExportRequest,
+    ExportJobStatus,
+    ImportValidationResult,
+    ImportOptions,
+    ImportResult,
+)
+
+
+def get_redis_client():
+    """Get Redis client for job status tracking."""
+    settings = get_settings()
+    return redis.from_url(settings.redis_url)
+
+
+@router.post("/{range_id}/export/full", deprecated=True)
+def export_range_full(
+    range_id: UUID,
+    options: ExportRequest,
+    background_tasks: BackgroundTasks,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """
+    Export range with full configuration (all VM settings, templates, MSEL, artifacts).
+
+    DEPRECATED: Use POST /blueprints to save as blueprint, then GET /blueprints/{id}/export.
+    This endpoint will be removed in a future version.
+
+    For online exports (include_docker_images=False): Returns file directly.
+    For offline exports (include_docker_images=True): Starts background job and returns job ID.
+    """
+    from proving_ground.services.export_service import get_export_service
+
+    # Verify range exists and user has access
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+
+    export_service = get_export_service()
+
+    if options.include_docker_images:
+        # Offline export - run as background task
+        import uuid
+
+        job_id = str(uuid.uuid4())
+
+        # Store initial job status in Redis
+        redis_client = get_redis_client()
+        job_status = ExportJobStatus(
+            job_id=job_id,
+            status="pending",
+            progress_percent=0,
+            current_step="Initializing...",
+            created_at=datetime.utcnow(),
+        )
+        redis_client.setex(
+            f"export_job:{job_id}", 3600 * 24, job_status.model_dump_json()  # 24 hour TTL
+        )
+
+        # Schedule background task
+        background_tasks.add_task(
+            _run_offline_export,
+            range_id=range_id,
+            job_id=job_id,
+            options=options,
+            user_id=current_user.id,
+        )
+
+        return job_status
+
+    else:
+        # Online export - return file directly
+        try:
+            archive_path, filename = export_service.export_range_online(
+                range_id=range_id,
+                options=options,
+                user=current_user,
+                db=db,
+            )
+            return FileResponse(
+                path=str(archive_path),
+                filename=filename,
+                media_type="application/zip",
+                background=BackgroundTasks(),  # Cleanup after response
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        except Exception as e:
+            logger.exception("Export failed")
+            raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}") from e
+
+
+def _run_offline_export(range_id: UUID, job_id: str, options: ExportRequest, user_id: UUID):
+    """Background task for offline export with Docker images."""
+    from proving_ground.services.export_service import get_export_service
+    from proving_ground.database import get_session_local
+
+    redis_client = get_redis_client()
+
+    def update_progress(percent: int, step: str):
+        job_data = redis_client.get(f"export_job:{job_id}")
+        if job_data:
+            job_status = ExportJobStatus.model_validate_json(job_data)
+            job_status.status = "in_progress"
+            job_status.progress_percent = percent
+            job_status.current_step = step
+            redis_client.setex(f"export_job:{job_id}", 3600 * 24, job_status.model_dump_json())
+
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise ValueError("User not found")
+
+        export_service = get_export_service()
+        archive_path, filename = export_service.export_range_offline(
+            range_id=range_id,
+            options=options,
+            user=user,
+            db=db,
+            progress_callback=update_progress,
+        )
+
+        # Update job with download info
+        file_size = os.path.getsize(archive_path)
+        job_status = ExportJobStatus(
+            job_id=job_id,
+            status="completed",
+            progress_percent=100,
+            current_step="Export complete",
+            download_url=f"/ranges/export/jobs/{job_id}/download",
+            file_size_bytes=file_size,
+            created_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+        # Store the archive path for download
+        redis_client.setex(f"export_job:{job_id}:path", 3600 * 24, str(archive_path))
+        redis_client.setex(f"export_job:{job_id}:filename", 3600 * 24, filename)
+        redis_client.setex(f"export_job:{job_id}", 3600 * 24, job_status.model_dump_json())
+
+    except Exception as e:
+        logger.exception(f"Offline export failed for job {job_id}")
+        job_status = ExportJobStatus(
+            job_id=job_id,
+            status="failed",
+            progress_percent=0,
+            current_step="Export failed",
+            error_message=str(e),
+            created_at=datetime.utcnow(),
+        )
+        redis_client.setex(f"export_job:{job_id}", 3600 * 24, job_status.model_dump_json())
+    finally:
+        db.close()
+
+
+@router.get("/export/jobs/{job_id}", response_model=ExportJobStatus, deprecated=True)
+def get_export_job_status(job_id: str, current_user: CurrentUser):
+    """
+    Get status of a background export job.
+
+    DEPRECATED: Range export endpoints are deprecated. Use blueprint export instead.
+    """
+    redis_client = get_redis_client()
+    job_data = redis_client.get(f"export_job:{job_id}")
+
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Export job not found")
+
+    return ExportJobStatus.model_validate_json(job_data)
+
+
+@router.get("/export/jobs/{job_id}/download", deprecated=True)
+def download_export(
+    job_id: str,
+    token: str = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Download a completed export archive.
+
+    DEPRECATED: Range export endpoints are deprecated. Use blueprint export instead.
+
+    Uses query param token for direct browser downloads of large files.
+    This avoids loading multi-GB files into memory as blobs.
+    """
+    from proving_ground.utils.security import decode_access_token
+    from proving_ground.models.user import User
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Token required for download")
+
+    user_id = decode_access_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    current_user = db.query(User).filter(User.id == user_id).first()
+    if not current_user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    redis_client = get_redis_client()
+
+    # Check job status
+    job_data = redis_client.get(f"export_job:{job_id}")
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Export job not found")
+
+    job_status = ExportJobStatus.model_validate_json(job_data)
+    if job_status.status != "completed":
+        raise HTTPException(
+            status_code=400, detail=f"Export not ready. Status: {job_status.status}"
+        )
+
+    # Get archive path
+    archive_path = redis_client.get(f"export_job:{job_id}:path")
+    filename = redis_client.get(f"export_job:{job_id}:filename")
+
+    if not archive_path or not filename:
+        raise HTTPException(status_code=404, detail="Export file not found")
+
+    archive_path = archive_path.decode() if isinstance(archive_path, bytes) else archive_path
+    filename = filename.decode() if isinstance(filename, bytes) else filename
+
+    if not os.path.exists(archive_path):
+        raise HTTPException(status_code=404, detail="Export file has been deleted")
+
+    return FileResponse(
+        path=archive_path,
+        filename=filename,
+        media_type="application/gzip",
+    )
+
+
+@router.post("/import/validate", response_model=ImportValidationResult, deprecated=True)
+async def validate_import(
+    file: UploadFile = File(...),
+    db: DBSession = None,
+    current_user: CurrentUser = None,
+):
+    """
+    Validate an import archive and preview conflicts.
+
+    DEPRECATED: Use POST /blueprints/import/validate instead.
+    This endpoint will be removed in a future version.
+
+    Upload a .zip or .tar.gz export archive to validate before importing.
+    Returns validation results including any conflicts with existing templates or networks.
+    """
+    from proving_ground.services.export_service import get_export_service
+
+    # Save uploaded file to temp location
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file.filename)
+    try:
+        content = await file.read()
+        temp_file.write(content)
+        temp_file.close()
+
+        export_service = get_export_service()
+        result = export_service.validate_import(Path(temp_file.name), db)
+        return result
+
+    finally:
+        # Cleanup temp file
+        if os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
+
+
+@router.post("/import/execute", response_model=ImportResult, deprecated=True)
+async def execute_import(
+    file: UploadFile = File(...),
+    name_override: str = None,
+    template_conflict_action: str = "use_existing",
+    skip_artifacts: bool = False,
+    skip_msel: bool = False,
+    skip_walkthrough: bool = False,
+    db: DBSession = None,
+    current_user: CurrentUser = None,
+):
+    """
+    Execute a range import from an archive.
+
+    DEPRECATED: Use POST /blueprints/import instead.
+    This endpoint will be removed in a future version.
+
+    Upload a .zip or .tar.gz export archive to import.
+
+    Options:
+    - name_override: Override the range name (required if name conflicts)
+    - template_conflict_action: "use_existing", "create_new", or "skip"
+    - skip_artifacts: Don't import artifacts
+    - skip_msel: Don't import MSEL/injects
+    - skip_walkthrough: Don't import Content Library student guide
+    """
+    from proving_ground.services.export_service import get_export_service
+
+    # Save uploaded file to temp location
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file.filename)
+    try:
+        content = await file.read()
+        temp_file.write(content)
+        temp_file.close()
+
+        options = ImportOptions(
+            name_override=name_override,
+            template_conflict_action=template_conflict_action,
+            skip_artifacts=skip_artifacts,
+            skip_msel=skip_msel,
+            skip_walkthrough=skip_walkthrough,
+        )
+
+        export_service = get_export_service()
+        result = export_service.import_range(
+            archive_path=Path(temp_file.name),
+            options=options,
+            user=current_user,
+            db=db,
+        )
+        return result
+
+    finally:
+        # Cleanup temp file
+        if os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
+
+
+@router.post("/import/load-images", deprecated=True)
+async def load_docker_images(
+    file: UploadFile = File(...),
+    current_user: CurrentUser = None,
+):
+    """
+    Load Docker images from an offline export archive.
+
+    DEPRECATED: Use POST /blueprints/import/load-images instead.
+    This endpoint will be removed in a future version.
+
+    Use this endpoint to pre-load Docker images before importing a range
+    on an air-gapped system.
+    """
+    from proving_ground.services.export_service import get_export_service
+
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Save uploaded file to temp location
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file.filename)
+    try:
+        content = await file.read()
+        temp_file.write(content)
+        temp_file.close()
+
+        export_service = get_export_service()
+        loaded_images = export_service.load_docker_images(Path(temp_file.name))
+
+        return {
+            "success": True,
+            "images_loaded": loaded_images,
+            "count": len(loaded_images),
+        }
+
+    except Exception as e:
+        logger.exception("Failed to load Docker images")
+        raise HTTPException(status_code=500, detail=f"Failed to load images: {str(e)}") from e
+
+    finally:
+        # Cleanup temp file
+        if os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
+
+
+# ============================================================================
+# Resource Tag Endpoints (ABAC Visibility Control)
+# ============================================================================
+
+
+@router.get("/{range_id}/tags", response_model=ResourceTagsResponse)
+def get_range_tags(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Get visibility tags for a range."""
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    # Check access
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+
+    tags = (
+        db.query(ResourceTag.tag)
+        .filter(ResourceTag.resource_type == "range", ResourceTag.resource_id == range_id)
+        .all()
+    )
+
+    return ResourceTagsResponse(
+        resource_type="range", resource_id=range_id, tags=[t[0] for t in tags]
+    )
+
+
+@router.post("/{range_id}/tags", status_code=status.HTTP_201_CREATED)
+def add_range_tag(
+    range_id: UUID, tag_data: ResourceTagCreate, db: DBSession, current_user: CurrentUser
+):
+    """
+    Add a visibility tag to a range.
+    Only the owner or an admin can add tags.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    # Only owner or admin can add tags
+    if range_obj.created_by != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only the owner or admin can add tags")
+
+    # Check if tag already exists
+    existing = (
+        db.query(ResourceTag)
+        .filter(
+            ResourceTag.resource_type == "range",
+            ResourceTag.resource_id == range_id,
+            ResourceTag.tag == tag_data.tag,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Tag already exists on this range")
+
+    tag = ResourceTag(resource_type="range", resource_id=range_id, tag=tag_data.tag)
+    db.add(tag)
+    db.commit()
+
+    return {"message": f"Tag '{tag_data.tag}' added to range"}
+
+
+@router.delete("/{range_id}/tags/{tag}")
+def remove_range_tag(range_id: UUID, tag: str, db: DBSession, current_user: CurrentUser):
+    """
+    Remove a visibility tag from a range.
+    Only the owner or an admin can remove tags.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    # Only owner or admin can remove tags
+    if range_obj.created_by != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only the owner or admin can remove tags")
+
+    tag_obj = (
+        db.query(ResourceTag)
+        .filter(
+            ResourceTag.resource_type == "range",
+            ResourceTag.resource_id == range_id,
+            ResourceTag.tag == tag,
+        )
+        .first()
+    )
+    if not tag_obj:
+        raise HTTPException(status_code=404, detail="Tag not found on this range")
+
+    db.delete(tag_obj)
+    db.commit()
+
+    return {"message": f"Tag '{tag}' removed from range"}
+
+
+# ============================================================================
+# Range Console - DinD Quick Actions
+# ============================================================================
+
+
+class RangeConsoleContainer(BaseModel):
+    """Container info from DinD."""
+
+    id: str
+    name: str
+    status: str
+    image: str
+    created: str
+
+
+class RangeConsoleNetwork(BaseModel):
+    """Network info from DinD."""
+
+    id: str
+    name: str
+    driver: str
+    scope: str
+
+
+class RangeConsoleStats(BaseModel):
+    """Resource stats from DinD."""
+
+    container_count: int
+    network_count: int
+    cpu_percent: Optional[float] = None
+    memory_mb: Optional[float] = None
+
+
+@router.get("/{range_id}/console/containers", response_model=List[RangeConsoleContainer])
+def get_range_containers(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """
+    List all containers in the range's DinD environment.
+    Equivalent to 'docker ps -a' inside the DinD container.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    if not range_obj.dind_container_id or not range_obj.dind_docker_url:
+        raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
+
+    from proving_ground.services.dind_service import get_dind_service
+
+    dind_service = get_dind_service()
+
+    try:
+        range_client = dind_service.get_range_client(str(range_id), range_obj.dind_docker_url)
+        containers = range_client.containers.list(all=True)
+
+        return [
+            RangeConsoleContainer(
+                id=c.short_id,
+                name=c.name,
+                status=c.status,
+                image=c.image.tags[0] if c.image.tags else c.image.short_id,
+                created=c.attrs.get("Created", "")[:19],
+            )
+            for c in containers
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list containers: {e}") from e
+
+
+@router.get("/{range_id}/console/networks", response_model=List[RangeConsoleNetwork])
+def get_range_networks(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """
+    List all networks in the range's DinD environment.
+    Equivalent to 'docker network ls' inside the DinD container.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    if not range_obj.dind_container_id or not range_obj.dind_docker_url:
+        raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
+
+    from proving_ground.services.dind_service import get_dind_service
+
+    dind_service = get_dind_service()
+
+    try:
+        range_client = dind_service.get_range_client(str(range_id), range_obj.dind_docker_url)
+        networks = range_client.networks.list()
+
+        return [
+            RangeConsoleNetwork(
+                id=n.short_id,
+                name=n.name,
+                driver=n.attrs.get("Driver", ""),
+                scope=n.attrs.get("Scope", ""),
+            )
+            for n in networks
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list networks: {e}") from e
+
+
+@router.get("/{range_id}/console/container/{container_id}/logs")
+def get_container_logs(
+    range_id: UUID,
+    container_id: str,
+    db: DBSession,
+    current_user: CurrentUser,
+    tail: int = Query(100, ge=1, le=10000),
+):
+    """
+    Get logs from a container in the range's DinD environment.
+    Equivalent to 'docker logs --tail N <container>' inside DinD.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    if not range_obj.dind_container_id or not range_obj.dind_docker_url:
+        raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
+
+    from proving_ground.services.dind_service import get_dind_service
+
+    dind_service = get_dind_service()
+
+    try:
+        range_client = dind_service.get_range_client(str(range_id), range_obj.dind_docker_url)
+        container = range_client.containers.get(container_id)
+        logs = container.logs(tail=tail, timestamps=True).decode("utf-8", errors="replace")
+
+        return {"container_id": container_id, "logs": logs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get container logs: {e}") from e
+
+
+@router.get("/{range_id}/console/stats", response_model=RangeConsoleStats)
+def get_range_stats(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """
+    Get resource statistics for the range's DinD environment.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    if not range_obj.dind_container_id or not range_obj.dind_docker_url:
+        raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
+
+    from proving_ground.services.dind_service import get_dind_service
+
+    dind_service = get_dind_service()
+
+    try:
+        range_client = dind_service.get_range_client(str(range_id), range_obj.dind_docker_url)
+        containers = range_client.containers.list(all=True)
+        networks = range_client.networks.list()
+
+        return RangeConsoleStats(
+            container_count=len(containers),
+            network_count=len(networks),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {e}") from e
+
+
+@router.get("/{range_id}/console/iptables")
+def get_range_iptables(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """
+    Get iptables rules from the DinD container.
+    Shows network isolation (FORWARD chain) and NAT rules.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    if not range_obj.dind_container_id:
+        raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
+
+    from proving_ground.services.docker_service import get_docker_service
+
+    docker_service = get_docker_service()
+
+    try:
+        dind_container = docker_service.client.containers.get(range_obj.dind_container_id)
+
+        # Get FORWARD chain (network isolation)
+        forward_result = dind_container.exec_run("iptables -L FORWARD -n -v", privileged=True)
+        forward_output = forward_result.output.decode("utf-8", errors="replace")
+
+        # Get NAT POSTROUTING chain (outbound NAT/masquerade)
+        nat_result = dind_container.exec_run(
+            "iptables -t nat -L POSTROUTING -n -v", privileged=True
+        )
+        nat_output = nat_result.output.decode("utf-8", errors="replace")
+
+        # Parse and format the output
+        formatted_output = _format_network_isolation(forward_output, nat_output)
+
+        return {
+            "iptables_nat": formatted_output,
+            "forward_rules_raw": forward_output,
+            "nat_rules_raw": nat_output,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get iptables rules: {e}") from e
+
+
+def _format_network_isolation(forward_output: str, nat_output: str) -> str:
+    """Format iptables output into a readable network isolation summary."""
+    lines = []
+    lines.append("Network Isolation (iptables)")
+    lines.append("=" * 50)
+    lines.append("")
+
+    # Parse FORWARD chain
+    lines.append("FORWARD Chain:")
+    forward_lines = forward_output.strip().split("\n")
+    policy = "DROP"
+    for line in forward_lines:
+        if "policy" in line.lower():
+            if "ACCEPT" in line:
+                policy = "ACCEPT"
+            elif "DROP" in line:
+                policy = "DROP"
+            lines.append(f"  Policy: {policy}")
+        elif "ACCEPT" in line and ("ESTABLISHED" in line or "RELATED" in line):
+            lines.append("  ✓ ACCEPT established/related connections")
+        elif "ACCEPT" in line and "br-" in line:
+            # Extract bridge interfaces
+            parts = line.split()
+            in_iface = ""
+            out_iface = ""
+            for _i, p in enumerate(parts):
+                if p.startswith("br-"):
+                    if not in_iface:
+                        in_iface = p
+                    else:
+                        out_iface = p
+            if in_iface and out_iface:
+                if in_iface == out_iface:
+                    lines.append(f"  ✓ {in_iface} ↔ {in_iface} (internal traffic)")
+                else:
+                    lines.append(f"  ✓ {in_iface} → {out_iface}")
+            elif in_iface:
+                lines.append(f"  ✓ {in_iface} → eth0 (internet access)")
+
+    lines.append("")
+    lines.append("NAT POSTROUTING:")
+    nat_lines = nat_output.strip().split("\n")
+    has_masq = False
+    for line in nat_lines:
+        if "MASQUERADE" in line:
+            has_masq = True
+            lines.append("  ✓ MASQUERADE on eth0 (outbound NAT)")
+    if not has_masq:
+        lines.append("  (no NAT rules)")
+
+    # Use \r\n for terminal compatibility
+    return "\r\n".join(lines)
+
+
+@router.get("/{range_id}/console/port-forwarding")
+def get_range_port_forwarding(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """
+    Get socat port forwarding configuration from the DinD container.
+    Shows VNC proxy mappings for each VM.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    if not range_obj.dind_container_id:
+        raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
+
+    from proving_ground.services.docker_service import get_docker_service
+
+    docker_service = get_docker_service()
+
+    try:
+        dind_container = docker_service.client.containers.get(range_obj.dind_container_id)
+
+        # Get socat processes
+        result = dind_container.exec_run(
+            "sh -c 'ps 2>/dev/null | grep socat | grep -v grep'", privileged=True
+        )
+        raw_output = result.output.decode("utf-8", errors="replace")
+
+        # Parse socat processes into structured data
+        proxies = _parse_socat_processes(raw_output)
+
+        # Get VM info to enrich the output
+        vm_map = {vm.ip_address: vm.hostname for vm in range_obj.vms if vm.ip_address}
+
+        # Format output
+        formatted_output = _format_port_forwarding(proxies, vm_map)
+
+        return {
+            "port_forwarding": formatted_output,
+            "proxies": proxies,
+            "proxy_count": len(proxies),
+            "raw_output": raw_output,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get port forwarding: {e}") from e
+
+
+def _parse_socat_processes(raw_output: str) -> list:
+    """Parse ps aux output for socat processes into structured data.
+
+    Handles both standard Linux ps aux (PID in column 2) and
+    BusyBox/Alpine ps aux (PID in column 1).
+    """
+    import re
+
+    proxies = []
+
+    for line in raw_output.strip().split("\n"):
+        if not line.strip() or "socat" not in line.lower():
+            continue
+        # Skip header line and grep itself
+        if line.startswith("PID") or "grep" in line:
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        # Try to find PID - check first few columns for a number
+        pid = None
+        for part in parts[:3]:
+            if part.isdigit():
+                pid = part
+                break
+
+        # Extract TCP-LISTEN port
+        listen_match = re.search(r"TCP-LISTEN:(\d+)", line)
+        external_port = int(listen_match.group(1)) if listen_match else None
+
+        # Extract target TCP address
+        target_match = re.search(r"TCP:([0-9.]+):(\d+)", line)
+        if target_match:
+            vm_ip = target_match.group(1)
+            vnc_port = int(target_match.group(2))
+        else:
+            vm_ip = None
+            vnc_port = None
+
+        if external_port and vm_ip:
+            proxies.append(
+                {
+                    "pid": pid,
+                    "external_port": external_port,
+                    "vm_ip": vm_ip,
+                    "vnc_port": vnc_port,
+                    "status": "running",
+                }
+            )
+
+    return proxies
+
+
+def _format_port_forwarding(proxies: list, vm_map: dict) -> str:
+    """Format socat proxy list into readable output."""
+    lines = []
+    lines.append("Port Forwarding (Socat Proxies)")
+    lines.append("=" * 50)
+    lines.append("")
+
+    if not proxies:
+        lines.append("No active port forwarding proxies.")
+        lines.append("")
+        lines.append("VNC proxies are created when VMs start.")
+        lines.append("Try repairing VNC if VMs are running but no proxies exist.")
+        # Use \r\n for terminal compatibility
+        return "\r\n".join(lines)
+
+    for proxy in proxies:
+        vm_ip = proxy.get("vm_ip", "unknown")
+        hostname = vm_map.get(vm_ip, "unknown")
+        external_port = proxy.get("external_port", "?")
+        vnc_port = proxy.get("vnc_port", "?")
+        pid = proxy.get("pid", "?")
+
+        lines.append(f"VM: {hostname} ({vm_ip})")
+        lines.append(f"  └─ VNC :{vnc_port} → External :{external_port} [PID {pid}]")
+        lines.append("")
+
+    lines.append(f"Active Proxies: {len(proxies)}")
+
+    # Use \r\n for terminal compatibility
+    return "\r\n".join(lines)
+
+
+@router.get("/{range_id}/console/routes")
+def get_range_routes(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """
+    Get IP routing table from the DinD container.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    if not range_obj.dind_container_id:
+        raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
+
+    from proving_ground.services.docker_service import get_docker_service
+
+    docker_service = get_docker_service()
+
+    try:
+        dind_container = docker_service.client.containers.get(range_obj.dind_container_id)
+        result = dind_container.exec_run("ip route show")
+        output = result.output.decode("utf-8", errors="replace")
+
+        return {"routes": output}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get routes: {e}") from e
+
+
+@router.post("/{range_id}/console/exec")
+def exec_in_dind(
+    range_id: UUID,
+    db: DBSession,
+    current_user: CurrentUser,
+    command: str = Query(..., description="Command to execute in DinD container"),
+):
+    """
+    Execute a command in the DinD container.
+    Only admin and range_engineer roles allowed.
+    """
+    # Permission check
+    if current_user.role not in ["admin", "range_engineer"]:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    if not range_obj.dind_container_id:
+        raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
+
+    # Whitelist allowed commands for safety
+    allowed_prefixes = [
+        "docker ps",
+        "docker logs",
+        "docker inspect",
+        "docker stats",
+        "docker network",
+        "docker images",
+        "docker volume",
+        "ip route",
+        "ip addr",
+        "ip link",
+        "iptables -L",
+        "iptables -t nat -L",
+        "cat /etc/resolv.conf",
+        "cat /etc/hosts",
+        "ls",
+        "pwd",
+        "whoami",
+        "hostname",
+        "uname",
+    ]
+
+    is_allowed = any(command.strip().startswith(prefix) for prefix in allowed_prefixes)
+    if not is_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="Command not allowed. Use the interactive console for arbitrary commands.",
+        )
+
+    from proving_ground.services.docker_service import get_docker_service
+
+    docker_service = get_docker_service()
+
+    try:
+        dind_container = docker_service.client.containers.get(range_obj.dind_container_id)
+        result = dind_container.exec_run(command, privileged=True)
+        output = result.output.decode("utf-8", errors="replace")
+
+        return {
+            "command": command,
+            "exit_code": result.exit_code,
+            "output": output,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to execute command: {e}") from e
+
+
+# ============ Training Content ============
+
+
+class SetStudentGuideRequest(BaseModel):
+    """Request body for setting a student guide on a range."""
+
+    student_guide_id: Optional[UUID] = None
+
+
+class SetStudentGuideResponse(BaseModel):
+    """Response after setting student guide."""
+
+    student_guide_id: Optional[UUID] = None
+    student_guide_title: Optional[str] = None
+
+
+@router.patch("/{range_id}/student-guide", response_model=SetStudentGuideResponse)
+def set_student_guide(
+    range_id: UUID,
+    data: SetStudentGuideRequest,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """
+    Associate a student guide from Content Library with this range.
+
+    The selected guide will be displayed in the Student Lab view.
+    Pass student_guide_id=null to remove the association.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    # Check permission (owner or admin)
+    if range_obj.created_by != current_user.id and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized to modify this range")
+
+    # Validate content exists and is student_guide type
+    content_title = None
+    if data.student_guide_id:
+        content = db.query(Content).filter(Content.id == data.student_guide_id).first()
+        if not content:
+            raise HTTPException(status_code=404, detail="Content not found")
+        if content.content_type != ContentType.STUDENT_GUIDE:
+            raise HTTPException(status_code=400, detail="Content must be of type 'student_guide'")
+        content_title = content.title
+
+    range_obj.student_guide_id = data.student_guide_id
+    db.commit()
+
+    logger.info(
+        f"Range {range_id} student guide set to {data.student_guide_id} by {current_user.username}"
+    )
+
+    return SetStudentGuideResponse(
+        student_guide_id=data.student_guide_id, student_guide_title=content_title
+    )
+
+
+# ============ VM Console Visibility Control ============
+
+
+class RangeVMVisibilityVM(BaseModel):
+    """VM info for visibility control."""
+
+    id: UUID
+    hostname: str
+    status: str
+    is_hidden: bool = False
+
+
+class RangeVMVisibilityResponse(BaseModel):
+    """VM visibility settings for a range."""
+
+    range_id: UUID
+    range_name: str
+    hidden_vm_ids: List[UUID] = []
+    vms: List[RangeVMVisibilityVM] = []
+
+
+class RangeVMVisibilityUpdate(BaseModel):
+    """Update VM visibility for a range."""
+
+    hidden_vm_ids: List[UUID]
+
+
+@router.get("/{range_id}/vm-visibility", response_model=RangeVMVisibilityResponse)
+def get_range_vm_visibility(
+    range_id: UUID,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """Get VM visibility settings for a range.
+
+    This controls which VMs the assigned user can see and access via console.
+    """
+    range_obj = db.query(Range).options(joinedload(Range.vms)).filter(Range.id == range_id).first()
+
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    # Check permission (owner, admin, or assigned user viewing their own)
+    is_owner = range_obj.created_by == current_user.id
+    is_admin = current_user.role == "admin"
+    is_assigned = range_obj.assigned_to_user_id == current_user.id
+    has_role = current_user.has_any_role("engineer", "evaluator")
+
+    if not (is_owner or is_admin or has_role):
+        # Assigned user can view but not modify
+        if not is_assigned:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+    hidden_ids = set(str(vm_id) for vm_id in (range_obj.hidden_vm_ids or []))
+
+    vms = [
+        RangeVMVisibilityVM(
+            id=vm.id,
+            hostname=vm.hostname,
+            status=vm.status.value if hasattr(vm.status, "value") else str(vm.status),
+            is_hidden=str(vm.id) in hidden_ids,
+        )
+        for vm in range_obj.vms
+    ]
+
+    return RangeVMVisibilityResponse(
+        range_id=range_obj.id,
+        range_name=range_obj.name,
+        hidden_vm_ids=range_obj.hidden_vm_ids or [],
+        vms=vms,
+    )
+
+
+@router.put("/{range_id}/vm-visibility", response_model=RangeVMVisibilityResponse)
+def update_range_vm_visibility(
+    range_id: UUID,
+    data: RangeVMVisibilityUpdate,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """Update which VMs are hidden from the assigned user.
+
+    This controls which VMs the assigned user can see and access via console.
+    """
+    range_obj = db.query(Range).options(joinedload(Range.vms)).filter(Range.id == range_id).first()
+
+    if not range_obj:
+        raise HTTPException(status_code=404, detail="Range not found")
+
+    # Check permission (owner, admin, or evaluator/engineer)
+    is_owner = range_obj.created_by == current_user.id
+    is_admin = current_user.role == "admin"
+    has_role = current_user.has_any_role("engineer", "evaluator")
+
+    if not (is_owner or is_admin or has_role):
+        raise HTTPException(status_code=403, detail="Not authorized to modify visibility")
+
+    # Validate that all VM IDs belong to this range
+    range_vm_ids = {str(vm.id) for vm in range_obj.vms}
+    for vm_id in data.hidden_vm_ids:
+        if str(vm_id) not in range_vm_ids:
+            raise HTTPException(status_code=400, detail=f"VM {vm_id} does not belong to this range")
+
+    range_obj.hidden_vm_ids = [str(vm_id) for vm_id in data.hidden_vm_ids]
+    db.commit()
+    db.refresh(range_obj)
+
+    logger.info(
+        f"Range {range_id} VM visibility updated by {current_user.username}: "
+        f"{len(data.hidden_vm_ids)} VMs hidden"
+    )
+
+    hidden_ids = set(str(vm_id) for vm_id in (range_obj.hidden_vm_ids or []))
+
+    vms = [
+        RangeVMVisibilityVM(
+            id=vm.id,
+            hostname=vm.hostname,
+            status=vm.status.value if hasattr(vm.status, "value") else str(vm.status),
+            is_hidden=str(vm.id) in hidden_ids,
+        )
+        for vm in range_obj.vms
+    ]
+
+    return RangeVMVisibilityResponse(
+        range_id=range_obj.id,
+        range_name=range_obj.name,
+        hidden_vm_ids=range_obj.hidden_vm_ids or [],
+        vms=vms,
+    )
