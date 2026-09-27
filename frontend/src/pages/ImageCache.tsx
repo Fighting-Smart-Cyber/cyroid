@@ -1,7 +1,10 @@
 // frontend/src/pages/ImageCache.tsx
 import { useState, useEffect, useRef } from 'react'
-import { cacheApi, registryApi, DockerPullStatus, DockerBuildStatus, BuildableImage, ImageStatusResponse } from '../services/api'
+import { isAxiosError } from 'axios'
+import { cacheApi, registryApi, DockerPullStatus, DockerBuildStatus, BuildableImage, ImageStatusResponse, RegistryImage } from '../services/api'
 import { useAuthStore } from '../stores/authStore'
+import { useCapabilitiesStore } from '../stores/capabilitiesStore'
+import { featureGate } from '../lib/featureGate'
 import type {
   CachedImage,
   CacheStats,
@@ -51,9 +54,101 @@ import { BRANDING } from '../lib/branding'
 
 type TabType = 'overview' | 'docker' | 'isos' | 'linux-isos' | 'macos-isos' | 'custom-isos'
 
+/**
+ * Why the page has nothing to show.
+ *
+ * `substrate` is the distinction this page was getting wrong. Everything behind it reads the host
+ * Docker daemon, so on an install without one every request refuses by design -- and the page
+ * answered that with "Failed to load cache data" over five empty tabs, which reads as a broken
+ * install rather than an install that was never meant to have an image cache.
+ */
+export type CacheFailure = { kind: 'substrate' | 'error'; message: string }
+
+/**
+ * The `detail` FastAPI puts on a refusal, when it carries one a person can read.
+ *
+ * Only a non-empty string is accepted. Several routes here answer with a `detail` object (the
+ * `no_direct_download` shape below) and a 422 answers with a list of objects; putting either of
+ * those straight into JSX throws in React rather than telling anyone anything.
+ */
+export function responseDetail(reason: unknown): string | null {
+  if (!isAxiosError(reason)) return null
+  const body = reason.response?.data as { detail?: unknown } | undefined
+  return typeof body?.detail === 'string' && body.detail.trim() !== '' ? body.detail : null
+}
+
+/** The whole `detail`, for the few handlers that have to read a structured refusal. */
+function rawDetail(reason: unknown): unknown {
+  if (!isAxiosError(reason)) return undefined
+  return (reason.response?.data as { detail?: unknown } | undefined)?.detail
+}
+
+/** The server's own words where it has any, a plain sentence where it has none. */
+function detailOr(reason: unknown, fallback: string): string {
+  return responseDetail(reason) ?? fallback
+}
+
+/**
+ * The structured refusal the ISO routes answer with when a version has no direct download URL.
+ * Narrowed field by field so a `detail` of some other shape cannot reach the render as
+ * "[object Object]" or as a raw server payload.
+ */
+export function noDirectDownload(
+  reason: unknown
+): { message?: string; downloadPage?: string } | null {
+  const detail = rawDetail(reason)
+  if (typeof detail !== 'object' || detail === null) return null
+  const shape = detail as { status?: unknown; message?: unknown; download_page?: unknown }
+  if (shape.status !== 'no_direct_download') return null
+  return {
+    message: typeof shape.message === 'string' ? shape.message : undefined,
+    downloadPage: typeof shape.download_page === 'string' ? shape.download_page : undefined,
+  }
+}
+
+/** A readable sentence buried in a structured `detail`, for the routes that answer with one. */
+export function structuredMessage(reason: unknown): string | null {
+  const detail = rawDetail(reason)
+  if (typeof detail !== 'object' || detail === null) return null
+  const shape = detail as { message?: unknown; detail?: unknown }
+  if (typeof shape.message === 'string' && shape.message.trim() !== '') return shape.message
+  if (typeof shape.detail === 'string' && shape.detail.trim() !== '') return shape.detail
+  return null
+}
+
+/**
+ * What to tell the user about a failed load. The server's own `detail` comes first because it is
+ * the only text that knows which route failed and why -- the substrate guard names the substrate
+ * in its 501. Axios contributes "Request failed with status code 500", which explains nothing.
+ *
+ * Only 501 means "this install does not have one". The app-level Docker handler answers 501 just
+ * when the install is Kubernetes and 503 when a Docker host has lost its daemon, so the two cases
+ * stay apart. A 404 must not join them: the routes behind this page answer 404 for a resource
+ * missing by id -- a pull status, a golden image, a custom ISO -- and reading one as the
+ * substrate would tell a Docker operator that their host has no image cache and that a cluster
+ * pulls range images instead, neither of which is true of the machine in front of them.
+ */
+export function describeFailure(reason: unknown, label: string): CacheFailure {
+  const detail = responseDetail(reason)
+  const status = isAxiosError(reason) ? reason.response?.status : undefined
+
+  if (status === 501) {
+    return { kind: 'substrate', message: detail ?? `${label} is not available on this install.` }
+  }
+  if (detail) return { kind: 'error', message: detail }
+  if (isAxiosError(reason) && !reason.response) {
+    return { kind: 'error', message: `${label} could not be read: the API did not answer.` }
+  }
+  if (status) return { kind: 'error', message: `${label} could not be read (HTTP ${status}).` }
+  return { kind: 'error', message: `${label} could not be read.` }
+}
+
 export default function ImageCache() {
   const { user } = useAuthStore()
   const isAdmin = user?.roles?.includes('admin') ?? false
+  const features = useCapabilitiesStore((s) => s.features)
+  const substrateLabel = useCapabilitiesStore((s) => s.substrateLabel)
+  const gate = featureGate(features, 'image_cache')
   const [activeTab, setActiveTab] = useState<TabType>('overview')
   const [stats, setStats] = useState<CacheStats | null>(null)
   const [images, setImages] = useState<CachedImage[]>([])
@@ -66,6 +161,8 @@ export default function ImageCache() {
   const [actionLoading, setActionLoading] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  // Why the page has no data at all, as distinct from `error`, which reports one failed action.
+  const [loadFailure, setLoadFailure] = useState<CacheFailure | null>(null)
 
   // Modal state for caching new images
   const [showCacheModal, setShowCacheModal] = useState(false)
@@ -137,6 +234,7 @@ export default function ImageCache() {
   const loadData = async () => {
     setLoading(true)
     setError(null)
+    setLoadFailure(null)
     try {
       const [statsRes, imagesRes, recommendedRes, windowsRes, linuxRes, macosRes, customISOsRes, buildableRes, registryRes] = await Promise.all([
         cacheApi.getStats(),
@@ -147,7 +245,9 @@ export default function ImageCache() {
         cacheApi.getMacOSVersions(),
         cacheApi.listCustomISOs(),
         cacheApi.listBuildableImages(),
-        registryApi.listImages(),
+        // The registry is a container beside the daemon, not the daemon itself, so its being
+        // down says nothing about the cache. Rejecting here used to take the whole page with it.
+        registryApi.listImages().catch((): { data: RegistryImage[] } => ({ data: [] })),
       ])
       setStats(statsRes.data)
       setImages(imagesRes.data)
@@ -158,10 +258,10 @@ export default function ImageCache() {
       setCustomISOs(customISOsRes.data)
       setBuildableImages(buildableRes.data.images || [])
       // Extract repository names from registry images for checking if built images are in registry
-      const repoNames = (registryRes.data || []).map((img: any) => img.repository || img.name || '')
+      const repoNames = (registryRes.data || []).map((img) => img.name || '')
       setRegistryImages(repoNames)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load cache data')
+    } catch (err: unknown) {
+      setLoadFailure(describeFailure(err, 'The image cache'))
     } finally {
       setLoading(false)
     }
@@ -211,8 +311,8 @@ export default function ImageCache() {
         }
       }))
       startRegistryPushPolling(res.data.operation_id, imageTag)
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to start push to registry')
+    } catch (err: unknown) {
+      toast.error(detailOr(err, 'Failed to start push to registry'))
     }
   }
 
@@ -267,8 +367,8 @@ export default function ImageCache() {
       } else {
         toast.info('No unused images to prune')
       }
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to prune images')
+    } catch (err: unknown) {
+      toast.error(detailOr(err, 'Failed to prune images'))
     } finally {
       setIsPruning(false)
     }
@@ -539,8 +639,8 @@ export default function ImageCache() {
       }))
       startDockerPullPolling(imageKey, image)
       setSuccess(`Started pulling ${image}`)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to start pull')
+    } catch (err: unknown) {
+      setError(detailOr(err, 'Failed to start pull'))
     } finally {
       setActionLoading(null)
     }
@@ -557,8 +657,8 @@ export default function ImageCache() {
         delete newStatus[imageKey]
         return newStatus
       })
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to cancel pull')
+    } catch (err: unknown) {
+      setError(detailOr(err, 'Failed to cancel pull'))
     } finally {
       setActionLoading(null)
     }
@@ -705,8 +805,8 @@ export default function ImageCache() {
       }))
       startDockerBuildPolling(buildKey, imageName)
       toast.success(`Started building proving_ground/${imageName}:latest`)
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to start build')
+    } catch (err: unknown) {
+      toast.error(detailOr(err, 'Failed to start build'))
     } finally {
       setActionLoading(null)
     }
@@ -723,8 +823,8 @@ export default function ImageCache() {
         delete newStatus[buildKey]
         return newStatus
       })
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to cancel build')
+    } catch (err: unknown) {
+      toast.error(detailOr(err, 'Failed to cancel build'))
     } finally {
       setActionLoading(null)
     }
@@ -771,10 +871,13 @@ export default function ImageCache() {
   }
 
   useEffect(() => {
+    // Only ask an install that has a cache. The route is gated too; this is the second line, for
+    // a render that reaches the component some other way.
+    if (gate !== 'allow') return
     loadData()
     checkActiveBuilds()
     checkActivePushes()
-  }, [])
+  }, [gate])
 
   // Check for active downloads after data is loaded
   useEffect(() => {
@@ -812,8 +915,8 @@ export default function ImageCache() {
       setSelectedRecommended([])
       setNewImageName('')
       setTimeout(() => loadData(), 2000)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to start batch caching')
+    } catch (err: unknown) {
+      setError(detailOr(err, 'Failed to start batch caching'))
     } finally {
       setActionLoading(null)
     }
@@ -843,8 +946,8 @@ export default function ImageCache() {
       setShowCustomISOModal(false)
       setCustomISOName('')
       setCustomISOUrl('')
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to start ISO download')
+    } catch (err: unknown) {
+      setError(detailOr(err, 'Failed to start ISO download'))
     } finally {
       setActionLoading(null)
     }
@@ -861,8 +964,8 @@ export default function ImageCache() {
         delete newStatus[filename]
         return newStatus
       })
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to cancel download')
+    } catch (err: unknown) {
+      setError(detailOr(err, 'Failed to cancel download'))
     } finally {
       setActionLoading(null)
     }
@@ -935,18 +1038,17 @@ export default function ImageCache() {
         }
       }, 2000) // Poll every 2 seconds
 
-    } catch (err: any) {
-      const detail = err.response?.data?.detail
-      if (typeof detail === 'object' && detail.status === 'no_direct_download') {
-        // Show error with download page link
-        const msg = detail.message || 'No direct download available'
-        if (detail.download_page) {
-          setError(`${msg}. Visit the download page to get the ISO manually.`)
-        } else {
-          setError(msg)
-        }
+    } catch (err: unknown) {
+      const refusal = noDirectDownload(err)
+      if (refusal) {
+        const msg = refusal.message || 'No direct download is available for this version.'
+        setError(
+          refusal.downloadPage
+            ? `${msg} Fetch the ISO from the publisher yourself, then upload it here.`
+            : msg
+        )
       } else {
-        setError(typeof detail === 'string' ? detail : 'Failed to start download')
+        setError(detailOr(err, 'The download could not be started.'))
       }
       setActionLoading(null)
     }
@@ -1009,13 +1111,13 @@ export default function ImageCache() {
         }
       }, 2000) // Poll every 2 seconds
 
-    } catch (err: any) {
-      const detail = err.response?.data?.detail
-      if (typeof detail === 'object' && detail.status === 'no_direct_download') {
-        setError(detail.message || 'No direct download available')
-      } else {
-        setError(typeof detail === 'string' ? detail : 'Failed to start download')
-      }
+    } catch (err: unknown) {
+      const refusal = noDirectDownload(err)
+      setError(
+        refusal
+          ? refusal.message || 'No direct download is available for this distribution.'
+          : detailOr(err, 'The download could not be started.')
+      )
       setActionLoading(null)
     }
   }
@@ -1090,9 +1192,9 @@ export default function ImageCache() {
       }
       setDeleteConfirm({ type: null, name: '', isLoading: false })
       await loadData()
-    } catch (err: any) {
+    } catch (err: unknown) {
       setDeleteConfirm({ type: null, name: '', isLoading: false })
-      toast.error(err.response?.data?.detail || `Failed to delete ${deleteConfirm.name}`)
+      toast.error(detailOr(err, `${deleteConfirm.name} could not be deleted.`))
     }
   }
 
@@ -1108,8 +1210,8 @@ export default function ImageCache() {
         delete newStatus[downloadKey]
         return newStatus
       })
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to cancel download')
+    } catch (err: unknown) {
+      setError(detailOr(err, 'Failed to cancel download'))
     } finally {
       setActionLoading(null)
     }
@@ -1127,8 +1229,8 @@ export default function ImageCache() {
         delete newStatus[downloadKey]
         return newStatus
       })
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to cancel download')
+    } catch (err: unknown) {
+      setError(detailOr(err, 'Failed to cancel download'))
     } finally {
       setActionLoading(null)
     }
@@ -1172,13 +1274,8 @@ export default function ImageCache() {
       }, 2000)
 
       setSuccess(`Started downloading macOS ${version.name}`)
-    } catch (err: any) {
-      const detail = err.response?.data?.detail
-      if (typeof detail === 'object') {
-        setError(detail.message || detail.detail || 'Failed to start download')
-      } else {
-        setError(detail || 'Failed to start download')
-      }
+    } catch (err: unknown) {
+      setError(structuredMessage(err) ?? detailOr(err, 'The download could not be started.'))
     } finally {
       setActionLoading(null)
     }
@@ -1199,8 +1296,8 @@ export default function ImageCache() {
         delete newStatus[version]
         return newStatus
       })
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to cancel download')
+    } catch (err: unknown) {
+      setError(detailOr(err, 'Failed to cancel download'))
     } finally {
       setActionLoading(null)
     }
@@ -1263,8 +1360,8 @@ export default function ImageCache() {
             setUploadName('')
       setUploadCategory('')
       await loadData()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || `Failed to upload ${showUploadModal === 'docker' ? 'Docker image' : 'ISO'}`)
+    } catch (err: unknown) {
+      setError(detailOr(err, `Failed to upload ${showUploadModal === 'docker' ? 'Docker image' : 'ISO'}`))
     } finally {
       setActionLoading(null)
     }
@@ -1320,10 +1417,64 @@ export default function ImageCache() {
     return { desktop, server, services, proving_ground, other }
   }
 
-  if (loading) {
+  // A page that says what is there, in place of five empty tabs behind a red banner. The gate is
+  // the install's own answer; a 501 from the load is the same answer arriving later, and the
+  // server's own words are preferred to ours because only it knows which route refused.
+  //
+  // Checked before `loading`, which never clears on a denied install: nothing was ever fetched.
+  const refusal: CacheFailure | null =
+    gate === 'deny'
+      ? {
+          kind: 'substrate',
+          message: `${substrateLabel ? `This ${substrateLabel} install` : 'This install'} has no image cache.`,
+        }
+      : loadFailure?.kind === 'substrate'
+        ? loadFailure
+        : null
+
+  // Waiting on /system/capabilities: render nothing rather than a cache this install may not
+  // have, which would then have to disappear.
+  if (!refusal && (gate === 'pending' || loading)) {
     return (
       <div className="flex items-center justify-center h-64">
         <Loader2 className="h-8 w-8 animate-spin text-primary-600" />
+      </div>
+    )
+  }
+
+  if (refusal) {
+    return (
+      <div className="bg-white shadow rounded-lg p-8 text-center">
+        <CloudOff className="mx-auto h-12 w-12 text-gray-400" />
+        <h1 className="mt-4 text-lg font-medium text-gray-900">No image cache on this install</h1>
+        <p className="mt-2 text-sm text-gray-600 max-w-xl mx-auto">{refusal.message}</p>
+        <p className="mt-2 text-sm text-gray-500 max-w-xl mx-auto">
+          Range images are pulled by the cluster from the blueprint that names them, so there is
+          nothing to pull, build or prune here.
+        </p>
+      </div>
+    )
+  }
+
+  if (loadFailure) {
+    return (
+      <div className="bg-white shadow rounded-lg p-8 text-center">
+        <AlertCircle className="mx-auto h-12 w-12 text-amber-400" />
+        <h1 className="mt-4 text-lg font-medium text-gray-900">
+          The image cache could not be read
+        </h1>
+        <p className="mt-2 text-sm text-gray-600 max-w-xl mx-auto">{loadFailure.message}</p>
+        <p className="mt-2 text-sm text-gray-500 max-w-xl mx-auto">
+          This is not an empty cache -- nothing could be listed at all. A range that needs an
+          image which is not already on this host will fail to deploy until this is working again.
+        </p>
+        <button
+          onClick={loadData}
+          className="mt-6 inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+        >
+          <RefreshCw className="h-4 w-4 mr-2" />
+          Try again
+        </button>
       </div>
     )
   }
@@ -1337,7 +1488,8 @@ export default function ImageCache() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Image Cache</h1>
           <p className="mt-1 text-sm text-gray-500">
-            Manage cached Docker images, Windows ISOs, and golden images for offline deployment
+            The Docker images and installer ISOs held on this host, so a range deploys without
+            reaching out to the internet
           </p>
         </div>
         <button

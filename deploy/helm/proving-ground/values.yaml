@@ -1,0 +1,341 @@
+# PROVING GROUND in-cluster. Every image is pinned by the installer to the tag in VERSION;
+# nothing here says `latest`, and the image-pinning guard in CI counts it if it does.
+
+image:
+  # WHERE YOUR IMAGES LIVE. No default, deliberately: CYROID publishes no images, so there is no
+  # registry that would be right for everyone, and a default naming one organisation's private
+  # host is useless to everybody else and leaks the host into the public engine. Rendering without
+  # it fails with a message naming this value. scripts/install-k8s.sh supplies it from
+  # scripts/registry.env, or from PG_IMAGE_REPO.
+  registry: ""
+  # Empty means the chart's appVersion, which CI sets to the release version when it publishes
+  # the chart -- so advancing the chart advances the images, and one number names both. Set
+  # only to run a different build than the chart was published for (a rehearsal at a sha).
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The GitLab registry is private. With credentials given, the chart renders the pull secret
+# named below (kept across uninstalls and chart changes -- it is what pulls the next version).
+# scripts/install-k8s.sh supplies them: on the Flux path through a `valuesFrom` Secret, so the
+# token is never in the HelmRelease itself. Leave them empty and name an existing secret, or
+# leave both empty if containerd already has credentials.
+registryCredentials:
+  username: ""
+  password: ""
+imagePullSecret: pg-registry
+
+# Where CI publishes the chart (an OCI repository beside the images). The API reads its tag list
+# to answer "is there an update", with the pull secret above.
+# Empty is allowed and simply means no update check: the panel then says it has nothing to pull
+# rather than claiming to be up to date, which is the distinction 0.53.1 had to draw.
+chartRepository: ""
+
+# Extra hosts the chart registry's auth token service may live on, comma-separated. Empty is
+# right for almost everyone: the update check already accepts the registry's own host and any
+# host beneath its parent domain, which covers a registry and a token service that are siblings.
+# Set this only where the token service is on an unrelated host -- the refusal names it.
+updateRealmHosts: ""
+
+# What the deployment calls itself -- the engine's name by default; a distribution overrides.
+branding:
+  productName: CYROID
+  tagline: Cyber Range Orchestrator
+  primaryPalette: "{}"
+
+ingress:
+  enabled: true
+  className: traefik
+  # Hostname the Ingress answers to; empty matches any host, which is right for an IP-only host.
+  host: ""
+  # DNS suffix a range's applications answer beneath, each range on a label of its own:
+  # `<range-id>.apps.example.com`. Empty -- the default -- publishes no range application at all.
+  #
+  # A range's application is software the learner is being trained against, and on the platform's
+  # own host it is same-origin with the console: its JavaScript reads the operator's session out
+  # of the browser and calls the API as whoever opened it. A host of its own is what stops that,
+  # so an install without one gets no applications rather than applications here.
+  #
+  # Setting it needs a wildcard record (`*.apps.example.com`) pointing at this same ingress, a
+  # certificate the controller will serve for that name -- its default certificate or a TLSStore,
+  # because the per-range Ingress objects live in each range's namespace and can reference no
+  # secret of this one -- and `host` above, or this ingress answers on the applications host too.
+  appsHost: ""
+  tls:
+    enabled: true
+    # A self-signed certificate is generated once and kept across upgrades. Point this at a secret
+    # of your own (cert-manager, Let's Encrypt) to use it instead.
+    secretName: pg-tls
+    # The secret the APPLICATIONS host uses, when it is not the same one.
+    #
+    # Empty means "whatever secretName is", which is right in the two cases that matter: the
+    # generated certificate (it carries `*.<appsHost>` as a SAN), and a DNS-01 certificate that
+    # covers both hosts. Leave it empty if you can.
+    #
+    # It exists for HTTP-01, where no ACME CA will issue a wildcard at all, so a certificate for
+    # `host` cannot cover the applications. Point this at `pg-tls` there and the chart generates
+    # one for the applications alone -- untrusted, but carrying the right name, which is strictly
+    # better than a trusted certificate carrying the wrong one, because a browser REFUSES a name
+    # mismatch outright rather than offering to continue.
+    #
+    # If you control the DNS zone, prefer scripts/setup-cert-manager-dns01.sh: one trusted
+    # certificate for both hosts, no prompt for anyone, and it works on a private address.
+    appsSecretName: ""
+    # Further names and addresses the generated certificate answers for, beyond `host` and
+    # localhost. An address belongs in extraIPs and a name in extraNames -- a DNS SAN of
+    # "10.0.0.1" matches nothing, which is how an install reached by address ends up with a
+    # certificate no browser will accept. An entry in extraIPs that is not an address fails the
+    # render rather than being dropped: a certificate quietly missing the SAN it was asked for is
+    # the defect this closes, not one to repeat.
+    #
+    # Read only when the certificate is generated. An install that already has its pg-tls keeps
+    # the certificate it has, so adding a name here changes nothing until that secret is deleted.
+    # scripts/install-k8s.sh fills in the node's address.
+    extraNames: []
+    extraIPs: []
+    # An escape hatch, off unless it is turned on, and almost no install needs it.
+    #
+    # Traefik does NOT choose a certificate by the names an Ingress declared TLS for. Its
+    # Kubernetes provider reads `spec.tls[].secretName`, ignores `spec.tls[].hosts` completely,
+    # and then matches each handshake against the SANs of every certificate it has loaded --
+    # wildcards included, and falling back to the address the connection arrived on when the
+    # client sent no SNI, which is what a browser does for an install reached by IP. So the SAN
+    # list above is the whole of the mechanism: a range application on `<range>.<appsHost>` is
+    # served this certificate by the `*.<appsHost>` SAN, with no store involved, even though its
+    # Ingress lives in the range's namespace and can name no secret of this one.
+    #
+    # On, the chart writes a TLSStore named `default` AND a copy of the certificate secret into
+    # rangeIngress.controllerNamespace -- a namespace this release does not own -- and that store
+    # becomes the default certificate for EVERY host that Traefik controller serves, including
+    # hosts with nothing to do with PROVING GROUND. It is for an install where the SAN match has
+    # been established not to be enough on the cluster in front of you. It is not the answer to a
+    # name simply missing from the certificate; that belongs in extraNames above. Uninstalling
+    # removes the store, so Traefik stops serving a certificate for a product that is gone; the
+    # copied secret carries the same `helm.sh/resource-policy: keep` as the original and is left
+    # behind in that namespace for an operator to delete.
+    #
+    # Before turning it on: `kubectl get tlsstores -A`. Traefik honours exactly one `default`
+    # store, and one some other release owns makes this install fail on ownership rather than
+    # silently take it over -- the right way round, but worth knowing before the install and not
+    # during it. Traefik also ignores a `default` store outside the namespace named by its own
+    # `defaultTLSResourcesNamespace` option, wherever that option is set.
+    defaultStore:
+      # "" and false are both off. true requires secretName to be the generated pg-tls and
+      # rangeIngress.controllerNamespace to name where the controller runs; anything else fails
+      # the render rather than emitting a store that resolves to nothing.
+      enabled: ""
+      # Traefik v3's API group -- k3s v1.36 ships v3. A Traefik v2 controller served the same
+      # kind as traefik.containo.us/v1alpha1 and rejects this one outright.
+      apiVersion: traefik.io/v1alpha1
+
+# A PodDisruptionBudget for each workload the values below give more than one replica, so a node
+# drain moves its pods one at a time rather than taking the whole deployment down at once.
+#
+# Emitted only at two replicas or more, on purpose: a budget over a single-replica workload has no
+# safe eviction at all, so it blocks the drain outright instead of protecting anything. Replicas
+# changed with `kubectl scale` rather than here get no budget -- this is decided when the chart
+# renders, not when the deployment scales.
+podDisruptionBudget:
+  enabled: true
+
+# Resource policy across every workload: requests on all of them, memory limits only.
+#
+# A CPU limit is enforced by CFS throttling rather than by the scheduler, so a pod that briefly
+# needs more than its slice is stalled for the remainder of every period even on an idle node. On
+# the API that is request latency with nothing in a log to explain it; on the deploy worker it is
+# a range that takes longer to come up for no visible reason. Requests already do the work a CPU
+# limit is usually reached for: they are what the scheduler places on, and what the kernel shares
+# the node by under contention. Memory has no equivalent -- the limit is the only thing stopping
+# one workload taking the node down with it -- so every workload has one.
+
+api:
+  # More than one replica needs `data.accessMode: ReadWriteMany` on a multi-node cluster: every
+  # API and worker pod mounts pg-data, and a ReadWriteOnce volume pins them all to one node, where
+  # the second pod is Pending rather than serving. Do not add anti-affinity for the same reason --
+  # on the single-node profile co-location is what makes that volume work at all.
+  replicas: 1
+  workers: 4
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 2Gi}
+
+worker:
+  # `default` queue: everything except range deploys.
+  # Replicas multiply the pod's own concurrency -- the queue is consumed by processes x threads
+  # per pod. See api.replicas for what scaling past one node needs.
+  replicas: 1
+  processes: 2
+  threads: 8
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 2Gi}
+
+workerDeploy:
+  # `deploys pool` queues. Deploys run concurrently up to replicas x processes x threads, which is
+  # four on these defaults: a cohort that starts together queues behind that, so thirty learners
+  # deploying at once is thirty ranges through four slots. Raise replicas before a class rather
+  # than during one, and raise the cluster's capacity to run what they deploy with it. Nothing in
+  # the deploy actor is per-pod state -- the broker hands each message to exactly one consumer --
+  # so replicas are safe; what is not safe is starting more ranges than the nodes can hold.
+  replicas: 1
+  processes: 1
+  threads: 4
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 2Gi}
+
+frontend:
+  # Static assets and no state, so the only reason for a second replica is surviving a node drain
+  # -- and this is the cheapest workload here to give one to.
+  replicas: 1
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+# One volume for what the API and workers share: catalogs, scenarios, images, the shared dir.
+# ReadWriteOnce works on a single node (local-path); a multi-node profile needs RWX here -- it is
+# the "RWX for a named subset" of ADR-0012's contract.
+data:
+  storageClassName: ""
+  accessMode: ReadWriteOnce
+  size: 50Gi
+
+# --- Environment-supplied on every profile but k3s (ADR-0012). On k3s the chart runs them.
+#
+# What that costs, stated rather than implied, because k3s is the profile where PROVING GROUND
+# owns its own data. Postgres is one pod on one ReadWriteOnce volume and MinIO is one pod on
+# another: no replica, no standby, no backup, and no point at which either is copied anywhere
+# else. A node that loses its disk loses the learner record with it, and nothing in this chart can
+# change that -- a single-node profile has nowhere to replicate to.
+#
+# What the chart does do is refuse to be the cause. Every volume it creates carries
+# `helm.sh/resource-policy: keep`, and the Postgres StatefulSet retains its claim when it is
+# deleted or scaled to zero, so no uninstall, rollback or failed upgrade takes the database with
+# it. An install carrying a class needs a backup job outside this chart, or an
+# environment-supplied Postgres (`enabled: false`) that already has one.
+
+postgres:
+  enabled: true
+  image: docker.io/library/postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+  storageClassName: ""
+  size: 20Gi
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 2Gi}
+  # Used only when `enabled: false` -- the environment's Postgres.
+  externalUrl: ""
+
+minio:
+  enabled: true
+  # By digest, from a registry you can reach. No default for the same reason as image.registry.
+  # Mirroring it is not optional paranoia: docker.io/minio/minio refused the digest CI had
+  # mirrored on 2026-08-27 ("insufficient_scope: authorization failed" -- the upstream copy was
+  # gone), and quay.io later answered 401 for anonymous pulls too. Whoever runs this needs a copy
+  # they control. scripts/install-k8s.sh supplies ours from PG_MINIO_IMAGE.
+  image: ""
+  storageClassName: ""
+  size: 50Gi
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  # Everything below is used only when `enabled: false` -- the environment's object store.
+  #
+  # Azure Blob has NO S3 API, so "point externalEndpoint at Blob" does not work; that needs the
+  # Blob implementation behind services/object_store.py. What these do cover is any genuinely
+  # S3-compatible endpoint, which is what ADR-0012's contract asks the environment for.
+  externalEndpoint: ""
+  # TLS. Defaults to true whenever an external endpoint is set, because nothing real speaks
+  # plain HTTP and an accredited boundary will not carry it. Set false only to reach an
+  # in-cluster test endpoint.
+  externalSecure: true
+  # Credentials. Prefer existingSecret so keys never pass through values.yaml or a release's
+  # stored manifest; it must carry MINIO_ACCESS_KEY and MINIO_SECRET_KEY.
+  existingSecret: ""
+  externalAccessKey: ""
+  externalSecretKey: ""
+  # Buckets. Defaults match what the catalog resolves against and should not be renamed; name
+  # DIFFERENT ones here when the environment pre-provisions them.
+  bucket: "proving-ground-artifacts"
+  contentBucket: "proving-ground-content"
+  # Whether PG may create a bucket it does not find. Off for an external store by default: an
+  # identity scoped to a pre-provisioned bucket has no s3:CreateBucket, and failing at startup
+  # is worse than saying so.
+  createBucket: true
+
+# pg-gateway: the reverse proxy in front of a range's applications.
+#
+# It replaces two Traefik CRDs that cannot be expressed on Application Gateway, the AWS Load
+# Balancer Controller, GKE's ingress or OpenShift's router. Runs the same image as the API with a
+# different entrypoint -- what separates them is what the pod is GIVEN: no database URL, no
+# object-store keys, no symmetric JWT secret, and one read-only cluster permission.
+gateway:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+
+redis:
+  # The Dramatiq broker. This was a bare literal in redis.yaml -- the one wholly untemplated
+  # manifest in the chart -- so it could not be pointed at a mirror. An air-gapped install, or
+  # any cluster that may only pull from its own registry, could not deploy the chart at all.
+  image: docker.io/library/redis:7.4.1-alpine@sha256:c1e88455c85225310bbea54816e9c3f4b5295815e6dbf80c34d40afc6df28275
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+# The cluster's own pod and service CIDRs, so a range network that would collide with them is
+# refused at blueprint validation. Defaults are k3s's. AKS kubenet is 10.244.0.0/16 pods and
+# 10.0.0.0/16 services; on Azure CNI pod addresses come from the VNet, so name the VNet range.
+clusterReservedCidrs: "10.42.0.0/16,10.43.0.0/16"
+
+# Where the substrate's Flux controllers run; its pods are let into every range's network policy.
+fluxNamespace: flux-system
+
+# Student-facing ingress for a range's applications (PG-62): each web-facing capability gets
+# `<range-id>.<ingress.appsHost>/<app>/` on the same ingress class as the platform, authorised per
+# request by ForwardAuth back to the API. The controller's pods are let through each range's
+# default-deny by namespace and labels. Empty className routes nothing, and so does an empty
+# `ingress.appsHost` -- the host is what keeps a range's application out of this origin.
+rangeIngress:
+  className: traefik
+  # An optional sub-path beneath a range's host. Empty is right for almost everyone: the host
+  # already names the range, so an application is simply at `/<app>`.
+  pathPrefix: ""
+  controllerNamespace: kube-system
+  controllerPodLabels: app.kubernetes.io/name=traefik
+
+# Which chart repositories a blueprint's capabilities may be fetched from. An entry covers
+# everything beneath it, and nothing outside the list is permitted -- anybody who can author a
+# blueprint would otherwise choose the chart helm-controller renders and applies with the
+# permissions Flux holds. The repository this install pulls the platform from (`chartRepository`
+# above) is permitted without being restated.
+#
+# The default is the repository the blueprint PROVING GROUND seeds fetches its sample capability
+# from, so a fresh install can deploy something. An air-gapped install replaces this with its own
+# mirror and keeps nothing public here (ADR-0007).
+capabilityChartRepositories: "https://stefanprodan.github.io"
+
+# How much of the cluster the control plane's own ServiceAccount may reach.
+#
+#   cluster    (default) the range verbs -- pods/exec, jobs, KubeVirt machines, network
+#              attachments, Helm releases -- are held CLUSTER-WIDE. This is what every install
+#              before 0.52.0 had, and it means the API's token can exec into any pod on the
+#              cluster, including this release's own Postgres.
+#   namespace  those verbs are removed from the cluster-wide role and granted inside each range's
+#              namespace instead, by a RoleBinding the control plane writes as it creates the
+#              namespace. 108 permission tuples become 15.
+#
+# The default is the broad one so that an upgrade changes nothing. **Narrowing requires every
+# live range to be redeployed**: a range created before the switch has no RoleBinding in its
+# namespace, and every operation on it -- stop, start, console, teardown -- will 403 until it is.
+# Tear down or redeploy your ranges first, then set this, then upgrade.
+# FastAPI's debug behaviour, and the switch that lets an install run with the JWT secret this
+# repository ships. Both belong off on anything that is not a developer's laptop.
+debug: false
+
+rbac:
+  rangePermissions: cluster
+
+# Range substrate settings handed to the API and workers. `kubernetes` is the whole point of this
+# chart; `dind` here would be an API with no Docker socket.
+rangeSubstrate: kubernetes

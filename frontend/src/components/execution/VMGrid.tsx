@@ -1,4 +1,16 @@
 // frontend/src/components/execution/VMGrid.tsx
+/**
+ * The Era A (Docker) grid of a range's VMs.
+ *
+ * Every control on a card drives the host or DinD Docker daemon through the VM's `container_id`:
+ * start, stop, restart, the VNC console, the shell, the environment editor and the stats poll. A
+ * Kubernetes range has no VM rows and no container ids, so none of them can do anything there --
+ * which is why the page above this one renders the workload grid instead, and why this component
+ * refuses rather than drawing dead buttons if it is ever mounted on a Kubernetes install.
+ *
+ * "Container" is the right word here and nowhere else in the product: on this substrate a range
+ * machine really is a container, and the shell really is a shell inside it.
+ */
 import { useEffect, useState } from 'react'
 import { VM, VMStats } from '../../types'
 import { vmsApi } from '../../services/api'
@@ -7,6 +19,7 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 import { EmulationWarning } from '../common/EmulationWarning'
+import { useSubstrate } from '../../stores/capabilitiesStore'
 import { VMEnvEditor } from './VMEnvEditor'
 
 interface Props {
@@ -26,6 +39,7 @@ const statusColors: Record<VM['status'], string> = {
 export function VMGrid({ vms, onRefresh, onOpenConsole }: Props) {
   const [vmStats, setVmStats] = useState<Record<string, VMStats | null>>({})
   const [envVm, setEnvVm] = useState<VM | null>(null)
+  const { isKubernetes } = useSubstrate()
 
   useEffect(() => {
     const runningVms = vms.filter(vm => vm.status === 'running')
@@ -68,6 +82,15 @@ export function VMGrid({ vms, onRefresh, onOpenConsole }: Props) {
     } catch (error) {
       console.error(`Failed to ${action} VM:`, error)
     }
+  }
+
+  if (isKubernetes) {
+    return (
+      <div className="text-center py-8 text-gray-500">
+        <p>This grid drives the Docker daemon, and this install runs ranges on Kubernetes.</p>
+        <p className="text-sm mt-1">A Kubernetes range's machines are listed under Machines, each with its own console.</p>
+      </div>
+    )
   }
 
   if (vms.length === 0) {
@@ -164,19 +187,20 @@ export function VMGrid({ vms, onRefresh, onOpenConsole }: Props) {
                   >
                     <RotateCcw className="w-4 h-4 text-blue-600" />
                   </button>
-                  {/* VM Console (VNC) - for guest OS access */}
+                  {/* The guest's own screen. */}
                   <button
                     onClick={() => onOpenConsole(vm.id, vm.hostname, 'vnc')}
                     className="p-1.5 hover:bg-blue-100 rounded"
-                    title="VM Console (VNC)"
+                    title="VM console (VNC)"
                   >
                     <Monitor className="w-4 h-4 text-blue-600" />
                   </button>
-                  {/* Container Shell - for container layer troubleshooting */}
+                  {/* A shell in the container, which for an emulated VM is the host of the guest
+                      and not the guest -- worth saying, because the two buttons look alike. */}
                   <button
                     onClick={() => onOpenConsole(vm.id, vm.hostname, 'terminal')}
                     className="p-1.5 hover:bg-green-100 rounded"
-                    title="Container Shell"
+                    title="Container shell — inside the container, not the guest OS"
                   >
                     <Terminal className="w-4 h-4 text-green-600" />
                   </button>

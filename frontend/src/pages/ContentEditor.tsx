@@ -1,5 +1,6 @@
 // frontend/src/pages/ContentEditor.tsx
 import { useState, useEffect, useCallback } from 'react'
+import { isAxiosError } from 'axios'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useEditor, EditorContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
@@ -38,6 +39,7 @@ import {
   X,
   Copy,
   Tag,
+  AlertTriangle,
 } from 'lucide-react'
 import { contentApi, Content, ContentCreate, ContentUpdate, ContentType, ContentAsset } from '../services/api'
 import { WalkthroughEditor } from '../components/content/WalkthroughEditor'
@@ -56,6 +58,661 @@ const CONTENT_TYPES: { value: ContentType; label: string }[] = [
 
 // sanitizeHtml moved to src/utils/sanitizeHtml.ts so ContentLibrary's PDF path
 // can use the same allow-list instead of assigning raw innerHTML.
+
+// ---------------------------------------------------------------------------
+// TipTap HTML -> Markdown
+//
+// `body_markdown` is the stored form. The API re-renders `body_html` from it on
+// every save and the editor reloads that render, so whatever this serialiser
+// cannot express is destroyed the moment the author presses Save -- and the
+// destroyed version is what they are handed back. What this replaced was a
+// chain of regexes over the raw HTML: the `<code>` pattern had no `s` flag, so
+// a multi-line code block never matched and fell through to the catch-all tag
+// strip; every `<li>` became a `-` bullet whatever its parent; and `<table>`,
+// `<pre>` and `<s>` had no rule at all. Four of the toolbar's own buttons --
+// Table, Code Block, Ordered List and Strikethrough -- produced content that
+// looked right while editing and was flattened on save.
+//
+// The input is never arbitrary HTML. It is ProseMirror's own serialisation,
+// which closes every tag and quotes every attribute, so a small parser over the
+// string is sound. Keeping it string-only also keeps it testable: the unit
+// tests run in vitest's node environment, which has no DOM.
+//
+// The target dialect is what the API renders with: Python-Markdown plus its
+// `tables` and `fenced_code` extensions. That is not GFM -- it has no `~~`
+// strikethrough -- so strikethrough goes out as an inline `<s>` element, which
+// Python-Markdown passes through and TipTap's Strike mark parses back.
+// ---------------------------------------------------------------------------
+
+interface HtmlElement {
+  type: 'element'
+  tag: string
+  attrs: Record<string, string>
+  children: HtmlNode[]
+}
+
+interface HtmlText {
+  type: 'text'
+  value: string
+}
+
+type HtmlNode = HtmlElement | HtmlText
+
+/** Elements that never have a closing tag, so they must not open a nesting level. */
+const VOID_ELEMENTS = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+  'link', 'meta', 'param', 'source', 'track', 'wbr',
+])
+
+/** Elements that belong inside a paragraph rather than starting a block of their own. */
+const INLINE_ELEMENTS = new Set([
+  'a', 'abbr', 'b', 'bdi', 'bdo', 'br', 'cite', 'code', 'data', 'del', 'dfn',
+  'em', 'i', 'img', 'ins', 'kbd', 'mark', 'q', 's', 'samp', 'small', 'span',
+  'strike', 'strong', 'sub', 'sup', 'time', 'u', 'var',
+])
+
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: ' ',
+  hellip: '…',
+  mdash: '—',
+  ndash: '–',
+  copy: '©',
+  reg: '®',
+  trade: '™',
+}
+
+function decodeEntities(text: string): string {
+  if (!text.includes('&')) return text
+  return text.replace(/&(#[Xx][0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);/g, (whole, body: string) => {
+    if (body[0] === '#') {
+      const code =
+        body[1] === 'x' || body[1] === 'X'
+          ? Number.parseInt(body.slice(2), 16)
+          : Number.parseInt(body.slice(1), 10)
+      if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return whole
+      return String.fromCodePoint(code)
+    }
+    const named = NAMED_ENTITIES[body.toLowerCase()]
+    return named === undefined ? whole : named
+  })
+}
+
+/**
+ * Find the `>` that closes the tag opening at `start`, ignoring any that sits
+ * inside a quoted attribute value -- a link title or an image alt text is free
+ * to contain one.
+ */
+function findTagEnd(html: string, start: number): number {
+  let quote = ''
+  for (let i = start + 1; i < html.length; i += 1) {
+    const char = html[i]
+    if (quote) {
+      if (char === quote) quote = ''
+    } else if (char === '"' || char === "'") {
+      quote = char
+    } else if (char === '>') {
+      return i
+    }
+  }
+  return -1
+}
+
+function parseOpenTag(raw: string): { element: HtmlElement; selfClosing: boolean } {
+  const selfClosing = raw.endsWith('/')
+  const body = selfClosing ? raw.slice(0, -1) : raw
+  const name = /^([A-Za-z][A-Za-z0-9-]*)/.exec(body)
+  const attrs: Record<string, string> = {}
+  if (name) {
+    const attribute = /([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+))?/g
+    attribute.lastIndex = name[0].length
+    let match = attribute.exec(body)
+    while (match) {
+      const raw_value = match[2]
+      const unquoted =
+        raw_value && (raw_value[0] === '"' || raw_value[0] === "'")
+          ? raw_value.slice(1, -1)
+          : raw_value
+      attrs[match[1].toLowerCase()] = unquoted ? decodeEntities(unquoted) : ''
+      match = attribute.exec(body)
+    }
+  }
+  return {
+    element: { type: 'element', tag: name ? name[1].toLowerCase() : '', attrs, children: [] },
+    selfClosing,
+  }
+}
+
+function parseHtml(html: string): HtmlNode[] {
+  const root: HtmlElement = { type: 'element', tag: '#root', attrs: {}, children: [] }
+  const open: HtmlElement[] = [root]
+  const push = (node: HtmlNode) => open[open.length - 1].children.push(node)
+
+  let cursor = 0
+  while (cursor < html.length) {
+    const next = html.indexOf('<', cursor)
+    if (next === -1) {
+      push({ type: 'text', value: decodeEntities(html.slice(cursor)) })
+      break
+    }
+    if (next > cursor) push({ type: 'text', value: decodeEntities(html.slice(cursor, next)) })
+
+    if (html.startsWith('<!--', next)) {
+      const end = html.indexOf('-->', next + 4)
+      cursor = end === -1 ? html.length : end + 3
+      continue
+    }
+
+    const end = findTagEnd(html, next)
+    if (end === -1) {
+      // An unterminated `<` is literal text, not a tag.
+      push({ type: 'text', value: decodeEntities(html.slice(next)) })
+      break
+    }
+    const raw = html.slice(next + 1, end)
+    cursor = end + 1
+
+    if (raw.startsWith('!') || raw.startsWith('?')) continue
+
+    if (raw.startsWith('/')) {
+      const tag = raw.slice(1).trim().toLowerCase()
+      for (let depth = open.length - 1; depth > 0; depth -= 1) {
+        if (open[depth].tag === tag) {
+          open.length = depth
+          break
+        }
+      }
+      continue
+    }
+
+    const { element, selfClosing } = parseOpenTag(raw)
+    push(element)
+    if (!selfClosing && !VOID_ELEMENTS.has(element.tag)) open.push(element)
+  }
+
+  return root.children
+}
+
+function isElement(node: HtmlNode): node is HtmlElement {
+  return node.type === 'element'
+}
+
+function textContent(node: HtmlNode): string {
+  if (node.type === 'text') return node.value
+  if (node.tag === 'br') return '\n'
+  return node.children.map(textContent).join('')
+}
+
+/** A construct the markdown round-trip cannot carry, phrased for the author. */
+type ReportLoss = (message: string) => void
+
+interface InlineContext {
+  inTableCell: boolean
+  report: ReportLoss
+}
+
+interface BlockContext {
+  report: ReportLoss
+  /**
+   * True once the blocks being written sit inside a list item or a blockquote.
+   * Python-Markdown's `fenced_code` only matches a fence at the outermost
+   * level -- indented under a list item or behind a `>` it reads the fence as
+   * the first line of an inline code span and folds the whole block into a
+   * paragraph. Indented code blocks do nest, so nested code goes out in that
+   * form instead.
+   */
+  codeMustBeIndented: boolean
+}
+
+/**
+ * Escape the characters that markdown would otherwise read as syntax.
+ *
+ * `<` and `>` become entities rather than backslash escapes so that text an
+ * author typed -- `<script>`, or a shell redirect -- can never be handed back
+ * to the renderer as live HTML, and so a line beginning with `>` cannot turn
+ * itself into a blockquote. An underscore inside a word (`body_markdown`) is
+ * left alone; Python-Markdown does not treat it as emphasis and escaping it
+ * would litter the stored markdown and its exports.
+ */
+function escapeInlineText(raw: string, inTableCell: boolean): string {
+  // A newline inside an inline text node is markup, not content -- the renderer
+  // puts one after every `<br />` it writes -- and markdown would read it as
+  // the end of the line.
+  const text = raw.replace(/[\t\r\n]+/g, ' ')
+  let out = ''
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i]
+    if (char === '&') {
+      out += '&amp;'
+    } else if (char === '<') {
+      out += '&lt;'
+    } else if (char === '>') {
+      out += '&gt;'
+    } else if (char === '\\' || char === '*' || char === '`' || char === '[' || char === ']') {
+      out += `\\${char}`
+    } else if (char === '|' && inTableCell) {
+      out += '\\|'
+    } else if (char === '_') {
+      const before = text[i - 1]
+      const after = text[i + 1]
+      const insideWord =
+        before !== undefined &&
+        after !== undefined &&
+        /[0-9A-Za-z]/.test(before) &&
+        /[0-9A-Za-z]/.test(after)
+      out += insideWord ? '_' : '\\_'
+    } else {
+      out += char
+    }
+  }
+  return out
+}
+
+/**
+ * Stop a paragraph whose text happens to start with `#`, `-`, `+` or `1.` from
+ * being re-read as a heading or a list item. A digit cannot carry a backslash
+ * escape, so for a numbered opener the delimiter is escaped instead.
+ */
+function escapeLineStart(line: string): string {
+  const ordered = /^(\s*)(\d+)([.)])(?=\s|$)/.exec(line)
+  if (ordered) {
+    return `${ordered[1]}${ordered[2]}\\${ordered[3]}${line.slice(ordered[0].length)}`
+  }
+  const marker = /^(\s*)([-+#])/.exec(line)
+  if (marker) {
+    return `${marker[1]}\\${marker[2]}${line.slice(marker[0].length)}`
+  }
+  return line
+}
+
+function escapeBlockText(text: string): string {
+  return text
+    .replace(/\n[ \t]+/g, '\n')
+    .split('\n')
+    .map(escapeLineStart)
+    .join('\n')
+}
+
+/** A link destination containing whitespace or brackets needs the `<...>` form. */
+function linkDestination(url: string): string {
+  return /[\s()<>]/.test(url) ? `<${url.replace(/[<>]/g, encodeURIComponent)}>` : url
+}
+
+function linkTitle(title: string | undefined): string {
+  if (!title) return ''
+  return ` "${title.replace(/"/g, '\\"')}"`
+}
+
+function codeSpan(source: string, report: ReportLoss): string {
+  if (source.startsWith('`') || source.endsWith('`')) {
+    report('inline code that begins or ends with a backtick, which markdown cannot delimit')
+  }
+  const runs = source.match(/`+/g)
+  const longest = runs ? runs.reduce((widest, run) => Math.max(widest, run.length), 0) : 0
+  const fence = '`'.repeat(longest + 1)
+  return `${fence}${source}${fence}`
+}
+
+/**
+ * Emphasis delimiters cannot sit against whitespace, so any space the mark
+ * happens to cover is moved outside them.
+ */
+function wrapMark(inner: string, delimiter: string): string {
+  const parts = /^(\s*)([\s\S]*?)(\s*)$/.exec(inner)
+  if (!parts || !parts[2]) return inner
+  return `${parts[1]}${delimiter}${parts[2]}${delimiter}${parts[3]}`
+}
+
+function inlineToMarkdown(nodes: HtmlNode[], ctx: InlineContext): string {
+  let out = ''
+  for (const node of nodes) {
+    if (node.type === 'text') {
+      out += escapeInlineText(node.value, ctx.inTableCell)
+      continue
+    }
+    out += inlineElementToMarkdown(node, ctx)
+  }
+  return out
+}
+
+function inlineElementToMarkdown(node: HtmlElement, ctx: InlineContext): string {
+  switch (node.tag) {
+    case 'br':
+      // Two trailing spaces are markdown's hard break; inside a pipe table the
+      // cell is one line, so the break has to stay as an element.
+      return ctx.inTableCell ? '<br>' : '  \n'
+    case 'img': {
+      const alt = (node.attrs.alt ?? '').replace(/([[\]])/g, '\\$1')
+      return `![${alt}](${linkDestination(node.attrs.src ?? '')}${linkTitle(node.attrs.title)})`
+    }
+    case 'a': {
+      const text = inlineToMarkdown(node.children, ctx)
+      const href = node.attrs.href
+      if (!href) return text
+      return `[${text}](${linkDestination(href)}${linkTitle(node.attrs.title)})`
+    }
+    case 'code': {
+      const source = textContent(node)
+      if (source.includes('\n')) {
+        ctx.report('a line break inside inline code, which markdown keeps on one line')
+      }
+      return codeSpan(source.replace(/\n/g, ' '), ctx.report)
+    }
+    case 'strong':
+    case 'b':
+      return wrapMark(inlineToMarkdown(node.children, ctx), '**')
+    case 'em':
+    case 'i':
+      return wrapMark(inlineToMarkdown(node.children, ctx), '*')
+    case 's':
+    case 'strike':
+    case 'del': {
+      const inner = inlineToMarkdown(node.children, ctx)
+      return inner.trim() ? `<s>${inner}</s>` : inner
+    }
+    case 'u': {
+      // StarterKit carries an Underline mark and binds Mod-U to it, so `<u>`
+      // reaches here whenever an author uses the shortcut -- the toolbar having
+      // no button for it is no protection. Neither markdown nor this renderer
+      // has an underline syntax, so it takes the same route as `<s>`: the
+      // element goes out as itself, Python-Markdown passes it through and
+      // TipTap's Underline parses it back.
+      const inner = inlineToMarkdown(node.children, ctx)
+      return inner.trim() ? `<u>${inner}</u>` : inner
+    }
+    default:
+      return inlineToMarkdown(node.children, ctx)
+  }
+}
+
+function describeBlock(tag: string): string {
+  if (/^h[1-6]$/.test(tag)) return 'heading'
+  switch (tag) {
+    case 'ul':
+    case 'ol':
+      return 'list'
+    case 'pre':
+      return 'code block'
+    case 'blockquote':
+      return 'quote'
+    case 'table':
+      return 'table'
+    case 'hr':
+      return 'horizontal rule'
+    default:
+      return tag
+  }
+}
+
+function tableRows(table: HtmlElement): HtmlElement[] {
+  const rows: HtmlElement[] = []
+  const visit = (nodes: HtmlNode[]) => {
+    for (const node of nodes) {
+      if (!isElement(node)) continue
+      if (node.tag === 'tr') rows.push(node)
+      else if (node.tag === 'thead' || node.tag === 'tbody' || node.tag === 'tfoot') {
+        visit(node.children)
+      }
+    }
+  }
+  visit(table.children)
+  return rows
+}
+
+function cellToMarkdown(cell: HtmlElement, report: ReportLoss): string {
+  const colspan = Number.parseInt(cell.attrs.colspan ?? '1', 10)
+  const rowspan = Number.parseInt(cell.attrs.rowspan ?? '1', 10)
+  if (colspan > 1 || rowspan > 1) {
+    report('a merged table cell, which a markdown table cannot span across rows or columns')
+  }
+
+  const blocks = cell.children.filter(
+    (child): child is HtmlElement => isElement(child) && !INLINE_ELEMENTS.has(child.tag)
+  )
+  const foreign = blocks.find((block) => block.tag !== 'p')
+  if (foreign) {
+    report(`a ${describeBlock(foreign.tag)} inside a table cell, where markdown allows only one line of text`)
+  } else if (blocks.length > 1) {
+    report('a table cell holding more than one paragraph, where markdown allows only one line')
+  }
+
+  const ctx: InlineContext = { inTableCell: true, report }
+  const pieces: string[] = []
+  let pending: HtmlNode[] = []
+  const flush = () => {
+    if (!pending.length) return
+    pieces.push(inlineToMarkdown(pending, ctx))
+    pending = []
+  }
+  for (const child of cell.children) {
+    if (child.type === 'text' || INLINE_ELEMENTS.has(child.tag)) {
+      pending.push(child)
+      continue
+    }
+    flush()
+    pieces.push(inlineToMarkdown(child.children, ctx))
+  }
+  flush()
+
+  return pieces
+    .map((piece) => piece.replace(/\s*\n\s*/g, ' ').trim())
+    .filter((piece) => piece.length > 0)
+    .join('<br>')
+}
+
+function tableToMarkdown(table: HtmlElement, report: ReportLoss): string | null {
+  const rows = tableRows(table)
+  const grid = rows.map((row) =>
+    row.children.filter((cell): cell is HtmlElement => isElement(cell) && (cell.tag === 'th' || cell.tag === 'td'))
+  )
+  const width = grid.reduce((widest, row) => Math.max(widest, row.length), 0)
+  if (width === 0) return null
+  if (grid.length === 1) {
+    // A pipe table is a header plus a body, and a header on its own comes back
+    // with an empty row underneath it rather than as the one row it was.
+    report('a table with a single row, which markdown reads back with an empty row beneath it')
+  }
+
+  const lines = grid.map((row) => {
+    const cells: string[] = []
+    for (let column = 0; column < width; column += 1) {
+      cells.push(row[column] ? cellToMarkdown(row[column], report) : '')
+    }
+    return `| ${cells.join(' | ')} |`
+  })
+
+  // Python-Markdown's `tables` extension reads the first line as the header and
+  // requires the delimiter beneath it, so a table that TipTap built without a
+  // header row still has to present one.
+  const divider = `| ${new Array(width).fill('---').join(' | ')} |`
+  return [lines[0], divider, ...lines.slice(1)].join('\n')
+}
+
+function codeBlockToMarkdown(pre: HtmlElement, ctx: BlockContext): string {
+  const code = pre.children.find((child): child is HtmlElement => isElement(child) && child.tag === 'code')
+  const source = textContent(code ?? pre).replace(/\n$/, '')
+  const language = /(?:^|\s)(?:language|lang)-([^\s]+)/.exec(code?.attrs.class ?? '')?.[1] ?? ''
+
+  if (ctx.codeMustBeIndented) {
+    // The indented form carries the code itself but has nowhere to put the
+    // language, so a nested block comes back without its highlighting. That is
+    // a loss of presentation, not of the author's text, which is why it does
+    // not block the save the way a dropped table cell does.
+    return source
+      .split('\n')
+      .map((line) => `    ${line}`)
+      .join('\n')
+  }
+
+  const runs = source.match(/^`{3,}/gm)
+  const longest = runs ? runs.reduce((widest, run) => Math.max(widest, run.length), 0) : 0
+  const fence = '`'.repeat(Math.max(3, longest + 1))
+  return `${fence}${language}\n${source}\n${fence}`
+}
+
+function listToMarkdown(list: HtmlElement, ordered: boolean, ctx: BlockContext): string | null {
+  if (ordered) {
+    const start = list.attrs.start
+    if (start && start !== '1') {
+      ctx.report(`a numbered list starting at ${start}, which markdown renumbers from 1`)
+    }
+  }
+
+  const items = list.children.filter((child): child is HtmlElement => isElement(child) && child.tag === 'li')
+  if (items.length === 0) return null
+
+  const nested: BlockContext = { ...ctx, codeMustBeIndented: true }
+  const rendered = items.map((item, index) => {
+    const marker = ordered ? `${index + 1}. ` : '- '
+    const body = blocksToMarkdown(item.children, nested)
+    // Python-Markdown nests on a four-space indent, so every continuation line
+    // of an item -- a second paragraph, a sub-list, a code block -- carries
+    // one whatever the marker's own width is. The marker keeps its trailing
+    // space when the item opens with something other than text, because a bare
+    // `-` on a line of its own is a paragraph rather than a list.
+    const lines = body.split('\n')
+    const head = lines[0] ? `${marker}${lines[0]}`.replace(/\s+$/, '') : marker
+    const tail = lines.slice(1).map((line) => (line ? `    ${line}` : ''))
+    return [head, ...tail].join('\n')
+  })
+
+  // An item that spans more than one line has to be followed by a blank line,
+  // or the next item -- which sits at column zero while the previous item's
+  // continuation is indented -- is read as part of the nested block instead of
+  // as a sibling.
+  const separator = rendered.some((item) => item.includes('\n')) ? '\n\n' : '\n'
+  return rendered.join(separator)
+}
+
+function blockToMarkdown(node: HtmlElement, ctx: BlockContext): string | null {
+  const inline: InlineContext = { inTableCell: false, report: ctx.report }
+
+  if (/^h[1-6]$/.test(node.tag)) {
+    const level = Number.parseInt(node.tag.slice(1), 10)
+    const text = inlineToMarkdown(node.children, inline).replace(/\s*\n\s*/g, ' ').trim()
+    return text ? `${'#'.repeat(level)} ${text}` : null
+  }
+
+  switch (node.tag) {
+    case 'p': {
+      const text = inlineToMarkdown(node.children, inline).trim()
+      return text ? escapeBlockText(text) : null
+    }
+    case 'hr':
+      return '---'
+    case 'ul':
+      return listToMarkdown(node, false, ctx)
+    case 'ol':
+      return listToMarkdown(node, true, ctx)
+    case 'li': {
+      // A stray `<li>` outside a list reaches here only from pasted markup.
+      const orphan: HtmlElement = { type: 'element', tag: 'ul', attrs: {}, children: [node] }
+      return listToMarkdown(orphan, false, ctx)
+    }
+    case 'blockquote': {
+      const inner = blocksToMarkdown(node.children, { ...ctx, codeMustBeIndented: true })
+      if (!inner) return null
+      return inner
+        .split('\n')
+        .map((line) => (line ? `> ${line}` : '>'))
+        .join('\n')
+    }
+    case 'pre':
+      return codeBlockToMarkdown(node, ctx)
+    case 'table':
+      return tableToMarkdown(node, ctx.report)
+    default:
+      return blocksToMarkdown(node.children, ctx) || null
+  }
+}
+
+function blocksToMarkdown(nodes: HtmlNode[], ctx: BlockContext): string {
+  const blocks: string[] = []
+  let pending: HtmlNode[] = []
+
+  const flush = () => {
+    if (!pending.length) return
+    const text = inlineToMarkdown(pending, { inTableCell: false, report: ctx.report }).trim()
+    pending = []
+    if (text) blocks.push(escapeBlockText(text))
+  }
+
+  for (const node of nodes) {
+    if (node.type === 'text') {
+      // Whitespace between two blocks is formatting, not content; whitespace
+      // between two inline runs is a word gap and has to survive.
+      if (node.value.trim() || pending.length) pending.push(node)
+      continue
+    }
+    if (INLINE_ELEMENTS.has(node.tag) && node.tag !== 'br') {
+      pending.push(node)
+      continue
+    }
+    if (node.tag === 'br') {
+      if (pending.length) pending.push(node)
+      continue
+    }
+    flush()
+    const block = blockToMarkdown(node, ctx)
+    if (block) blocks.push(block)
+  }
+  flush()
+
+  return blocks.join('\n\n')
+}
+
+export interface MarkdownConversion {
+  markdown: string
+  /**
+   * Constructs the author can see in the editor that the stored markdown cannot
+   * carry. Non-empty means the save must be refused rather than silently
+   * flattening them.
+   */
+  losses: string[]
+}
+
+export function htmlToMarkdown(html: string): MarkdownConversion {
+  const losses = new Set<string>()
+  const ctx: BlockContext = {
+    report: (message) => losses.add(message),
+    codeMustBeIndented: false,
+  }
+  const markdown = blocksToMarkdown(parseHtml(html), ctx)
+  return { markdown: markdown.trim(), losses: [...losses] }
+}
+
+/**
+ * Wrap markdown that has no cached render in escaped paragraphs.
+ *
+ * Rows written before the API started caching `body_html` still carry markdown
+ * only. This used to interpolate that text straight into `<p>` tags, which both
+ * scrambled the structure and handed any HTML in the body to the browser as
+ * live markup. Showing the source escaped is honest about what is there and
+ * cannot execute.
+ */
+export function markdownAsPlainHtml(markdown: string): string {
+  const escape = (text: string) =>
+    text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return markdown
+    .split(/\n{2,}/)
+    .map((paragraph) => `<p>${escape(paragraph).replace(/\n/g, '<br>')}</p>`)
+    .join('')
+}
+
+function requestFailureMessage(err: unknown, fallback: string): string {
+  if (isAxiosError(err)) {
+    const detail = err.response?.data?.detail
+    if (typeof detail === 'string') return detail
+    if (!err.response) return 'The server could not be reached.'
+    return err.message
+  }
+  if (err instanceof Error && err.message) return err.message
+  return fallback
+}
 
 interface EditorToolbarProps {
   editor: ReturnType<typeof useEditor>
@@ -244,6 +901,11 @@ export default function ContentEditor() {
   // Preview mode
   const [showPreview, setShowPreview] = useState(false)
 
+  // Why the last save did not happen: a refusal this page raised because the
+  // markdown round-trip would lose something, or the reason the API gave.
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saveLosses, setSaveLosses] = useState<string[]>([])
+
   const editor = useEditor({
     extensions: [
       StarterKit.configure({
@@ -295,12 +957,11 @@ export default function ContentEditor() {
       setAssets(data.assets)
       setWalkthroughData(data.walkthrough_data || null)
 
-      // Set editor content from markdown (convert to HTML for TipTap)
+      // Set editor content from the API's cached render of the stored markdown.
       if (editor && data.body_html) {
         editor.commands.setContent(sanitizeHtml(data.body_html))
       } else if (editor && data.body_markdown) {
-        // If no HTML, try to use markdown (basic conversion)
-        editor.commands.setContent(`<p>${data.body_markdown.replace(/\n/g, '</p><p>')}</p>`)
+        editor.commands.setContent(markdownAsPlainHtml(data.body_markdown))
       }
     } catch (err) {
       console.error('Failed to load content:', err)
@@ -310,53 +971,38 @@ export default function ContentEditor() {
     }
   }
 
-  // Convert TipTap HTML to simple markdown (basic conversion)
-  function htmlToMarkdown(html: string): string {
-    // This is a simplified conversion - in production you'd want a proper library
-    const md = html
-      .replace(/<h1[^>]*>(.*?)<\/h1>/gi, '# $1\n\n')
-      .replace(/<h2[^>]*>(.*?)<\/h2>/gi, '## $1\n\n')
-      .replace(/<h3[^>]*>(.*?)<\/h3>/gi, '### $1\n\n')
-      .replace(/<strong[^>]*>(.*?)<\/strong>/gi, '**$1**')
-      .replace(/<b[^>]*>(.*?)<\/b>/gi, '**$1**')
-      .replace(/<em[^>]*>(.*?)<\/em>/gi, '*$1*')
-      .replace(/<i[^>]*>(.*?)<\/i>/gi, '*$1*')
-      .replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`')
-      .replace(/<a[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi, '[$2]($1)')
-      .replace(/<img[^>]*src="([^"]*)"[^>]*>/gi, '![]($1)')
-      .replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n')
-      .replace(/<blockquote[^>]*>(.*?)<\/blockquote>/gi, '> $1\n\n')
-      .replace(/<hr\s*\/?>/gi, '\n---\n')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<p[^>]*>(.*?)<\/p>/gi, '$1\n\n')
-      .replace(/<[^>]+>/g, '')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&amp;/g, '&')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim()
-    return md
-  }
-
   async function handleSave() {
+    setSaveError(null)
+    setSaveLosses([])
+
     if (!title.trim()) {
-      alert('Title is required')
+      setSaveError('A title is required before this can be saved.')
+      return
+    }
+
+    const isWalkthrough = contentType === 'student_guide'
+    const conversion = htmlToMarkdown(isWalkthrough ? '' : editor?.getHTML() || '')
+
+    // The body is stored as markdown and re-rendered by the API, so anything
+    // markdown cannot express is gone the moment this request succeeds. Refuse
+    // rather than report success over content the author would then find
+    // flattened.
+    if (conversion.losses.length > 0) {
+      setSaveLosses(conversion.losses)
       return
     }
 
     setSaving(true)
     try {
-      const html = editor?.getHTML() || ''
-      const markdown = htmlToMarkdown(html)
+      const markdown = conversion.markdown
 
       if (isNew) {
         const data: ContentCreate = {
           title,
           description: description || undefined,
           content_type: contentType,
-          body_markdown: contentType === 'student_guide' ? '' : markdown,
-          walkthrough_data: contentType === 'student_guide' ? walkthroughData : undefined,
+          body_markdown: markdown,
+          walkthrough_data: isWalkthrough ? walkthroughData : undefined,
           tags,
           organization: organization || undefined,
         }
@@ -367,8 +1013,8 @@ export default function ContentEditor() {
           title,
           description: description || undefined,
           content_type: contentType,
-          body_markdown: contentType === 'student_guide' ? '' : markdown,
-          walkthrough_data: contentType === 'student_guide' ? walkthroughData : undefined,
+          body_markdown: markdown,
+          walkthrough_data: isWalkthrough ? walkthroughData : undefined,
           tags,
           organization: organization || undefined,
           is_published: isPublished,
@@ -377,8 +1023,7 @@ export default function ContentEditor() {
         await loadContent(id)
       }
     } catch (err) {
-      console.error('Failed to save:', err)
-      alert('Failed to save content')
+      setSaveError(requestFailureMessage(err, 'The server did not say why the save failed.'))
     } finally {
       setSaving(false)
     }
@@ -509,6 +1154,50 @@ export default function ContentEditor() {
           </button>
         </div>
       </div>
+
+      {saveLosses.length > 0 && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-4">
+          <div className="flex">
+            <AlertTriangle className="h-5 w-5 text-amber-600 flex-shrink-0" />
+            <div className="ml-3">
+              <h3 className="text-sm font-medium text-amber-900">Not saved</h3>
+              <p className="mt-1 text-sm text-amber-800">
+                This content is stored as markdown, which cannot hold the following. Saving
+                would drop them without warning, so nothing was sent.
+              </p>
+              <ul className="mt-2 list-disc pl-5 text-sm text-amber-800 space-y-1">
+                {saveLosses.map((loss) => (
+                  <li key={loss}>{loss}</li>
+                ))}
+              </ul>
+              <button
+                onClick={() => setSaveLosses([])}
+                className="mt-3 text-sm font-medium text-amber-900 underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {saveError && (
+        <div className="rounded-md border border-red-300 bg-red-50 p-4">
+          <div className="flex">
+            <AlertTriangle className="h-5 w-5 text-red-600 flex-shrink-0" />
+            <div className="ml-3">
+              <h3 className="text-sm font-medium text-red-900">Not saved</h3>
+              <p className="mt-1 text-sm text-red-800">{saveError}</p>
+              <button
+                onClick={() => setSaveError(null)}
+                className="mt-3 text-sm font-medium text-red-900 underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Main Editor */}

@@ -1,6 +1,6 @@
 // frontend/src/components/diagnostics/ComponentHealth.tsx
 import { useState } from 'react'
-import { ChevronDown, ChevronRight, Server, Network as NetworkIcon, Router, Box, AlertCircle, CheckCircle, Clock, XCircle } from 'lucide-react'
+import { ChevronDown, ChevronRight, Server, Network as NetworkIcon, Box, AlertCircle, CheckCircle, Clock, XCircle } from 'lucide-react'
 import type { Range, Network, VM } from '../../types'
 import clsx from 'clsx'
 
@@ -57,7 +57,7 @@ export function ComponentHealth({ range, networks, vms, onSelectVm, selectedVmId
   }
 
   const errorVms = vms.filter(vm => vm.status === 'error')
-  const errorCount = errorVms.length + (range.status === 'error' ? 1 : 0) + (range.router?.status === 'error' ? 1 : 0)
+  const errorCount = errorVms.length + (range.status === 'error' ? 1 : 0)
 
   return (
     <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
@@ -93,21 +93,8 @@ export function ComponentHealth({ range, networks, vms, onSelectVm, selectedVmId
           )}
         </div>
 
-        {/* Router Status */}
-        {range.router && (
-          <div className="px-4 py-2">
-            <div className="flex items-center gap-2 ml-6">
-              <Router className="w-4 h-4 text-blue-500" />
-              <span className="text-sm text-gray-700">VyOS Router</span>
-              <StatusBadge status={range.router.status} />
-            </div>
-            {range.router.error_message && (
-              <div className="ml-10 mt-1 text-xs text-red-600 bg-red-50 px-2 py-1 rounded">
-                {range.router.error_message}
-              </div>
-            )}
-          </div>
-        )}
+        {/* No router row: the only code that ever created one is the legacy, non-DinD deploy
+            path, which nothing calls. The row reported a component no range has. */}
 
         {/* Networks */}
         <div className="px-4 py-2">

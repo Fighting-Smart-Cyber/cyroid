@@ -3,7 +3,7 @@ from proving_ground.models.base import Base
 from proving_ground.models.user import User, UserRole, UserAttribute, AVAILABLE_ROLES
 from proving_ground.models.resource_tag import ResourceTag
 from proving_ground.models.vm_enums import OSType, VMType, LinuxDistro
-from proving_ground.models.range import Range, RangeStatus
+from proving_ground.models.range import Range, RangeStatus, RangeVisibility, RangeShare
 from proving_ground.models.network import Network
 from proving_ground.models.vm import VM, VMStatus, BootSource
 from proving_ground.models.vm_network import VMNetwork
@@ -30,6 +30,7 @@ from proving_ground.models.notification import Notification, NotificationType, N
 from proving_ground.models.base_image import BaseImage, ImageType
 from proving_ground.models.golden_image import GoldenImage, GoldenImageSource
 from proving_ground.models.platform_secret import PlatformSecret
+from proving_ground.models.feedback import Feedback, FeedbackKind, FeedbackSource, FeedbackStatus
 
 # Catalog models
 from proving_ground.models.catalog import (
@@ -51,6 +52,8 @@ __all__ = [
     "VMType",
     "LinuxDistro",
     "Range",
+    "RangeVisibility",
+    "RangeShare",
     "RangeStatus",
     "Network",
     "VM",
@@ -90,6 +93,10 @@ __all__ = [
     "ImageType",
     "GoldenImage",
     "PlatformSecret",
+    "FeedbackStatus",
+    "FeedbackSource",
+    "FeedbackKind",
+    "Feedback",
     "GoldenImageSource",
     # Catalog
     "CatalogSource",

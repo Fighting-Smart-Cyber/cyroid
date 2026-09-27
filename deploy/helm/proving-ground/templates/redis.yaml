@@ -1,0 +1,132 @@
+# PROVING GROUND's Dramatiq broker (PG-39 / SRE-6).
+#
+# Redis runs in PROVING GROUND's own namespace as a dependency PG operates,
+# not one the environment supplies: no target environment offers a Redis
+# operator, and adding Redis to the cluster capability contract (ADR-0012)
+# would make every one of them owe us something none of them have.
+#
+# Everything PG keeps here is disposable -- see ADR-0015. The flags below
+# enforce that rather than merely documenting it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-redis-config
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: broker
+    app.kubernetes.io/part-of: proving-ground
+data:
+  redis.conf: |
+    # Never write to disk. A profile where Redis happened to persist and one
+    # where it did not would behave differently on restart, and the whole
+    # decision rests on nothing here being worth keeping.
+    save ""
+    appendonly no
+
+    # noeviction, emphatically not allkeys-lru. Under memory pressure an
+    # eviction policy would silently discard queued Dramatiq messages --
+    # deploys that never run, with nothing reporting it. Refusing writes is
+    # loud; losing tasks is not.
+    maxmemory 512mb
+    maxmemory-policy noeviction
+
+    # The NetworkPolicy beside this file is what keeps the broker private.
+    # Protected mode adds nothing once a pod is allowed through and would
+    # reject the workers.
+    protected-mode no
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-redis
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: broker
+    app.kubernetes.io/part-of: proving-ground
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: proving-ground
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-redis
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: broker
+    app.kubernetes.io/part-of: proving-ground
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two Redis pods would be two brokers, and
+  # workers attached to the old one would process a queue nobody is filling.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+      app.kubernetes.io/part-of: proving-ground
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: broker
+        app.kubernetes.io/part-of: proving-ground
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          # Digest-pinned: no runtime tag resolution, so an air-gapped mirror
+          # and a connected cluster run the same bytes (ADR-0007).
+          image: {{ .Values.redis.image | quote }}
+          imagePullPolicy: IfNotPresent
+          args: ["/etc/redis/redis.conf"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 640Mi
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: pg-redis-config
+        # emptyDir, so the "never persist" decision survives someone later
+        # turning appendonly back on: there is nowhere durable to write.
+        - name: data
+          emptyDir: {}

@@ -22,8 +22,10 @@ import {
   X,
   FileCode,
   FileDown,
+  FolderArchive,
 } from 'lucide-react'
 import { contentApi, ContentListItem, ContentType, ContentImport } from '../services/api'
+import { contentBundleApi, bundleErrorDetail } from '../services/contentBundle'
 import { toast } from '../stores/toastStore'
 import { formatDistanceToNow } from 'date-fns'
 
@@ -128,6 +130,25 @@ export default function ContentLibrary() {
     } catch (err) {
       console.error('Failed to export:', err)
       toast.error('Failed to export content')
+    }
+    setActiveMenu(null)
+  }
+
+  async function handleExportBundle(id: string, title: string) {
+    try {
+      const blob = await contentBundleApi.export(id)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+      a.download = `${slug || 'content'}-bundle.tar.gz`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      toast.success('Content exported as a bundle')
+    } catch (err: unknown) {
+      toast.error(bundleErrorDetail(err, 'Failed to export content bundle'))
     }
     setActiveMenu(null)
   }
@@ -415,6 +436,14 @@ export default function ContentLibrary() {
                               >
                                 <FileDown className="h-4 w-4 mr-3" />
                                 Export as PDF
+                              </button>
+                              <button
+                                onClick={() => handleExportBundle(item.id, item.title)}
+                                title="A directory of plain files that git can diff and a person can review"
+                                className="flex items-center w-full px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
+                              >
+                                <FolderArchive className="h-4 w-4 mr-3" />
+                                Export as bundle
                               </button>
                             </div>
                             <div className="border-t border-gray-100">

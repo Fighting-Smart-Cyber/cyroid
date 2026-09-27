@@ -59,6 +59,10 @@ export interface Range {
   stopped_at: string | null
   network_count: number
   vm_count: number
+  // Which substrate produced the two counts above, so a listing can name the unit the way that
+  // substrate does -- "machines" on Kubernetes, "VMs" on Docker. Per range, not per install:
+  // a listing can hold both eras while a Docker install is being migrated.
+  substrate?: 'dind' | 'kubernetes'
   networks?: Network[]
   vms?: VM[]
   router?: RangeRouter | null
@@ -913,10 +917,17 @@ export interface ScenarioDetail extends Scenario {
   events: ScenarioEvent[]
 }
 
+export interface ScenarioProblem {
+  /** The file name, relative to the scenarios directory -- never a host path. */
+  file: string
+  error: string
+}
+
 export interface ScenariosListResponse {
   scenarios: Scenario[]
-  scenarios_dir: string
   total: number
+  /** Files in the library the parser could not read, named so they can be corrected. */
+  problems: ScenarioProblem[]
 }
 
 export interface ScenarioUpload {

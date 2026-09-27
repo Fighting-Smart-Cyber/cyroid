@@ -5,10 +5,17 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { Maximize2, Minimize2, X, RefreshCw, Terminal as TerminalIcon, AlertTriangle } from 'lucide-react'
 import clsx from 'clsx'
+import { requestWebSocketTicket } from '../../hooks/useRealtimeRange'
 
 interface VMConsoleProps {
   vmId: string
   vmHostname: string
+  /**
+   * The session, kept as a prop so that a sign-out or a token refresh
+   * reconnects the console. It is no longer put in the socket URL: the
+   * handshake carries an HttpOnly ticket cookie instead. See
+   * requestWebSocketTicket.
+   */
   token: string
   onClose: () => void
 }
@@ -23,6 +30,12 @@ export function VMConsole({ vmId, vmHostname, token, onClose }: VMConsoleProps) 
   const fitAddon = useRef<FitAddon | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Bumped on every effect run AND on every cleanup. Fetching the ticket is
+  // asynchronous, so the terminal this connect was started for can be disposed
+  // while the request is in flight -- a fast unmount, or React 18's double
+  // mount in development. Without the check the connect writes to a destroyed
+  // terminal and leaves a socket nobody will ever close.
+  const generationRef = useRef(0)
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting')
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -54,7 +67,8 @@ export function VMConsole({ vmId, vmHostname, token, onClose }: VMConsoleProps) 
     fitAddon.current = fit
 
     // Connect WebSocket
-    connectWebSocket(terminal)
+    generationRef.current += 1
+    void connectWebSocket(terminal, generationRef.current)
 
     // Handle resize
     const handleResize = () => {
@@ -63,6 +77,7 @@ export function VMConsole({ vmId, vmHostname, token, onClose }: VMConsoleProps) 
     window.addEventListener('resize', handleResize)
 
     return () => {
+      generationRef.current += 1
       window.removeEventListener('resize', handleResize)
       terminal.dispose()
       if (wsRef.current) {
@@ -74,7 +89,7 @@ export function VMConsole({ vmId, vmHostname, token, onClose }: VMConsoleProps) 
     }
   }, [vmId, token, reconnectCount])
 
-  const connectWebSocket = (terminal: Terminal) => {
+  const connectWebSocket = async (terminal: Terminal, generation: number) => {
     setConnectionStatus('connecting')
     setError(null)
 
@@ -89,11 +104,32 @@ export function VMConsole({ vmId, vmHostname, token, onClose }: VMConsoleProps) 
       }
     }, CONNECTION_TIMEOUT_MS)
 
+    terminal.writeln('\x1b[90mConnecting to ' + vmHostname + '...\x1b[0m')
+
+    // The session is not put in the socket URL. This trades it for an HttpOnly
+    // cookie scoped to this one console's path, which the handshake sends by
+    // itself -- see requestWebSocketTicket.
+    try {
+      await requestWebSocketTicket('console', vmId)
+    } catch {
+      if (generationRef.current !== generation) return
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current)
+      }
+      setConnectionStatus('error')
+      setError('Console ticket refused')
+      terminal.writeln('\r\n\x1b[31mConsole ticket refused\x1b[0m')
+      terminal.writeln('\x1b[33mYou may not have access to this VM, or your session expired.\x1b[0m')
+      terminal.writeln('\x1b[33mSign in again, then use Reconnect.\x1b[0m')
+      return
+    }
+
+    // The terminal was disposed while the ticket was in flight.
+    if (generationRef.current !== generation) return
+
     // Use wss:// for HTTPS, ws:// for HTTP
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = wsProtocol + '//' + window.location.host + '/api/v1/ws/console/' + vmId + '?token=' + token
-
-    terminal.writeln('\x1b[90mConnecting to ' + vmHostname + '...\x1b[0m')
+    const wsUrl = wsProtocol + '//' + window.location.host + '/api/v1/ws/console/' + vmId
 
     const ws = new WebSocket(wsUrl)
 

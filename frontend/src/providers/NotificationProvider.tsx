@@ -32,7 +32,7 @@ export function NotificationProvider({ children }: NotificationProviderProps) {
   const isAuthenticated = useAuthStore((s) => !!s.token)
   const loadFromServer = useNotificationStore((s) => s.loadFromServer)
   const clearAll = useNotificationStore((s) => s.clearAll)
-  const { toasts, addToast, dismissToast, clearAllToasts } = useToasts()
+  const { addToast, clearAllToasts } = useToasts()
 
   // Load notifications from server on mount when authenticated
   // Clear notifications when logged out
@@ -62,8 +62,9 @@ export function NotificationProvider({ children }: NotificationProviderProps) {
   return (
     <NotificationContext.Provider value={{ connectionState, isConnected }}>
       {children}
-      {/* Only show toasts when authenticated */}
-      {isAuthenticated && <ToastContainer toasts={toasts} onDismiss={dismissToast} />}
+      {/* The application's only toast mount point. Removing this line removes every toast in
+          the product; the container reads the shared store itself and takes no props. */}
+      {isAuthenticated && <ToastContainer />}
     </NotificationContext.Provider>
   )
 }

@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-frontend
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "frontend" | nindent 4 }}
+spec:
+  selector:
+    {{- include "pg.component" "frontend" | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-frontend
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "frontend" | nindent 4 }}
+spec:
+  replicas: {{ .Values.frontend.replicas }}
+  selector:
+    matchLabels:
+      {{- include "pg.component" "frontend" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.component" "frontend" | nindent 8 }}
+    spec:
+      {{- include "pg.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: frontend
+          image: {{ include "pg.image" (dict "Values" .Values "Chart" .Chart "name" "pg-frontend") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.frontend.resources | nindent 12 }}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.frontend.replicas) 1) }}
+---
+# As for the API: sequences a node drain rather than allowing the whole deployment to go at once,
+# and only exists at two replicas or more, where there is an eviction it can safely allow.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pg-frontend
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "frontend" | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "pg.component" "frontend" | nindent 6 }}
+{{- end }}

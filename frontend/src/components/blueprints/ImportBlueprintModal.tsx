@@ -1,4 +1,17 @@
 // frontend/src/components/blueprints/ImportBlueprintModal.tsx
+/**
+ * Importing a blueprint package, and describing what is in it before anyone commits to it.
+ *
+ * Two things were wrong here beyond the wording. The file picker accepted `.tar.gz`, which both
+ * import endpoints refuse outright, so choosing one produced a 400 and nothing else. And the
+ * review step offered a "Template Conflict Strategy" for templates that have not existed since
+ * the v2.0 format, over a validator that reports an empty list and an importer that reads the
+ * option nowhere -- a control whose only effect was to make the user think they had made a
+ * decision.
+ *
+ * A package now says which era wrote the blueprint inside it, and the review step names its
+ * workloads and its capability scopes rather than reporting a Kubernetes package as empty.
+ */
 import { useState, useRef, useEffect, useCallback } from 'react';
 import {
   blueprintsApi,
@@ -6,6 +19,7 @@ import {
   BlueprintImportOptions,
   BlueprintImportJobStatus,
 } from '../../services/api';
+import { apiErrorDetail } from '../../lib/blueprints';
 import {
   Upload,
   Loader2,
@@ -24,18 +38,37 @@ interface Props {
 
 type Step = 'upload' | 'validating' | 'review' | 'importing' | 'done';
 
+/**
+ * What the validator reports about a Kubernetes package. `BlueprintImportValidation` in
+ * services/api.ts is hand-written and predates these fields; it is read here rather than widened
+ * there because that file is being replaced by a generated client.
+ */
+interface PackageEra {
+  blueprint_schema_version?: number;
+  included_networks?: string[];
+  included_workloads?: string[];
+  included_capabilities?: string[];
+}
+
+const SCHEMA_VERSION_K8S = 2;
+
+/** What each package format is, for the one line that names it. */
+const PACKAGE_FORMATS: Record<string, string> = {
+  '2.0': 'Legacy Range Export',
+  '3.0': 'Blueprint Export',
+  '4.0': 'Unified Range Blueprint',
+  '5.0': 'Kubernetes Range Blueprint',
+};
+
 export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
   const [step, setStep] = useState<Step>('upload');
   const [file, setFile] = useState<File | null>(null);
-  const [validation, setValidation] = useState<BlueprintImportValidation | null>(null);
+  const [validation, setValidation] = useState<(BlueprintImportValidation & PackageEra) | null>(null);
   const [newName, setNewName] = useState('');
-  const [templateStrategy, setTemplateStrategy] = useState<'skip' | 'update' | 'error'>('skip');
   const [contentStrategy, setContentStrategy] = useState<'skip' | 'rename' | 'use_existing'>('skip');
   const [error, setError] = useState<string | null>(null);
   const [importResult, setImportResult] = useState<{
     blueprintName?: string;
-    templatesCreated: string[];
-    templatesSkipped: string[];
     dockerfilesExtracted?: string[];
     imagesBuilt?: string[];
     contentImported?: boolean;
@@ -78,8 +111,6 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
           if (result) {
             setImportResult({
               blueprintName: result.blueprint_name,
-              templatesCreated: result.templates_created || [],
-              templatesSkipped: result.templates_skipped || [],
               dockerfilesExtracted: result.dockerfiles_extracted,
               imagesBuilt: result.images_built,
               contentImported: result.content_imported,
@@ -116,9 +147,10 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
 
-    // Accept .zip and .tar.gz (for legacy v2.0 Range Export format)
-    if (!selectedFile.name.endsWith('.zip') && !selectedFile.name.endsWith('.tar.gz')) {
-      setError('Please select a ZIP or TAR.GZ file');
+    // Both import endpoints refuse anything that is not a .zip, so accepting a .tar.gz here only
+    // bought the user a 400 they had no way to predict.
+    if (!selectedFile.name.endsWith('.zip')) {
+      setError('Please select a ZIP file');
       return;
     }
 
@@ -131,8 +163,8 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
       setValidation(result);
       setNewName(result.blueprint_name);
       setStep('review');
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to validate blueprint');
+    } catch (err: unknown) {
+      setError(apiErrorDetail(err, 'Failed to validate blueprint'));
       setStep('upload');
     }
   };
@@ -145,7 +177,6 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
 
     try {
       const options: BlueprintImportOptions = {
-        template_conflict_strategy: templateStrategy,
         content_conflict_strategy: contentStrategy,
       };
 
@@ -158,8 +189,8 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
       const { job_id } = await blueprintsApi.importStart(file, options);
       setJobId(job_id);
       startPolling(job_id);
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to start import');
+    } catch (err: unknown) {
+      setError(apiErrorDetail(err, 'Failed to start import'));
       setStep('review');
     }
   };
@@ -187,7 +218,6 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
     setFile(null);
     setValidation(null);
     setNewName('');
-    setTemplateStrategy('skip');
     setContentStrategy('skip');
     setError(null);
     setImportResult(null);
@@ -226,6 +256,10 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
     ? Math.round((jobStatus.progress / jobStatus.total_steps) * 100)
     : 0;
 
+  const workloads = validation?.included_workloads ?? [];
+  const capabilities = validation?.included_capabilities ?? [];
+  const isKubernetesPackage = validation?.blueprint_schema_version === SCHEMA_VERSION_K8S;
+
   return (
     <Modal
       isOpen={true}
@@ -250,13 +284,13 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
                 Click to select a blueprint package
               </p>
               <p className="text-xs text-gray-500 mt-1">
-                Supports Blueprint Export (.zip) and legacy Range Export (.tar.gz)
+                A .zip written by Export Blueprint on this or another install
               </p>
             </div>
             <input
               ref={fileInputRef}
               type="file"
-              accept=".zip,.tar.gz"
+              accept=".zip"
               onChange={handleFileSelect}
               className="hidden"
             />
@@ -302,9 +336,8 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
             {validation.manifest_version && (
               <div className="text-xs text-gray-500 -mt-2">
                 Package format: v{validation.manifest_version}
-                {validation.manifest_version === '2.0' && ' (Legacy Range Export)'}
-                {validation.manifest_version === '3.0' && ' (Blueprint Export)'}
-                {validation.manifest_version === '4.0' && ' (Unified Range Blueprint)'}
+                {PACKAGE_FORMATS[validation.manifest_version] &&
+                  ` (${PACKAGE_FORMATS[validation.manifest_version]})`}
               </div>
             )}
 
@@ -330,6 +363,19 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
             <div className="bg-gray-50 rounded-md p-3">
               <h4 className="text-sm font-medium text-gray-700 mb-2">Package Contents</h4>
               <div className="grid grid-cols-2 gap-2 text-sm">
+                {validation.included_networks && validation.included_networks.length > 0 && (
+                  <div className="flex items-center text-gray-600">
+                    <span className="w-2 h-2 bg-green-400 rounded-full mr-2" />
+                    {validation.included_networks.length}{' '}
+                    {isKubernetesPackage ? 'network attachment(s)' : 'network(s)'}
+                  </div>
+                )}
+                {workloads.length > 0 && (
+                  <div className="flex items-center text-gray-600">
+                    <span className="w-2 h-2 bg-green-400 rounded-full mr-2" />
+                    {workloads.length} machine(s)
+                  </div>
+                )}
                 {validation.msel_included && (
                   <div className="flex items-center text-gray-600">
                     <span className="w-2 h-2 bg-green-400 rounded-full mr-2" />
@@ -357,42 +403,23 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
               </div>
             </div>
 
-            {/* Included Templates */}
-            {validation.included_templates.length > 0 && (
+            {/* Capability packages. Scope is required on every capability and has no default, so
+                it is shown here: it decides whether a reset touches one learner or all of them. */}
+            {capabilities.length > 0 && (
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Included Templates ({validation.included_templates.length})
+                  Capability Packages ({capabilities.length})
                 </label>
                 <div className="bg-gray-50 rounded-md p-3 max-h-32 overflow-y-auto">
                   <ul className="text-sm text-gray-600 space-y-1">
-                    {validation.included_templates.map((tpl) => (
-                      <li key={tpl} className="flex items-center">
+                    {capabilities.map((capability) => (
+                      <li key={capability} className="flex items-center">
                         <span className="w-2 h-2 bg-indigo-400 rounded-full mr-2" />
-                        {tpl}
+                        {capability}
                       </li>
                     ))}
                   </ul>
                 </div>
-              </div>
-            )}
-
-            {/* Template Conflict Strategy */}
-            {validation.warnings.some((w) => w.includes('already exists')) && (
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Template Conflict Strategy
-                </label>
-                <select
-                  value={templateStrategy}
-                  onChange={(e) =>
-                    setTemplateStrategy(e.target.value as 'skip' | 'update' | 'error')
-                  }
-                  className="block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
-                >
-                  <option value="skip">Use existing templates (skip)</option>
-                  <option value="update">Update existing templates</option>
-                  <option value="error">Fail if templates exist</option>
-                </select>
               </div>
             )}
 
@@ -516,6 +543,18 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
             <div className="bg-gray-50 rounded-md p-3">
               <h4 className="text-sm font-medium text-gray-700 mb-2">Import Summary</h4>
               <div className="grid grid-cols-2 gap-2 text-sm text-gray-600">
+                {workloads.length > 0 && (
+                  <div className="flex items-center">
+                    <CheckCircle className="h-3 w-3 text-green-500 mr-2" />
+                    {workloads.length} machine(s)
+                  </div>
+                )}
+                {capabilities.length > 0 && (
+                  <div className="flex items-center">
+                    <CheckCircle className="h-3 w-3 text-green-500 mr-2" />
+                    {capabilities.length} capability package(s)
+                  </div>
+                )}
                 {importResult.dockerfilesExtracted && importResult.dockerfilesExtracted.length > 0 && (
                   <div className="flex items-center">
                     <CheckCircle className="h-3 w-3 text-green-500 mr-2" />
@@ -542,35 +581,6 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
                 )}
               </div>
             </div>
-
-            {importResult.templatesCreated.length > 0 && (
-              <div>
-                <h4 className="text-sm font-medium text-gray-700 mb-2">
-                  Templates Created ({importResult.templatesCreated.length})
-                </h4>
-                <ul className="text-sm text-gray-600 bg-gray-50 rounded-md p-3 space-y-1">
-                  {importResult.templatesCreated.map((tpl, i) => (
-                    <li key={i} className="flex items-center">
-                      <CheckCircle className="h-3 w-3 text-green-500 mr-2" />
-                      {tpl}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {importResult.templatesSkipped.length > 0 && (
-              <div>
-                <h4 className="text-sm font-medium text-gray-700 mb-2">
-                  Templates Skipped ({importResult.templatesSkipped.length})
-                </h4>
-                <ul className="text-sm text-gray-500 bg-gray-50 rounded-md p-3 space-y-1">
-                  {importResult.templatesSkipped.map((tpl, i) => (
-                    <li key={i}>{tpl} (using existing)</li>
-                  ))}
-                </ul>
-              </div>
-            )}
 
             {importResult.warnings.length > 0 && (
               <div className="bg-amber-50 rounded-md p-3">
@@ -612,7 +622,8 @@ export default function ImportBlueprintModal({ onClose, onSuccess }: Props) {
               onClick={handleImport}
               disabled={
                 !newName ||
-                (validation?.conflicts.length ?? 0) > 0 && newName === validation?.blueprint_name
+                !validation?.valid ||
+                ((validation?.conflicts.length ?? 0) > 0 && newName === validation?.blueprint_name)
               }
               className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50"
             >

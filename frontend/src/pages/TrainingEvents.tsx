@@ -21,6 +21,9 @@ import {
 } from 'lucide-react'
 import { trainingEventsApi, TrainingEventListItem, EventStatus } from '../services/api'
 import { useAuthStore } from '../stores/authStore'
+import { toast } from '../stores/toastStore'
+import { apiErrorDetail } from '../lib/blueprints'
+import { EventAction, eventActionWords, lifecycleFailureMessage } from '../lib/trainingEvents'
 import { format, formatDistanceToNow, parseISO, isAfter, isBefore } from 'date-fns'
 
 const STATUS_INFO: Record<EventStatus, { label: string; color: string; icon: typeof Calendar }> = {
@@ -42,7 +45,7 @@ export default function TrainingEvents() {
   const [myEventsOnly, setMyEventsOnly] = useState(false)
   const [showFilters, setShowFilters] = useState(false)
   const [activeMenu, setActiveMenu] = useState<string | null>(null)
-  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [busy, setBusy] = useState<{ id: string; action: EventAction } | null>(null)
 
   const isInstructor = user?.roles?.includes('admin') || user?.roles?.includes('engineer')
 
@@ -50,8 +53,10 @@ export default function TrainingEvents() {
     loadEvents()
   }, [statusFilter, myEventsOnly])
 
-  async function loadEvents() {
-    setLoading(true)
+  // `showSpinner` is off when refreshing after an action: blanking the list to a spinner would
+  // take the row the user just acted on off the screen along with its result.
+  async function loadEvents(showSpinner = true) {
+    if (showSpinner) setLoading(true)
     setError(null)
     try {
       const params: Record<string, unknown> = {}
@@ -60,8 +65,7 @@ export default function TrainingEvents() {
       const response = await trainingEventsApi.list(params as { status?: EventStatus; my_events?: boolean })
       setEvents(response.data)
     } catch (err) {
-      setError('Failed to load events')
-      console.error(err)
+      setError(apiErrorDetail(err, 'Failed to load events'))
     } finally {
       setLoading(false)
     }
@@ -79,17 +83,26 @@ export default function TrainingEvents() {
     return true
   })
 
+  function eventName(id: string): string {
+    return events.find((e) => e.id === id)?.name ?? 'this event'
+  }
+
   async function handleDelete(id: string) {
     if (!confirm('Are you sure you want to delete this event? All associated student labs will be permanently deleted.')) return
+    const name = eventName(id)
     setActiveMenu(null)
-    setDeletingId(id)
+    setBusy({ id, action: 'delete' })
     try {
       await trainingEventsApi.delete(id)
-      setEvents(events.filter((e) => e.id !== id))
+      setEvents((current) => current.filter((e) => e.id !== id))
+      toast.success(`Deleted "${name}"`)
     } catch (err) {
-      console.error('Failed to delete:', err)
+      toast.error(lifecycleFailureMessage('delete', name, err))
+      // A teardown that stopped partway has already destroyed some of the labs, so the row the
+      // user is looking at is stale whether or not the event itself survived.
+      loadEvents(false)
     } finally {
-      setDeletingId(null)
+      setBusy(null)
     }
   }
 
@@ -107,6 +120,9 @@ export default function TrainingEvents() {
       }
     }
 
+    const name = eventName(id)
+    setActiveMenu(null)
+    setBusy({ id, action })
     try {
       switch (action) {
         case 'publish':
@@ -123,19 +139,29 @@ export default function TrainingEvents() {
           await trainingEventsApi.cancel(id)
           break
       }
-      loadEvents()
+      toast.success(`${eventActionWords(action).done} "${name}"`)
     } catch (err) {
-      console.error(`Failed to ${action}:`, err)
+      toast.error(lifecycleFailureMessage(action, name, err))
+    } finally {
+      setBusy(null)
+      // The server decides what the event is now, so nothing here advances the status on its own:
+      // a refused start leaves the event where it was, and a complete whose teardown failed
+      // partway leaves it running with fewer labs than it had.
+      loadEvents(false)
     }
-    setActiveMenu(null)
   }
 
   async function handleJoin(eventId: string) {
+    const name = eventName(eventId)
+    setBusy({ id: eventId, action: 'join' })
     try {
       await trainingEventsApi.join(eventId)
-      loadEvents()
+      toast.success(`Joined "${name}"`)
+      loadEvents(false)
     } catch (err) {
-      console.error('Failed to join:', err)
+      toast.error(lifecycleFailureMessage('join', name, err))
+    } finally {
+      setBusy(null)
     }
   }
 
@@ -272,13 +298,13 @@ export default function TrainingEvents() {
             const statusInfo = STATUS_INFO[event.status]
             const StatusIcon = statusInfo.icon
             const canManage = user?.id === event.created_by_id || user?.roles?.includes('admin')
-            const isDeleting = deletingId === event.id
+            const busyAction = busy?.id === event.id ? busy.action : null
 
             return (
               <div
                 key={event.id}
                 className={`bg-white shadow rounded-lg transition-shadow ${
-                  isDeleting ? 'opacity-50 pointer-events-none' : 'hover:shadow-md'
+                  busyAction ? 'opacity-50 pointer-events-none' : 'hover:shadow-md'
                 }`}
               >
                 <div className="p-4 sm:p-6">
@@ -333,17 +359,18 @@ export default function TrainingEvents() {
                       {!canManage && event.status === 'scheduled' && (
                         <button
                           onClick={() => handleJoin(event.id)}
-                          className="inline-flex items-center px-3 py-1 border border-primary-300 text-sm font-medium rounded text-primary-700 bg-primary-50 hover:bg-primary-100"
+                          disabled={busyAction !== null}
+                          className="inline-flex items-center px-3 py-1 border border-primary-300 text-sm font-medium rounded text-primary-700 bg-primary-50 hover:bg-primary-100 disabled:opacity-50"
                         >
                           Join
                         </button>
                       )}
                       {canManage && (
                         <div className="relative">
-                          {isDeleting ? (
+                          {busyAction ? (
                             <div className="flex items-center px-3 py-1 text-sm text-gray-500">
                               <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                              Deleting...
+                              {eventActionWords(busyAction).progressive}...
                             </div>
                           ) : (
                             <>

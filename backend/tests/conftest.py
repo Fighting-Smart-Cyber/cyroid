@@ -31,6 +31,50 @@ def db_session():
 
 
 @pytest.fixture
+def worker_db_session(tmp_path):
+    """`db_session` on a real file, for tests that run a worker task.
+
+    `db_session` is `sqlite:///:memory:` behind a StaticPool, which is ONE connection shared by
+    every session bound to that engine. That is right while a test uses a single session, and
+    wrong for the deploy and start tasks: both open a second session for the progress reporter
+    (`_progress_session`), whose writes commit from `asyncio.to_thread` -- a different thread from
+    the one the task's own session is on. Two sessions committing down one connection from two
+    threads corrupts the task's transaction.
+
+    Measured on this harness, committing from both threads for 2,000 iterations: one shared
+    session raises ~2,000 times, two sessions on the StaticPool raise ~345,000 times, and two
+    sessions on a file-backed engine -- a real connection each, as production has -- raise zero.
+
+    A module that runs worker tasks overrides `db_session` with this.
+    """
+    engine = create_engine(
+        f"sqlite:///{tmp_path}/test.db",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = TestingSessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.fixture
+def task_session_factory(db_session):
+    """Stand in for `get_session_local`, which returns a NEW session on every call.
+
+    A double that hands back one shared session puts the task's session and the progress
+    reporter's session back into the same object -- the very thing `_progress_session` exists to
+    keep apart. Pair this with `worker_db_session`; on the in-memory engine it is worse than the
+    bug it fixes. See `worker_db_session` for the measurements.
+    """
+    bind = db_session.get_bind()
+    return lambda: sessionmaker(autocommit=False, autoflush=False, bind=bind)
+
+
+@pytest.fixture
 def mock_dind_service():
     """Mock DinD service for integration tests."""
     mock_service = MagicMock()

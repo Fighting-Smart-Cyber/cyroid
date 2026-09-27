@@ -69,7 +69,11 @@ def test_plain_containers_do_not_get_vm_headroom():
     for name in ("_deploy_with_dind", "sync_range"):
         src = _fn_src(name)
         idx = src.find("_vm_container_memory_mb")
-        window = src[max(0, idx - 200) : idx + 300]
+        # Wide enough to span the whole conditional expression. The call grew
+        # multi-line when it gained the ISO-install allowance, which pushed
+        # "if privileged" out of a 300-char window while the guard it checks
+        # for was still there -- a window too tight fails on formatting.
+        window = src[max(0, idx - 200) : idx + 800]
         assert "privileged" in window, (
             f"{name} applies the emulator headroom unconditionally; only "
             f"privileged (QEMU/dockur) VMs need it."

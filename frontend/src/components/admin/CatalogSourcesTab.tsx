@@ -22,6 +22,7 @@ import {
 import clsx from 'clsx'
 import { ConfirmDialog } from '../common/ConfirmDialog'
 import { BRANDING } from '../../lib/branding'
+import { apiErrorDetail } from '../../lib/apiError'
 
 export default function CatalogSourcesTab() {
   const [sources, setSources] = useState<CatalogSource[]>([])
@@ -51,8 +52,8 @@ export default function CatalogSourcesTab() {
     try {
       const res = await catalogApi.listSources()
       setSources(res.data)
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to load catalog sources')
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to load catalog sources'))
     } finally {
       setLoading(false)
     }
@@ -104,8 +105,8 @@ export default function CatalogSourcesTab() {
       }
       setShowModal(false)
       fetchSources()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to save catalog source')
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to save catalog source'))
     } finally {
       setSubmitting(false)
     }
@@ -117,8 +118,8 @@ export default function CatalogSourcesTab() {
       await catalogApi.syncSource(source.id)
       toast.success(`Synced "${source.name}" successfully`)
       fetchSources()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || `Failed to sync "${source.name}"`)
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, `Failed to sync "${source.name}"`))
     } finally {
       setSyncingSourceId(null)
     }
@@ -132,8 +133,8 @@ export default function CatalogSourcesTab() {
       toast.success(`Deleted source "${deleteConfirm.source.name}"`)
       setDeleteConfirm({ source: null, isLoading: false })
       fetchSources()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to delete source')
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to delete source'))
       setDeleteConfirm({ source: null, isLoading: false })
     }
   }

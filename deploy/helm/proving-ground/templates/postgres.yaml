@@ -1,0 +1,89 @@
+{{- if .Values.postgres.enabled }}
+# The k3s profile's Postgres. On AKS and on-prem the environment supplies one (ADR-0012) and this
+# is `enabled: false` with `externalUrl` set.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-postgres
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "postgres" | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "pg.component" "postgres" | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg-postgres
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "postgres" | nindent 4 }}
+spec:
+  serviceName: pg-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pg.component" "postgres" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.component" "postgres" | nindent 8 }}
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: proving_ground
+            - name: POSTGRES_DB
+              value: proving_ground
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: pg-platform, key: POSTGRES_PASSWORD}}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "proving_ground"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "proving_ground"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  # Stated rather than inherited. This is the API's default today, so it changes nothing now, and
+  # that is the point: the claim holding the learner record must not start being deleted because a
+  # later edit scaled the set to zero, or because a default moved. `helm.sh/resource-policy: keep`
+  # cannot cover this claim -- helm never created it; the StatefulSet controller did -- so this
+  # field is the whole of the protection.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.postgres.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.size }}
+{{- end }}

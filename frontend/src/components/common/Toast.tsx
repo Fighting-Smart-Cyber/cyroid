@@ -1,7 +1,16 @@
 // frontend/src/components/common/Toast.tsx
 /**
- * Toast notification component for displaying real-time feedback.
- * Supports optional action buttons for user interaction.
+ * The application's one toast stack.
+ *
+ * There were two, at the same fixed coordinates: this one, mounted by the shell, and a second
+ * one in components/notifications that the realtime notifications fed. Whichever rendered second
+ * covered the first, so a range that failed to deploy and a password that failed to change could
+ * each hide the other. That one is now a shim over this store (see
+ * components/notifications/ToastContainer.tsx) and this is the only thing that draws a toast.
+ *
+ * Say something with `toast.success | error | warning | info | withActions` from
+ * stores/toastStore. Mount this exactly once, in NotificationProvider -- it wraps every route,
+ * including the pop-out consoles and the student lab, which the shell does not.
  */
 import { useToastStore, ToastType, ToastAction } from '../../stores/toastStore'
 import { X, CheckCircle, AlertCircle, AlertTriangle, Info } from 'lucide-react'
@@ -50,20 +59,39 @@ function ActionButton({
   )
 }
 
-export function ToastContainer() {
+interface ToastContainerProps {
+  /** How many are on screen at once. A deploy emits a step per workload and the rest of the
+   *  screen should not disappear behind them; the bell keeps the full record either way. */
+  maxVisible?: number
+}
+
+export function ToastContainer({ maxVisible = 3 }: ToastContainerProps = {}) {
   const toasts = useToastStore((state) => state.toasts)
   const removeToast = useToastStore((state) => state.removeToast)
 
-  if (toasts.length === 0) return null
+  // The newest ones: the store appends, and the message that just arrived is the one being
+  // waited on.
+  const visible = toasts.slice(-maxVisible)
 
+  // Rendered even when empty. A live region has to be in the document before something is put
+  // into it, or a screen reader announces nothing; and the container takes no pointer events, so
+  // an empty one cannot swallow a click in the corner it sits in.
+  //
+  // The width is clamped to the viewport as well as to 24rem: a toast at its full width on a
+  // 375px screen started off the left edge and took the page's horizontal scrollbar with it.
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm">
-      {toasts.map((toast) => (
+    <div
+      className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-[min(24rem,calc(100vw-2rem))] pointer-events-none"
+      role="status"
+      aria-live="polite"
+      aria-label="Notifications"
+    >
+      {visible.map((toast) => (
         <div
           key={toast.id}
           className={`
             flex flex-col gap-2 px-4 py-3 rounded-lg border shadow-lg
-            animate-slide-in-right
+            animate-slide-in-right pointer-events-auto
             ${bgColorMap[toast.type]}
           `}
         >
@@ -71,10 +99,14 @@ export function ToastContainer() {
             <div className="flex-shrink-0 mt-0.5">
               {iconMap[toast.type]}
             </div>
-            <p className="text-sm text-white flex-1">{toast.message}</p>
+            {/* min-w-0 and break-words together: a flex item will not shrink below its longest
+                word on its own, and these messages carry range names, workload names and error
+                strings that have no spaces in them. */}
+            <p className="text-sm text-white flex-1 min-w-0 break-words">{toast.message}</p>
             <button
               onClick={() => removeToast(toast.id)}
               className="flex-shrink-0 text-gray-400 hover:text-white transition-colors"
+              aria-label="Dismiss notification"
             >
               <X className="w-4 h-4" />
             </button>

@@ -1,15 +1,31 @@
 # backend/proving_ground/api/vms.py
+import re
 import asyncio
 import ipaddress
 from typing import List, Optional, Tuple
 from uuid import UUID
 import logging
 
-from fastapi import APIRouter, HTTPException, status, Request, Query
+from fastapi import APIRouter, HTTPException, status, Request, Response, Query
 from sqlalchemy.orm import joinedload, Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from proving_ground.api.deps import DBSession, CurrentUser
+from proving_ground.api import kubernetes_ranges
+from proving_ground.api.deps import (
+    DBSession,
+    CurrentUser,
+    check_range_access,
+    check_range_control,
+)
+from proving_ground.utils.security import (
+    CONSOLE_TICKET_MINUTES,
+    create_console_ticket,
+    verify_console_ticket,
+)
+
+# The console ticket's cookie. Scoped per-VM by path at set time, so the name
+# is shared while the value never travels to a VM it was not issued for.
+CONSOLE_COOKIE_NAME = "pg_console_ticket"
 from proving_ground.models.vm import VM, VMStatus
 from proving_ground.models.range import Range, RangeStatus
 from proving_ground.models.network import Network
@@ -97,6 +113,65 @@ def filter_vms_by_visibility(vms: List[VM], range_obj: Range, user: User, db: Se
 
     # No visibility restrictions apply
     return vms
+
+
+def check_console_access(vm: VM, user: User, db: Session) -> None:
+    """May this user open THIS VM's console? Raises 403 if not.
+
+    A console is interactive control of a running machine. It is not a read,
+    and the read model is wrong for it in two ways that were both live:
+
+    `check_resource_access` grants an untagged resource to everyone
+    ("no tags = public"). Every range here is untagged, so any non-student
+    account was entitled to every console. That is how jon.rannabargar, who
+    owns nothing, opened an admin-owned range by pasting the URL.
+
+    `can_access_vm_console` returns True immediately for any engineer or
+    evaluator, on any range. Holding a role is not a relationship to someone
+    else's exercise.
+
+    Entitlement here is explicit: admin, the range's owner, the learner it is
+    assigned to, or a participant in its training event. Everyone else is
+    refused, and a role grants nothing on its own. can_access_vm_console still
+    decides whether a VM is HIDDEN from someone already entitled -- that is a
+    different question and it answers it well.
+    """
+    range_obj = db.query(Range).filter(Range.id == vm.range_id).first()
+    if not range_obj:
+        # No range means no way to establish entitlement. Refuse rather than
+        # fall through: the old code returned True here.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Console access not available for this VM",
+        )
+
+    entitled = (
+        user.is_admin or range_obj.created_by == user.id or range_obj.assigned_to_user_id == user.id
+    )
+
+    if not entitled and range_obj.training_event_id:
+        entitled = (
+            db.query(EventParticipant)
+            .filter(
+                EventParticipant.event_id == range_obj.training_event_id,
+                EventParticipant.user_id == user.id,
+            )
+            .first()
+            is not None
+        )
+
+    if not entitled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have console access to this VM",
+        )
+
+    # Entitled, but the VM may still be hidden from them for this exercise.
+    if not can_access_vm_console(vm, user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Console access not available for this VM",
+        )
 
 
 def can_access_vm_console(vm: VM, user: User, db: Session) -> bool:
@@ -489,6 +564,7 @@ def load_vm_source(
 
 @router.get("", response_model=List[VMResponse])
 def list_vms(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    check_range_access(range_id, current_user, db)
     """List all VMs in a range, filtered by visibility for students."""
     # Verify range exists
     range_obj = db.query(Range).filter(Range.id == range_id).first()
@@ -567,6 +643,23 @@ def _assert_guest_ram_fits_range(range_obj, guest_ram_mb) -> None:
 
 @router.post("", response_model=VMResponse, status_code=status.HTTP_201_CREATED)
 def create_vm(vm_data: VMCreate, db: DBSession, current_user: CurrentUser):
+    # Adding a VM to a range is changing that range.
+    check_range_control(vm_data.range_id, current_user, db)
+
+    if kubernetes_ranges.is_kubernetes():
+        # Same reason as create_network: the row is all this writes, and on the
+        # cluster nothing turns it into a machine. It would be counted by the
+        # range page and enable a start that reaches for a daemon that is absent.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This install runs on the Kubernetes substrate, where a range's machines "
+                "are declared as workloads in its blueprint and created on the cluster "
+                "when the range deploys. Edit the blueprint and redeploy; a machine added "
+                "here would exist only in the database."
+            ),
+        )
+
     # Verify range exists
     range_obj = db.query(Range).filter(Range.id == vm_data.range_id).first()
     if not range_obj:
@@ -750,6 +843,46 @@ def list_allowed_devices(current_user: CurrentUser):
     ]
 
 
+@router.get("/console-authz")
+def authorize_console_request(request: Request, db: DBSession):
+    """Traefik's forwardAuth target. 200 lets the proxy through, 403 stops it.
+
+    Deliberately takes no CurrentUser: the request being authorised is the
+    iframe's, which has no Authorization header. The ticket cookie is the
+    credential, and it is the only one accepted here.
+
+    The VM is read from X-Forwarded-Uri rather than a path parameter, because
+    Traefik calls this endpoint directly and passes the original request's
+    details in headers.
+    """
+    uri = request.headers.get("X-Forwarded-Uri", "")
+    m = re.match(r"^/vnc/([0-9a-fA-F-]{36})(/|$|\?)", uri)
+    if not m:
+        logger.warning(f"Console authz called with an unexpected URI: {uri[:120]!r}")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    try:
+        vm_id = UUID(m.group(1))
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden") from None
+
+    ticket = request.cookies.get(CONSOLE_COOKIE_NAME)
+    if not ticket:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No console ticket")
+
+    user_id = verify_console_ticket(ticket, vm_id)
+    if user_id is None:
+        # Bad signature, expired, or a ticket for a different VM.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid console ticket")
+
+    return {"ok": True}
+
+
+# Declared above /{vm_id} on purpose, for the same reason as
+# /allowed-devices: FastAPI matches in declaration order, so a static
+# path after a dynamic one is unreachable. Below it, Traefik's
+# forwardAuth calls would arrive at get_vm with vm_id="console-authz"
+# and every console request would be refused.
 @router.get("/{vm_id}", response_model=VMResponse)
 def get_vm(vm_id: UUID, db: DBSession, current_user: CurrentUser):
     vm = db.query(VM).filter(VM.id == vm_id).first()
@@ -758,6 +891,9 @@ def get_vm(vm_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
         )
+
+    check_range_access(vm.range_id, current_user, db)
+
     base_image, golden_image, snapshot = load_vm_source(db, vm)
     return vm_to_response(vm, db, base_image, golden_image, snapshot)
 
@@ -775,6 +911,8 @@ def update_vm(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
         )
+
+    check_range_control(vm.range_id, current_user, db)
 
     update_data = vm_data.model_dump(exclude_unset=True)
 
@@ -816,6 +954,8 @@ def delete_vm(vm_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
         )
+
+    check_range_control(vm.range_id, current_user, db)
 
     # Get range for DinD mode check
     range_obj = db.query(Range).filter(Range.id == vm.range_id).first()
@@ -916,6 +1056,8 @@ def _start_or_provision_vm(vm_id: UUID, db: Session, current_user, provision_onl
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
         )
+
+    check_range_control(vm.range_id, current_user, db)
 
     if vm.status not in [VMStatus.STOPPED, VMStatus.PENDING]:
         raise HTTPException(
@@ -2140,6 +2282,8 @@ def stop_vm(vm_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="VM not found",
         )
 
+    check_range_control(vm.range_id, current_user, db)
+
     if vm.status != VMStatus.RUNNING:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2209,6 +2353,8 @@ def get_vm_stats(vm_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="VM not found",
         )
 
+    check_range_access(vm.range_id, current_user, db)
+
     if vm.status != VMStatus.RUNNING:
         return {"vm_id": str(vm.id), "status": vm.status.value, "stats": None}
 
@@ -2247,6 +2393,44 @@ def _vm_emulated_type(vm) -> "str | None":
 _QEMU_VM_TYPES = ("linux_vm", "windows_vm", "macos_vm")
 
 
+@router.post("/{vm_id}/console-ticket")
+def issue_console_ticket(vm_id: UUID, db: DBSession, current_user: CurrentUser, response: Response):
+    """Exchange an authenticated session for a short-lived console ticket.
+
+    The console loads in an iframe, so its requests carry no Authorization
+    header -- the JWT lives in localStorage and a browser navigation knows
+    nothing about it. The ticket is delivered as a cookie instead, which the
+    browser then sends on every request under /vnc/{vm_id}, the websocket and
+    each asset included.
+
+    The cookie is scoped to that one path, so a ticket for one VM is not
+    presented to another, and HttpOnly so a script cannot read it back out.
+    """
+    vm = db.query(VM).filter(VM.id == vm_id).first()
+    if not vm:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VM not found")
+
+    check_console_access(vm, current_user, db)
+
+    ticket = create_console_ticket(vm.id, current_user.id)
+    response.set_cookie(
+        key=CONSOLE_COOKIE_NAME,
+        value=ticket,
+        # A session cookie, deliberately: no max_age, so closing the browser
+        # discards it rather than leaving a working console key behind on a
+        # shared machine. The token's own expiry still bounds it either way.
+        expires=None,
+        path=f"/vnc/{vm_id}",
+        httponly=True,
+        samesite="lax",
+        # Set only over TLS in production. Left off when the request itself
+        # arrived over plain HTTP, or a local http:// deployment could never
+        # send the cookie back and the console would fail closed for everyone.
+        secure=get_settings().console_cookie_secure,
+    )
+    return {"expires_in": CONSOLE_TICKET_MINUTES * 60}
+
+
 @router.get("/{vm_id}/vnc-info")
 def get_vm_vnc_info(vm_id: UUID, db: DBSession, current_user: CurrentUser, request: Request):
     """Get VNC console connection info for a VM"""
@@ -2257,12 +2441,11 @@ def get_vm_vnc_info(vm_id: UUID, db: DBSession, current_user: CurrentUser, reque
             detail="VM not found",
         )
 
-    # Check visibility - students can't access hidden VMs
-    if not can_access_vm_console(vm, current_user, db):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Console access not available for this VM",
-        )
+    # Two questions, not one. can_access_vm_console only asks whether this VM is
+    # HIDDEN from the caller; it never asks whether they are entitled to the
+    # range in the first place, and returns True for a range they have nothing
+    # to do with.
+    check_console_access(vm, current_user, db)
 
     if vm.status != VMStatus.RUNNING:
         raise HTTPException(
@@ -2445,6 +2628,8 @@ def get_vm_networks(vm_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="VM not found",
         )
 
+    check_range_access(vm.range_id, current_user, db)
+
     if not vm.container_id:
         return {
             "vm_id": str(vm.id),
@@ -2507,6 +2692,8 @@ def get_network_available_ips(
             detail="Network not found",
         )
 
+    check_range_access(network.range_id, current_user, db)
+
     available_ips = get_available_ips_in_range(network, db, limit=limit)
 
     return {
@@ -2522,6 +2709,7 @@ def get_network_available_ips(
 @router.get("/range/{range_id}/networks")
 def get_range_vm_networks(range_id: UUID, db: DBSession, current_user: CurrentUser):
     """Get all network interfaces for all VMs in a range"""
+    check_range_access(range_id, current_user, db)
     # Verify range exists
     range_obj = db.query(Range).filter(Range.id == range_id).first()
     if not range_obj:
@@ -2594,6 +2782,8 @@ def add_vm_network(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
         )
+
+    check_range_control(vm.range_id, current_user, db)
 
     if vm.status != VMStatus.RUNNING:
         raise HTTPException(
@@ -2673,6 +2863,8 @@ def remove_vm_network(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
         )
+
+    check_range_control(vm.range_id, current_user, db)
 
     if vm.status != VMStatus.RUNNING:
         raise HTTPException(
@@ -2761,6 +2953,8 @@ def update_vm_resources(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
         )
+
+    check_range_control(vm.range_id, current_user, db)
 
     cpu = resources.cpu if resources.cpu is not None else vm.cpu
     ram_mb = resources.ram_mb if resources.ram_mb is not None else vm.ram_mb
@@ -2868,6 +3062,8 @@ def apply_vm_config(vm_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="VM not found",
         )
 
+    check_range_control(vm.range_id, current_user, db)
+
     if not vm.container_id:
         # Nothing to reconcile: the next provision/start builds from the
         # current environment anyway.
@@ -2941,6 +3137,8 @@ def restart_vm(vm_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
         )
+
+    check_range_control(vm.range_id, current_user, db)
 
     if vm.status != VMStatus.RUNNING:
         raise HTTPException(
@@ -3031,17 +3229,8 @@ def get_vm_logs(
             detail="VM not found",
         )
 
-    range_obj = db.query(Range).filter(Range.id == vm.range_id).first()
-    if not range_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Range not found",
-        )
-    if range_obj.created_by != current_user.id and not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized",
-        )
+    # Was owner-or-admin written out by hand; same rule, one definition.
+    check_range_control(vm.range_id, current_user, db)
 
     if not vm.container_id:
         raise HTTPException(

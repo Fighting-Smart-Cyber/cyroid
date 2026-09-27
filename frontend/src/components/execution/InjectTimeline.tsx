@@ -2,10 +2,13 @@
 import { useState } from 'react'
 import {
   Play, SkipForward, Clock, CheckCircle, XCircle,
-  AlertCircle, Loader2, ChevronDown, ChevronUp, FileCode
+  AlertCircle, Loader2, ChevronDown, ChevronUp, FileCode, HelpCircle
 } from 'lucide-react'
+import { isAxiosError } from 'axios'
 import { Inject, InjectStatus, MSEL } from '../../types'
 import { mselApi } from '../../services/api'
+import { describeInjectActions, formatInjectTime, injectRefusalText } from '../../lib/injectActions'
+import { useSubstrate } from '../../stores/capabilitiesStore'
 import clsx from 'clsx'
 
 interface Props {
@@ -13,7 +16,13 @@ interface Props {
   onInjectUpdate: () => void
 }
 
-const statusConfig: Record<InjectStatus, { icon: React.ReactNode; color: string; bgColor: string }> = {
+interface StatusStyle {
+  icon: React.ReactNode
+  color: string
+  bgColor: string
+}
+
+const statusConfig: Record<InjectStatus, StatusStyle> = {
   pending: {
     icon: <Clock className="w-4 h-4" />,
     color: 'text-gray-500',
@@ -41,25 +50,39 @@ const statusConfig: Record<InjectStatus, { icon: React.ReactNode; color: string;
   },
 }
 
-function formatTime(minutes: number): string {
-  const hours = Math.floor(minutes / 60)
-  const mins = minutes % 60
-  return `T+${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`
+// A status the API grows that this build has never heard of must still draw a row.
+const unknownStatus: StatusStyle = {
+  icon: <HelpCircle className="w-4 h-4" />,
+  color: 'text-gray-400',
+  bgColor: 'bg-gray-100',
 }
 
-function InjectCard({ inject, onExecute, onSkip }: {
+function executedAtLabel(executedAt: string | null): string | null {
+  if (!executedAt) return null
+  const at = new Date(executedAt)
+  return Number.isNaN(at.getTime()) ? null : at.toLocaleTimeString()
+}
+
+function InjectCard({ inject, canExecute, executeBlockedReason, onExecute, onSkip }: {
   inject: Inject
-  onExecute: () => void
-  onSkip: () => void
+  canExecute: boolean
+  executeBlockedReason: string
+  onExecute: () => Promise<void>
+  onSkip: () => Promise<void>
 }) {
   const [expanded, setExpanded] = useState(false)
   const [executing, setExecuting] = useState(false)
-  const config = statusConfig[inject.status]
+  const config = statusConfig[inject.status] ?? unknownStatus
+  const actions = describeInjectActions(inject.actions)
+  const executedAt = executedAtLabel(inject.executed_at)
 
   const handleExecute = async () => {
     setExecuting(true)
-    await onExecute()
-    setExecuting(false)
+    try {
+      await onExecute()
+    } finally {
+      setExecuting(false)
+    }
   }
 
   return (
@@ -82,7 +105,7 @@ function InjectCard({ inject, onExecute, onSkip }: {
           <div>
             <div className="flex items-center gap-2">
               <span className="text-xs font-mono text-gray-500">
-                {formatTime(inject.inject_time_minutes)}
+                {formatInjectTime(inject.inject_time_minutes)}
               </span>
               <span className="text-xs text-gray-400">|</span>
               <span className="text-sm font-medium">{inject.title}</span>
@@ -99,15 +122,16 @@ function InjectCard({ inject, onExecute, onSkip }: {
           {inject.status === 'pending' && (
             <>
               <button
-                onClick={(e) => { e.stopPropagation(); handleExecute() }}
-                disabled={executing}
+                onClick={(e) => { e.stopPropagation(); void handleExecute() }}
+                disabled={executing || !canExecute}
+                title={canExecute ? undefined : executeBlockedReason}
                 className="flex items-center gap-1 px-2 py-1 text-xs bg-green-500 text-white rounded hover:bg-green-600 disabled:opacity-50"
               >
                 <Play className="w-3 h-3" />
                 Execute
               </button>
               <button
-                onClick={(e) => { e.stopPropagation(); onSkip() }}
+                onClick={(e) => { e.stopPropagation(); void onSkip() }}
                 disabled={executing}
                 className="flex items-center gap-1 px-2 py-1 text-xs bg-gray-200 text-gray-700 rounded hover:bg-gray-300 disabled:opacity-50"
               >
@@ -116,51 +140,95 @@ function InjectCard({ inject, onExecute, onSkip }: {
               </button>
             </>
           )}
-          {inject.executed_at && (
+          {executedAt && (
             <span className="text-xs text-gray-400">
-              {new Date(inject.executed_at).toLocaleTimeString()}
+              {executedAt}
             </span>
           )}
           {expanded ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
         </div>
       </div>
 
-      {expanded && inject.actions.length > 0 && (
+      {expanded && (
         <div className="border-t bg-gray-50 p-3 space-y-2">
           <h4 className="text-xs font-medium text-gray-500 uppercase">Actions</h4>
-          {inject.actions.map((action, idx) => (
-            <div key={idx} className="flex items-start gap-2 text-sm">
-              <FileCode className="w-4 h-4 text-gray-400 mt-0.5" />
-              <div>
-                <span className="font-medium capitalize">{action.type.replace('_', ' ')}</span>
-                <span className="text-gray-500"> on </span>
-                <span className="font-mono text-blue-600">{action.target_vm}</span>
-                {action.path && (
-                  <span className="text-gray-500"> at <code className="bg-gray-200 px-1 rounded">{action.path}</code></span>
-                )}
-                {action.command && (
-                  <span className="text-gray-500">: <code className="bg-gray-200 px-1 rounded">{action.command}</code></span>
-                )}
+          {actions.length === 0 ? (
+            <p className="text-sm text-gray-500">This inject has no actions — it is a cue for the instructor.</p>
+          ) : (
+            actions.map((action, idx) => (
+              <div key={idx} className="flex items-start gap-2 text-sm">
+                <FileCode className="w-4 h-4 text-gray-400 mt-0.5" />
+                <div>
+                  <span className="font-medium">{action.label}</span>
+                  {action.filename && (
+                    <span className="text-gray-500"> <code className="bg-gray-200 px-1 rounded">{action.filename}</code></span>
+                  )}
+                  {action.target && (
+                    <>
+                      <span className="text-gray-500"> on </span>
+                      <span className="font-mono text-blue-600">{action.target}</span>
+                    </>
+                  )}
+                  {action.path && (
+                    <span className="text-gray-500"> at <code className="bg-gray-200 px-1 rounded">{action.path}</code></span>
+                  )}
+                  {action.command && (
+                    <span className="text-gray-500">: <code className="bg-gray-200 px-1 rounded">{action.command}</code></span>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            ))
+          )}
         </div>
       )}
     </div>
   )
 }
 
+function apiErrorText(err: unknown, fallback: string): string {
+  if (isAxiosError(err)) {
+    const detail = err.response?.data?.detail
+    // FastAPI answers a validation failure with a list of objects. Rendering that straight into
+    // JSX is what "Objects are not valid as a React child" means, and it blanks the page.
+    if (typeof detail === 'string') return detail
+    if (Array.isArray(detail)) {
+      const messages = detail
+        .map((d) => (d && typeof d === 'object' && typeof d.msg === 'string' ? d.msg : null))
+        .filter((m): m is string => m !== null)
+      if (messages.length) return messages.join('; ')
+    }
+  }
+  if (err instanceof Error && err.message) return err.message
+  return fallback
+}
+
 export function InjectTimeline({ msel, onInjectUpdate }: Props) {
   const [error, setError] = useState<string | null>(null)
+  const { isKubernetes } = useSubstrate()
+
+  // `InjectService` refuses outright on the Kubernetes substrate and records the inject FAILED:
+  // its actions reach a machine through the Docker daemon and the range's VM rows, of which a
+  // Kubernetes range has neither, and there is no guest-side path to put in their place. A button
+  // that can only burn an inject is the lie; skipping still works, because that is a status
+  // change and nothing else.
+  const executeBlockedReason =
+    'Executing an inject runs its actions through the Docker daemon, which a Kubernetes range does not have.'
+
+  const injects = Array.isArray(msel?.injects) ? msel.injects : []
 
   const handleExecute = async (injectId: string) => {
     setError(null)
     try {
-      await mselApi.executeInject(injectId)
+      const { data } = await mselApi.executeInject(injectId)
+      // An inject that was refused or that failed an action still answers 200, with the outcome
+      // in the body. Reading only the HTTP status turned the row red and told the instructor
+      // nothing about why -- including the two refusals the service now returns by name.
+      if (data?.success === false) {
+        setError(injectRefusalText(data.results) ?? 'The inject did not run.')
+      }
       onInjectUpdate()
     } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to execute inject'
-      setError(errorMessage)
+      setError(apiErrorText(err, 'Failed to execute inject'))
     }
   }
 
@@ -170,22 +238,21 @@ export function InjectTimeline({ msel, onInjectUpdate }: Props) {
       await mselApi.skipInject(injectId)
       onInjectUpdate()
     } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to skip inject'
-      setError(errorMessage)
+      setError(apiErrorText(err, 'Failed to skip inject'))
     }
   }
 
-  const pendingCount = msel.injects.filter(i => i.status === 'pending').length
-  const completedCount = msel.injects.filter(i => i.status === 'completed').length
-  const failedCount = msel.injects.filter(i => i.status === 'failed').length
+  const pendingCount = injects.filter(i => i.status === 'pending').length
+  const completedCount = injects.filter(i => i.status === 'completed').length
+  const failedCount = injects.filter(i => i.status === 'failed').length
 
   return (
     <div className="bg-white rounded-lg shadow">
       <div className="px-4 py-3 border-b">
         <div className="flex items-center justify-between">
           <div>
-            <h3 className="font-medium">{msel.name}</h3>
-            <p className="text-xs text-gray-500">{msel.injects.length} injects</p>
+            <h3 className="font-medium">{msel?.name ?? 'Scenario'}</h3>
+            <p className="text-xs text-gray-500">{injects.length} injects</p>
           </div>
           <div className="flex items-center gap-3 text-xs">
             <span className="flex items-center gap-1">
@@ -206,6 +273,13 @@ export function InjectTimeline({ msel, onInjectUpdate }: Props) {
         </div>
       </div>
 
+      {isKubernetes && injects.length > 0 && (
+        <div className="mx-4 mt-3 flex items-start gap-2 p-2 bg-amber-50 text-amber-800 rounded text-xs">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>{executeBlockedReason} The timeline still tracks the exercise, and injects can be skipped.</span>
+        </div>
+      )}
+
       {error && (
         <div className="mx-4 mt-3 flex items-center gap-2 p-2 bg-red-50 text-red-700 rounded text-sm">
           <AlertCircle className="w-4 h-4" />
@@ -214,14 +288,22 @@ export function InjectTimeline({ msel, onInjectUpdate }: Props) {
       )}
 
       <div className="p-4 space-y-2 max-h-96 overflow-y-auto">
-        {msel.injects.map((inject) => (
-          <InjectCard
-            key={inject.id}
-            inject={inject}
-            onExecute={() => handleExecute(inject.id)}
-            onSkip={() => handleSkip(inject.id)}
-          />
-        ))}
+        {injects.length === 0 ? (
+          <p className="text-sm text-gray-500 text-center py-4">
+            This scenario has no injects — nothing in it fires on a timeline.
+          </p>
+        ) : (
+          injects.map((inject) => (
+            <InjectCard
+              key={inject.id}
+              inject={inject}
+              canExecute={!isKubernetes}
+              executeBlockedReason={executeBlockedReason}
+              onExecute={() => handleExecute(inject.id)}
+              onSkip={() => handleSkip(inject.id)}
+            />
+          ))
+        )}
       </div>
     </div>
   )

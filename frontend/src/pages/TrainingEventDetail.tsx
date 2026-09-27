@@ -22,8 +22,10 @@ import {
   Loader2,
   ExternalLink,
   RotateCcw,
+  AlertTriangle,
 } from 'lucide-react'
 import {
+  api,
   trainingEventsApi,
   TrainingEventDetail as TrainingEventDetailType,
   EventCreate,
@@ -37,6 +39,17 @@ import {
   User,
 } from '../services/api'
 import { useAuthStore } from '../stores/authStore'
+import { toast } from '../stores/toastStore'
+import { useSubstrate } from '../stores/capabilitiesStore'
+import { apiErrorDetail, machineNoun } from '../lib/blueprints'
+import {
+  eventActionWords,
+  labState,
+  lifecycleFailureMessage,
+  rollupLabs,
+  startFailureNotice,
+  summarizeLabs,
+} from '../lib/trainingEvents'
 import { VMVisibilityControl } from '../components/events/VMVisibilityControl'
 import { format, parseISO } from 'date-fns'
 import DOMPurify from 'dompurify'
@@ -47,6 +60,74 @@ const STATUS_LABELS: Record<EventStatus, string> = {
   running: 'Running',
   completed: 'Completed',
   cancelled: 'Cancelled',
+}
+
+type LifecycleAction = 'publish' | 'start' | 'complete' | 'cancel' | 'reactivate'
+
+/**
+ * How many labs a cohort gets, which is the only thing the two delivery modes differ in.
+ *
+ * The platform has always resolved a range with no assigned learner to an environment the whole
+ * cohort shares, and nothing offered a way to create one -- every path that made a range under an
+ * event assigned it to somebody -- so the mode the architecture turns on had never run.
+ */
+type EventDelivery = 'self-paced' | 'team-exercise'
+
+const DELIVERY_MODES: { value: EventDelivery; label: string; effect: string }[] = [
+  {
+    value: 'self-paced',
+    label: 'A lab each',
+    effect:
+      'Every student gets a lab of their own. They cannot see or disturb each other’s work.',
+  },
+  {
+    value: 'team-exercise',
+    label: 'One shared lab',
+    effect:
+      'The cohort works in a single lab: everyone sees the same machines and each other’s changes.',
+  },
+]
+
+/**
+ * The roles a person can hold *in this event*, and what each one actually changes.
+ *
+ * Not the same vocabulary as the platform roles under Access Control, which say who may open the
+ * event at all -- the form used to render both as "roles" side by side, so the choice here read as
+ * four interchangeable labels. The API accepts exactly this set and
+ * backend/tests/unit/test_team_exercise.py compares the two, so adding a label here without
+ * giving it a meaning there fails the build.
+ */
+const PARTICIPANT_ROLES: { value: string; label: string; effect: string }[] = [
+  { value: 'student', label: 'Student', effect: 'Gets a lab, and sees the student briefing.' },
+  {
+    value: 'instructor',
+    label: 'Instructor',
+    effect: 'No lab. Sees the whole briefing, instructor notes included.',
+  },
+  {
+    value: 'evaluator',
+    label: 'Evaluator',
+    effect: 'No lab. Sees the briefing except the instructor notes.',
+  },
+  {
+    value: 'observer',
+    label: 'Observer',
+    effect: 'No lab. Sees only the student guide and reference material.',
+  },
+]
+
+/**
+ * The delivery fields the API serves on an event.
+ *
+ * Declared here rather than in the API client because that file is hand-written and scheduled for
+ * replacement by a generated one (UX-2); this page should not be the reason it grows another
+ * hand-maintained field.
+ */
+type EventWithDelivery = TrainingEventDetailType & {
+  delivery?: EventDelivery
+  team_range_id?: string | null
+  team_range_status?: string | null
+  team_range_name?: string | null
 }
 
 // Sanitize HTML to prevent XSS - uses DOMPurify for secure rendering
@@ -72,7 +153,7 @@ export default function TrainingEventDetail() {
 
   const [loading, setLoading] = useState(!isNew)
   const [saving, setSaving] = useState(false)
-  const [event, setEvent] = useState<TrainingEventDetailType | null>(null)
+  const [event, setEvent] = useState<EventWithDelivery | null>(null)
 
   // Form state
   const [name, setName] = useState('')
@@ -98,6 +179,10 @@ export default function TrainingEventDetail() {
   const [selectedUserId, setSelectedUserId] = useState('')
   const [participantRole, setParticipantRole] = useState('student')
 
+  // Chosen before the event starts, because that is the moment it changes anything: it decides
+  // whether the start creates one range per student or one the cohort shares.
+  const [delivery, setDelivery] = useState<EventDelivery>('self-paced')
+
   // Briefing view
   const [showBriefing, setShowBriefing] = useState(false)
   const [briefingContent, setBriefingContent] = useState<{ title: string; html: string }[]>([])
@@ -105,12 +190,42 @@ export default function TrainingEventDetail() {
   // Confirmation dialog for complete/cancel
   const [confirmAction, setConfirmAction] = useState<'complete' | 'cancel' | null>(null)
 
+  // The lifecycle action in flight, so a second press cannot queue a second cohort of ranges.
+  const [pending, setPending] = useState<LifecycleAction | null>(null)
+  const [deleting, setDeleting] = useState(false)
+
+  // A refused start has to stay on the screen. A toast is gone in five seconds and the reason --
+  // which blueprint this substrate will not deploy, and why -- is the whole of what the
+  // instructor has to act on.
+  const [startError, setStartError] = useState<{ reason: string; aftermath: string } | null>(null)
+
+  const { label: substrateLabel, isKubernetes } = useSubstrate()
+  const machines = machineNoun(null, isKubernetes)
+
   const canManage = event
     ? user?.id === event.created_by_id || user?.roles?.includes('admin')
     : user?.roles?.includes('admin') || user?.roles?.includes('engineer')
 
-  // Count ranges that will be deleted (used in delete confirmation)
-  const rangesCount = event?.participants?.filter(p => p.range_id).length || 0
+  // The exact condition the participant picker renders under, the loaded event included: before
+  // it arrives `canManage` is the new-event fallback, which is true for any engineer, including
+  // one who is only reading somebody else's event.
+  const participantPickerShown = !isNew && !!event && !!canManage
+
+  // A team exercise is an event that owns one range nobody is assigned to; the server says so
+  // rather than the page inferring it, because the same property is what places that range in a
+  // vcluster of its own.
+  const isTeamExercise = event?.delivery === 'team-exercise'
+  const sharedLab = labState(event?.team_range_status)
+
+  // Count ranges that will be deleted (used in delete confirmation). Counting participants would
+  // promise to delete one lab per student in a team exercise, where there is only ever the one.
+  const labsCount = isTeamExercise
+    ? event?.team_range_id
+      ? 1
+      : 0
+    : event?.participants?.filter(p => p.range_id).length || 0
+  const labNoun = isTeamExercise ? 'shared lab' : 'student lab'
+  const labs = rollupLabs(event?.participants || [])
 
   useEffect(() => {
     loadDropdownData()
@@ -119,26 +234,54 @@ export default function TrainingEventDetail() {
     }
   }, [id, isNew])
 
+  // The user list feeds the participant picker and nothing else, and `GET /users` answers 403 to
+  // everyone but an admin. Asking for it on every view of an event put "Administrator access
+  // required" in front of a student about a control they are never shown; sharing one Promise.all
+  // with the other two lists, it also took the blueprint picker and the content library down with
+  // it for every non-admin who opened an event.
+  useEffect(() => {
+    if (!participantPickerShown) return
+    usersApi
+      .list()
+      .then((response) => setUsers(response.data))
+      .catch((err) => {
+        toast.error(
+          `Could not load the users available to add: ${apiErrorDetail(err, 'the server gave no reason')}`
+        )
+      })
+  }, [participantPickerShown])
+
   async function loadDropdownData() {
-    try {
-      const [blueprintsRes, contentRes, usersRes] = await Promise.all([
-        blueprintsApi.list(),
-        contentApi.list({ published_only: true }),
-        usersApi.list(),
-      ])
-      setBlueprints(blueprintsRes.data)
-      setContentItems(contentRes.data)
-      setUsers(usersRes.data)
-    } catch (err) {
-      console.error('Failed to load dropdown data:', err)
+    // Settled independently rather than as a group: both fill controls that every viewer of the
+    // event is shown, and either refusal used to blank the other as well.
+    const [blueprintsRes, contentRes] = await Promise.allSettled([
+      blueprintsApi.list(),
+      contentApi.list({ published_only: true }),
+    ])
+    if (blueprintsRes.status === 'fulfilled') setBlueprints(blueprintsRes.value.data)
+    if (contentRes.status === 'fulfilled') setContentItems(contentRes.value.data)
+    // Silence here left the blueprint picker and the content list looking merely empty, which is
+    // indistinguishable from an install that has neither -- and an event with no blueprint
+    // selected cannot be started at all.
+    if (blueprintsRes.status === 'rejected') {
+      toast.error(
+        `Could not load the blueprint list: ${apiErrorDetail(blueprintsRes.reason, 'the server gave no reason')}`
+      )
+    }
+    if (contentRes.status === 'rejected') {
+      toast.error(
+        `Could not load the content library: ${apiErrorDetail(contentRes.reason, 'the server gave no reason')}`
+      )
     }
   }
 
-  async function loadEvent(eventId: string) {
-    setLoading(true)
+  // `showSpinner` is off when refreshing after an action: replacing the page with a spinner would
+  // take the refusal banner off the screen the moment it was put there.
+  async function loadEvent(eventId: string, showSpinner = true) {
+    if (showSpinner) setLoading(true)
     try {
       const response = await trainingEventsApi.get(eventId)
-      const data = response.data
+      const data: EventWithDelivery = response.data
       setEvent(data)
       setName(data.name)
       setDescription(data.description || '')
@@ -154,8 +297,14 @@ export default function TrainingEventDetail() {
       setSelectedContentIds(data.content_ids || [])
       setAllowedRoles(data.allowed_roles || [])
       setTags(data.tags || [])
+      // An event that already owns a shared range keeps that mode selected. A reactivated team
+      // exercise whose lab was kept would otherwise come back with the selector on "a lab each",
+      // and starting it again would give the cohort a lab each beside the one they share.
+      if (data.delivery === 'team-exercise') setDelivery('team-exercise')
     } catch (err) {
-      console.error('Failed to load event:', err)
+      // Bouncing to the list with nothing said reads as a broken link rather than as the 403 or
+      // 404 it usually is.
+      toast.error(apiErrorDetail(err, 'Could not open that event'))
       navigate('/events')
     } finally {
       setLoading(false)
@@ -164,11 +313,11 @@ export default function TrainingEventDetail() {
 
   async function handleSave() {
     if (!name.trim()) {
-      alert('Name is required')
+      toast.error('Name is required')
       return
     }
     if (!startDatetime) {
-      alert('Start date/time is required')
+      toast.error('Start date/time is required')
       return
     }
 
@@ -190,6 +339,7 @@ export default function TrainingEventDetail() {
           tags,
         }
         const response = await trainingEventsApi.create(data)
+        toast.success(`Created "${name}"`)
         navigate(`/events/${response.data.id}`)
       } else if (id) {
         const data: EventUpdate = {
@@ -207,12 +357,11 @@ export default function TrainingEventDetail() {
           tags,
         }
         await trainingEventsApi.update(id, data)
-        await loadEvent(id)
+        toast.success('Event saved')
+        await loadEvent(id, false)
       }
-    } catch (err: any) {
-      console.error('Failed to save:', err)
-      const message = err.response?.data?.detail || 'Failed to save event'
-      alert(message)
+    } catch (err) {
+      toast.error(apiErrorDetail(err, 'Failed to save event'))
     } finally {
       setSaving(false)
     }
@@ -244,22 +393,27 @@ export default function TrainingEventDetail() {
 
   async function handleAddParticipant() {
     if (!selectedUserId || !id) return
+    const username = users.find((u) => u.id === selectedUserId)?.username ?? 'that user'
     try {
       await trainingEventsApi.addParticipant(id, selectedUserId, participantRole)
-      await loadEvent(id)
       setSelectedUserId('')
+      toast.success(`Added ${username} as ${participantRole}`)
+      await loadEvent(id, false)
     } catch (err) {
-      console.error('Failed to add participant:', err)
+      toast.error(apiErrorDetail(err, `Could not add ${username} to this event`))
     }
   }
 
   async function handleRemoveParticipant(userId: string) {
     if (!id) return
+    const username =
+      event?.participants.find((p) => p.user_id === userId)?.username ?? 'that participant'
     try {
       await trainingEventsApi.removeParticipant(id, userId)
-      await loadEvent(id)
+      toast.success(`Removed ${username}`)
+      await loadEvent(id, false)
     } catch (err) {
-      console.error('Failed to remove participant:', err)
+      toast.error(apiErrorDetail(err, `Could not remove ${username} from this event`))
     }
   }
 
@@ -275,11 +429,11 @@ export default function TrainingEventDetail() {
       )
       setShowBriefing(true)
     } catch (err) {
-      console.error('Failed to load briefing:', err)
+      toast.error(apiErrorDetail(err, 'Could not load the briefing for this event'))
     }
   }
 
-  async function handleStatusChange(action: 'publish' | 'start' | 'complete' | 'cancel' | 'reactivate', autoDeploy = false) {
+  async function handleStatusChange(action: LifecycleAction, autoDeploy = false) {
     if (!id) return
 
     // For complete/cancel, show confirmation first
@@ -288,13 +442,20 @@ export default function TrainingEventDetail() {
       return
     }
 
+    setPending(action)
+    if (action === 'start') setStartError(null)
     try {
       switch (action) {
         case 'publish':
           await trainingEventsApi.publish(id)
           break
         case 'start':
-          await trainingEventsApi.start(id, autoDeploy)
+          // Called through the shared axios client rather than `trainingEventsApi.start`: that
+          // helper predates the delivery mode, and dropping the parameter here would leave the
+          // instructor choosing between two buttons that send the same request.
+          await api.post(`/training-events/${id}/start`, null, {
+            params: { auto_deploy: autoDeploy, delivery },
+          })
           break
         case 'complete':
           await trainingEventsApi.complete(id)
@@ -306,11 +467,17 @@ export default function TrainingEventDetail() {
           await trainingEventsApi.reactivate(id)
           break
       }
-      setConfirmAction(null)
-      await loadEvent(id)
+      toast.success(`${eventActionWords(action).done} "${event?.name ?? 'event'}"`)
     } catch (err) {
-      console.error(`Failed to ${action}:`, err)
+      if (action === 'start') setStartError(startFailureNotice(err))
+      toast.error(lifecycleFailureMessage(action, event?.name ?? 'this event', err))
+    } finally {
+      setPending(null)
       setConfirmAction(null)
+      // Reloaded either way, because the server is the only authority on what the event is now:
+      // a refused start leaves it unchanged, and a complete whose teardown stopped partway has
+      // already destroyed some of the labs the page is still listing.
+      await loadEvent(id, false)
     }
   }
 
@@ -322,18 +489,24 @@ export default function TrainingEventDetail() {
 
   async function handleDelete() {
     if (!id) return
-    const rangesMsg = rangesCount > 0
-      ? `\n\nThis will permanently delete ${rangesCount} student lab${rangesCount > 1 ? 's' : ''} and all associated VMs.`
+    const rangesMsg = labsCount > 0
+      ? `\n\nThis will permanently delete ${labsCount} ${labNoun}${labsCount > 1 ? 's' : ''} and all associated ${machines}.`
       : ''
     if (!confirm(`Are you sure you want to delete this event?${rangesMsg}\n\nThis action cannot be undone.`)) {
       return
     }
+    setDeleting(true)
     try {
       await trainingEventsApi.delete(id)
+      toast.success(`Deleted "${event?.name ?? 'event'}"`)
       navigate('/events')
     } catch (err) {
-      console.error('Failed to delete:', err)
-      alert('Failed to delete event')
+      toast.error(lifecycleFailureMessage('delete', event?.name ?? 'this event', err))
+      // A teardown that stopped partway kept the event but destroyed some of its labs, so the
+      // participant list on screen is already out of date.
+      await loadEvent(id, false)
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -355,9 +528,9 @@ export default function TrainingEventDetail() {
               {confirmAction === 'complete' ? 'Complete Event?' : 'Cancel Event?'}
             </h3>
             <p className="text-gray-600 mb-4">
-              {rangesCount > 0 ? (
+              {labsCount > 0 ? (
                 <>
-                  This will <span className="font-semibold text-red-600">permanently delete {rangesCount} student lab{rangesCount > 1 ? 's' : ''}</span> and all associated VMs.
+                  This will <span className="font-semibold text-red-600">permanently delete {labsCount} {labNoun}{labsCount > 1 ? 's' : ''}</span> and all associated {machines}.
                   {confirmAction === 'cancel' && ' The event will remain in cancelled status.'}
                 </>
               ) : (
@@ -367,18 +540,21 @@ export default function TrainingEventDetail() {
             <div className="flex justify-end space-x-3">
               <button
                 onClick={() => setConfirmAction(null)}
-                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-md"
+                disabled={pending !== null}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-md disabled:opacity-50"
               >
                 Go Back
               </button>
               <button
                 onClick={handleConfirmAction}
-                className={`px-4 py-2 text-sm font-medium text-white rounded-md ${
+                disabled={pending !== null}
+                className={`inline-flex items-center px-4 py-2 text-sm font-medium text-white rounded-md disabled:opacity-50 ${
                   confirmAction === 'cancel'
                     ? 'bg-red-600 hover:bg-red-700'
                     : 'bg-purple-600 hover:bg-purple-700'
                 }`}
               >
+                {pending !== null && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                 {confirmAction === 'complete' ? 'Complete & Delete Labs' : 'Cancel & Delete Labs'}
               </button>
             </div>
@@ -437,20 +613,66 @@ export default function TrainingEventDetail() {
       {!isNew && event && canManage && (
         <div className="bg-white shadow rounded-lg p-4">
           <h3 className="text-sm font-medium text-gray-900 mb-3">Event Status</h3>
+          {startError && (
+            <div className="mb-3 flex items-start gap-2 rounded border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+              <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+              <div className="min-w-0">
+                <p className="font-medium">
+                  {substrateLabel
+                    ? `Could not start this event on ${substrateLabel}.`
+                    : 'Could not start this event.'}
+                </p>
+                <p className="mt-1 whitespace-pre-line break-words">{startError.reason}</p>
+                <p className="mt-1 text-red-700">{startError.aftermath}</p>
+              </div>
+            </div>
+          )}
+          {(event.status === 'draft' || event.status === 'scheduled') && (
+            <div className="mb-3">
+              <p className="text-xs font-medium text-gray-700 mb-1.5">Delivery</p>
+              <div className="flex flex-wrap gap-2">
+                {DELIVERY_MODES.map((mode) => (
+                  <button
+                    key={mode.value}
+                    type="button"
+                    onClick={() => setDelivery(mode.value)}
+                    disabled={pending !== null}
+                    aria-pressed={delivery === mode.value}
+                    className={`inline-flex items-center px-3 py-1.5 border text-sm font-medium rounded disabled:opacity-50 ${
+                      delivery === mode.value
+                        ? 'border-primary-400 bg-primary-50 text-primary-800'
+                        : 'border-gray-300 bg-white text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    {mode.value === 'team-exercise' ? (
+                      <Users className="h-4 w-4 mr-1.5" />
+                    ) : (
+                      <Monitor className="h-4 w-4 mr-1.5" />
+                    )}
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1.5 text-xs text-gray-500">
+                {DELIVERY_MODES.find((mode) => mode.value === delivery)?.effect}
+              </p>
+            </div>
+          )}
           <div className="flex flex-wrap gap-2">
             {event.status === 'draft' && (
               <button
                 onClick={() => handleStatusChange('publish')}
-                className="inline-flex items-center px-3 py-1.5 border border-blue-300 text-sm font-medium rounded text-blue-700 bg-blue-50 hover:bg-blue-100"
+                disabled={pending !== null}
+                className="inline-flex items-center px-3 py-1.5 border border-blue-300 text-sm font-medium rounded text-blue-700 bg-blue-50 hover:bg-blue-100 disabled:opacity-50"
               >
                 <CalendarCheck className="h-4 w-4 mr-1" />
-                Publish
+                {pending === 'publish' ? 'Publishing...' : 'Publish'}
               </button>
             )}
             {(event.status === 'draft' || event.status === 'scheduled') && (() => {
               const hasStudents = event.participants.some(p => p.role === 'student')
               const hasBlueprint = !!event.blueprint_id
-              const canStart = hasStudents && hasBlueprint
+              const canStart = hasStudents && hasBlueprint && pending === null
               const tooltip = !hasBlueprint
                 ? 'Assign a blueprint to this event first'
                 : !hasStudents
@@ -467,10 +689,18 @@ export default function TrainingEventDetail() {
                         : 'border-gray-200 text-gray-400 bg-gray-50 cursor-not-allowed'
                     }`}
                   >
-                    <Rocket className="h-4 w-4 mr-1" />
-                    Start & Deploy Labs
+                    {pending === 'start' ? (
+                      <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                    ) : (
+                      <Rocket className="h-4 w-4 mr-1" />
+                    )}
+                    {pending === 'start'
+                      ? 'Starting...'
+                      : delivery === 'team-exercise'
+                      ? 'Start & Deploy Shared Lab'
+                      : 'Start & Deploy Labs'}
                   </button>
-                  {!canStart && (
+                  {tooltip && (
                     <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-1.5 bg-gray-900 text-white text-xs rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap z-10">
                       {tooltip}
                       <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900" />
@@ -482,40 +712,74 @@ export default function TrainingEventDetail() {
             {event.status === 'running' && (
               <button
                 onClick={() => handleStatusChange('complete')}
-                className="inline-flex items-center px-3 py-1.5 border border-purple-300 text-sm font-medium rounded text-purple-700 bg-purple-50 hover:bg-purple-100"
+                disabled={pending !== null}
+                className="inline-flex items-center px-3 py-1.5 border border-purple-300 text-sm font-medium rounded text-purple-700 bg-purple-50 hover:bg-purple-100 disabled:opacity-50"
               >
                 <CheckCircle className="h-4 w-4 mr-1" />
-                Complete
+                {pending === 'complete' ? 'Completing...' : 'Complete'}
               </button>
             )}
             {event.status !== 'completed' && event.status !== 'cancelled' && (
               <button
                 onClick={() => handleStatusChange('cancel')}
-                className="inline-flex items-center px-3 py-1.5 border border-red-300 text-sm font-medium rounded text-red-700 bg-red-50 hover:bg-red-100"
+                disabled={pending !== null}
+                className="inline-flex items-center px-3 py-1.5 border border-red-300 text-sm font-medium rounded text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-50"
               >
                 <XCircle className="h-4 w-4 mr-1" />
-                Cancel
+                {pending === 'cancel' ? 'Cancelling...' : 'Cancel'}
               </button>
             )}
             {event.status === 'cancelled' && (
               <button
                 onClick={() => handleStatusChange('reactivate')}
-                className="inline-flex items-center px-3 py-1.5 border border-amber-300 text-sm font-medium rounded text-amber-700 bg-amber-50 hover:bg-amber-100"
+                disabled={pending !== null}
+                className="inline-flex items-center px-3 py-1.5 border border-amber-300 text-sm font-medium rounded text-amber-700 bg-amber-50 hover:bg-amber-100 disabled:opacity-50"
               >
                 <RotateCcw className="h-4 w-4 mr-1" />
-                Reactivate
+                {pending === 'reactivate' ? 'Reactivating...' : 'Reactivate'}
               </button>
             )}
             {/* Separator and Delete button */}
             <div className="w-px h-6 bg-gray-300 mx-2" />
             <button
               onClick={handleDelete}
-              className="inline-flex items-center px-3 py-1.5 border border-red-300 text-sm font-medium rounded text-red-700 bg-red-50 hover:bg-red-100"
+              disabled={deleting || pending !== null}
+              className="inline-flex items-center px-3 py-1.5 border border-red-300 text-sm font-medium rounded text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-50"
             >
               <Trash2 className="h-4 w-4 mr-1" />
-              Delete Event
+              {deleting ? 'Deleting...' : 'Delete Event'}
             </button>
           </div>
+          {/* Withheld until the event has been started or something was provisioned: on a draft
+              event every student is legitimately without a lab, and saying so reads as a fault.
+              A team exercise is reported as the one lab it is -- rolling the cohort up would
+              read "12 running" about a single range twelve people are sharing. */}
+          {isTeamExercise ? (
+            <p className="mt-3 flex flex-wrap items-center gap-x-2 text-xs text-gray-500">
+              <span>
+                Shared lab{event.team_range_name ? ` "${event.team_range_name}"` : ''}:{' '}
+                {sharedLab.label} &middot; {labs.total} student{labs.total === 1 ? '' : 's'}
+              </span>
+              {event.team_range_id && (
+                <a
+                  href={`/ranges/${event.team_range_id}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center text-primary-600 hover:text-primary-700"
+                >
+                  <ExternalLink className="h-3 w-3 mr-1" />
+                  Open
+                </a>
+              )}
+            </p>
+          ) : (
+            labs.total > 0 &&
+            (labs.total > labs.missing || event.status === 'running') && (
+              <p className="mt-3 text-xs text-gray-500">
+                Student labs: {summarizeLabs(labs)}
+              </p>
+            )
+          )}
         </div>
       )}
 
@@ -693,7 +957,12 @@ export default function TrainingEventDetail() {
           <h3 className="text-sm font-medium text-gray-900 mb-4">Access Control</h3>
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Allowed Roles</label>
+              {/* Named for what they are. These are the roles a user holds on this install, and
+                  they decide who can open the event at all -- a different question, and a
+                  different set, from the role someone is given *in* the event further down. */}
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Platform roles that can see this event
+              </label>
               <div className="flex flex-wrap gap-2">
                 {['student', 'engineer', 'evaluator', 'admin'].map((role) => (
                   <button
@@ -712,7 +981,8 @@ export default function TrainingEventDetail() {
                 ))}
               </div>
               <p className="mt-1 text-xs text-gray-500">
-                Leave empty to make event visible to all users
+                Leave empty to make the event visible to all users. This is not the role a
+                participant is given in the event &mdash; that is chosen under Participants.
               </p>
             </div>
             <div>
@@ -768,38 +1038,48 @@ export default function TrainingEventDetail() {
             </h3>
           </div>
           {canManage && (
-            <div className="flex gap-2 mb-4">
-              <select
-                value={selectedUserId}
-                onChange={(e) => setSelectedUserId(e.target.value)}
-                className="flex-1 border border-gray-300 rounded-md py-2 px-3 text-sm"
-              >
-                <option value="">Select user...</option>
-                {users
-                  .filter((u) => !event.participants.some((p) => p.user_id === u.id))
-                  .map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.username}
+            <div className="mb-4 rounded-md border border-gray-200 p-3">
+              <div className="flex gap-2">
+                <select
+                  aria-label="User to add"
+                  value={selectedUserId}
+                  onChange={(e) => setSelectedUserId(e.target.value)}
+                  className="flex-1 border border-gray-300 rounded-md py-2 px-3 text-sm"
+                >
+                  <option value="">Select user...</option>
+                  {users
+                    .filter((u) => !event.participants.some((p) => p.user_id === u.id))
+                    .map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.username}
+                      </option>
+                    ))}
+                </select>
+                <select
+                  aria-label="Role in this event"
+                  value={participantRole}
+                  onChange={(e) => setParticipantRole(e.target.value)}
+                  className="border border-gray-300 rounded-md py-2 px-3 text-sm"
+                >
+                  {PARTICIPANT_ROLES.map((role) => (
+                    <option key={role.value} value={role.value}>
+                      {role.label}
                     </option>
                   ))}
-              </select>
-              <select
-                value={participantRole}
-                onChange={(e) => setParticipantRole(e.target.value)}
-                className="border border-gray-300 rounded-md py-2 px-3 text-sm"
-              >
-                <option value="student">Student</option>
-                <option value="instructor">Instructor</option>
-                <option value="evaluator">Evaluator</option>
-                <option value="observer">Observer</option>
-              </select>
-              <button
-                onClick={handleAddParticipant}
-                disabled={!selectedUserId}
-                className="inline-flex items-center px-3 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700 disabled:opacity-50"
-              >
-                <Plus className="h-4 w-4" />
-              </button>
+                </select>
+                <button
+                  onClick={handleAddParticipant}
+                  disabled={!selectedUserId}
+                  className="inline-flex items-center px-3 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700 disabled:opacity-50"
+                >
+                  <Plus className="h-4 w-4" />
+                </button>
+              </div>
+              {/* What the chosen role actually does. Without it an instructor is picking between
+                  four labels whose consequences are invisible until the briefing is opened. */}
+              <p className="mt-2 text-xs text-gray-500">
+                {PARTICIPANT_ROLES.find((role) => role.value === participantRole)?.effect}
+              </p>
             </div>
           )}
           {event.participants.length === 0 ? (
@@ -813,25 +1093,30 @@ export default function TrainingEventDetail() {
                       <span className="text-sm font-medium text-gray-900">{p.username}</span>
                       <span className="ml-2 text-xs text-gray-500 capitalize">{p.role}</span>
                     </div>
-                    {/* Range Status Badge */}
-                    {p.range_id && (
-                      <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
-                        p.range_status === 'running' ? 'bg-green-100 text-green-700' :
-                        p.range_status === 'deploying' ? 'bg-yellow-100 text-yellow-700' :
-                        p.range_status === 'error' ? 'bg-red-100 text-red-700' :
-                        p.range_status === 'stopped' ? 'bg-gray-100 text-gray-700' :
-                        'bg-blue-100 text-blue-700'
-                      }`}>
-                        {p.range_status === 'deploying' && (
-                          <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                        )}
-                        {p.range_status === 'running' && (
-                          <Monitor className="h-3 w-3 mr-1" />
-                        )}
-                        {p.range_name || 'Lab'}
-                        {p.range_status && ` (${p.range_status})`}
+                    {/* Per-participant deployment state: the event's own status says nothing
+                        about whether this learner has anything to work on. */}
+                    {p.range_id ? (() => {
+                      const state = labState(p.range_status)
+                      return (
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${state.tone}`}
+                          title={p.range_name || undefined}
+                        >
+                          {state.spinner && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
+                          {p.range_status === 'running' && <Monitor className="h-3 w-3 mr-1" />}
+                          {p.range_status === 'error' && <AlertTriangle className="h-3 w-3 mr-1" />}
+                          {state.label}
+                          {/* Otherwise twelve students each showing "Running" reads as twelve
+                              labs, when a team exercise is one lab twelve people are in. */}
+                          {isTeamExercise && <span className="ml-1 font-normal opacity-70">(shared)</span>}
+                        </span>
+                      )
+                    })() : p.role === 'student' && event.status === 'running' ? (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-800">
+                        <AlertTriangle className="h-3 w-3 mr-1" />
+                        No lab
                       </span>
-                    )}
+                    ) : null}
                   </div>
                   <div className="flex items-center gap-2">
                     {/* Open Console Button */}
@@ -867,7 +1152,7 @@ export default function TrainingEventDetail() {
         <VMVisibilityControl
           event={event}
           canManage={canManage}
-          onUpdate={() => loadEvent(id!)}
+          onUpdate={() => loadEvent(id!, false)}
         />
       )}
 

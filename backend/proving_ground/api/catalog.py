@@ -22,6 +22,12 @@ from proving_ground.schemas.catalog import (
     CatalogSourceResponse,
     CatalogSourceUpdate,
 )
+from proving_ground.schemas.catalog_install import (
+    InstallJobStarted,
+    InstallJobStatus,
+    InstallPlanResponse,
+    InstallStep,
+)
 from proving_ground.services.catalog_service import CatalogService
 
 logger = logging.getLogger(__name__)
@@ -153,11 +159,14 @@ def sync_source(source_id: UUID, db: DBSession, admin_user: AdminUser):
     service = _get_service(db)
     try:
         service.sync_source(source)
+    except ValueError as e:
+        # A refused URL, a branch that does not exist, a path in index.json that escapes the
+        # catalog root: all of these are things the operator typed and can retype, so 500 tells
+        # them the wrong thing about whose fault it is and where to look.
+        raise HTTPException(status_code=400, detail=f"Sync failed: {e}") from e
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Sync failed: {str(e)}",
-        ) from e
+        logger.exception("catalog sync failed for source %s", source_id)
+        raise HTTPException(status_code=502, detail=f"Sync failed: {e}") from e
 
     db.refresh(source)
     return _source_to_response(source)
@@ -249,6 +258,114 @@ def install_item(item_id: str, data: CatalogInstallRequest, db: DBSession, admin
         raise HTTPException(status_code=500, detail=f"Installation failed: {str(e)}") from e
 
     return _installed_to_response(installed)
+
+
+# ============ One-click install with dependency resolution (PG-149) ============
+
+
+def _installer(db: Session, source, item_id: str):
+    """Build an installer and resolve the plan, turning failures into HTTP errors."""
+    from proving_ground.catalog.installer import CatalogInstaller
+
+    installer = CatalogInstaller(_get_service(db))
+    try:
+        return installer, installer.build_plan(source, item_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+def _plan_to_response(item_id: str, plan) -> InstallPlanResponse:
+    return InstallPlanResponse(
+        item_id=item_id,
+        steps=[
+            InstallStep(
+                key=s.key,
+                kind=s.kind,
+                ref=s.ref,
+                name=s.name,
+                label=s.label,
+                satisfied=s.satisfied,
+                available=s.available,
+                note=s.note,
+            )
+            for s in plan.steps
+        ],
+        total_steps=plan.total_steps,
+        warnings=plan.warnings,
+        summary=plan.describe(),
+    )
+
+
+@router.get("/items/{source_id}/{item_id}/install-plan", response_model=InstallPlanResponse)
+def get_install_plan(source_id: UUID, item_id: str, db: DBSession, current_user: CurrentUser):
+    """Show what installing this blueprint will do, without doing any of it."""
+    source = _get_source_or_404(source_id, db)
+    _, plan = _installer(db, source, item_id)
+    return _plan_to_response(item_id, plan)
+
+
+@router.post("/items/{item_id}/install/start", response_model=InstallJobStarted)
+def start_install(item_id: str, data: CatalogInstallRequest, db: DBSession, admin_user: AdminUser):
+    """Install a blueprint and everything it depends on, as a background job.
+
+    Returns a job id to poll. The plan is resolved here rather than on the
+    worker so an item that cannot be installed fails now, with a 404, instead
+    of as a job that starts and immediately dies.
+    """
+    import uuid as uuid_mod
+
+    from proving_ground.tasks.catalog_install import install_catalog_item_async
+    from proving_ground.tasks.jobs import PENDING
+
+    source = _get_source_or_404(data.source_id, db)
+    _, plan = _installer(db, source, item_id)
+
+    job_id = str(uuid_mod.uuid4())
+    from proving_ground.tasks.catalog_install import store
+
+    store.update(job_id, PENDING, "Queued for install...", 0, plan.total_steps, log=[])
+
+    install_catalog_item_async.send(
+        job_id,
+        str(source.id),
+        item_id,
+        str(admin_user.id),
+        data.build_images,
+    )
+
+    return InstallJobStarted(
+        job_id=job_id,
+        status=PENDING,
+        total_steps=plan.total_steps,
+        message=f"Install queued: {plan.describe()}",
+    )
+
+
+@router.get("/install/{job_id}/status", response_model=InstallJobStatus)
+def get_install_job_status(job_id: str, current_user: CurrentUser):
+    """Poll an install job's progress."""
+    from proving_ground.tasks.catalog_install import get_job_status
+
+    status_data = get_job_status(job_id)
+    if not status_data:
+        raise HTTPException(status_code=404, detail="Install job not found")
+    return InstallJobStatus(**status_data)
+
+
+@router.post("/install/{job_id}/cancel")
+def cancel_install_job(job_id: str, admin_user: AdminUser):
+    """Cancel an install that has not finished yet."""
+    from proving_ground.tasks.catalog_install import cancel_job, get_job_status
+
+    if not get_job_status(job_id):
+        raise HTTPException(status_code=404, detail="Install job not found")
+    if not cancel_job(job_id):
+        raise HTTPException(
+            status_code=400, detail="This install has already finished and cannot be cancelled"
+        )
+    return {"message": "Install cancelled", "job_id": job_id}
 
 
 @router.get("/installed", response_model=List[CatalogInstalledItemResponse])

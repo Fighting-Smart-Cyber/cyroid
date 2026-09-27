@@ -412,17 +412,27 @@ class DeploymentValidator:
 
         # Get available disk space
         try:
-            # Try Docker data directory first
-            docker_data_path = self.DOCKER_DATA_DIR
-
-            # Check if custom Docker root is configured
-            try:
-                info = self.docker.client.info()
-                docker_root = info.get("DockerRootDir")
-                if docker_root:
-                    docker_data_path = docker_root
-            except Exception:
-                pass
+            # Measure a path THIS PROCESS can see.
+            #
+            # This used to ask the daemon for DockerRootDir and stat that. That
+            # is a path on the HOST, and stat'ing it from inside this container
+            # raises FileNotFoundError whatever it happens to be -- the default
+            # "/var/lib/docker" fails exactly as a relocated "/data/docker"
+            # does. So every deploy logged "Could not check disk space" and the
+            # validator returned valid=True without having measured anything.
+            # A check that always abstains is worse than no check: it looks
+            # like a guard and reports nothing.
+            #
+            # vm_storage_dir is bind-mounted into this container and is the
+            # filesystem the guest disks are actually written to, which is what
+            # the estimate above is about.
+            settings = get_settings()
+            candidates = [
+                settings.vm_storage_dir,
+                settings.template_storage_dir,
+                "/",  # always present; a coarse answer beats none
+            ]
+            docker_data_path = next((c for c in candidates if c and os.path.isdir(c)), "/")
 
             # Get disk usage
             disk_usage = shutil.disk_usage(docker_data_path)

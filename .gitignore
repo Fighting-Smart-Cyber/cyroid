@@ -69,3 +69,6 @@ data/
 # Git worktrees
 .worktrees/
 .superpowers/
+
+# JUnit output from `npm run test:ci` / `pytest --junitxml`, written where CI writes it.
+report.xml

@@ -2,22 +2,20 @@
 """
 Async blueprint import task with progress tracking and cancellation support.
 """
-import json
 import logging
 import os
 import shutil
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 import dramatiq
-from redis import Redis
 
 from proving_ground.config import get_settings
 from proving_ground.database import get_session_local
 from proving_ground.models.user import User
 from proving_ground.schemas.blueprint_export import BlueprintImportOptions
 from proving_ground.services.blueprint_export_service import get_blueprint_export_service
+from proving_ground.tasks.jobs import JobStore
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -27,14 +25,14 @@ IMPORT_JOB_PREFIX = "blueprint_import:"
 IMPORT_JOB_TTL = 3600  # 1 hour TTL for job data
 
 
-def get_redis() -> Redis:
-    """Get Redis connection."""
-    return Redis.from_url(settings.redis_url, decode_responses=True)
+# One shared implementation of job progress lives in tasks.jobs; these keep
+# their original names so existing callers and the API are unaffected.
+_store = JobStore(IMPORT_JOB_PREFIX, IMPORT_JOB_TTL)
 
 
 def get_job_key(job_id: str) -> str:
     """Get Redis key for an import job."""
-    return f"{IMPORT_JOB_PREFIX}{job_id}"
+    return _store.key(job_id)
 
 
 def update_job_status(
@@ -48,54 +46,36 @@ def update_job_status(
     result: Optional[Dict[str, Any]] = None,
 ):
     """Update import job status in Redis."""
-    redis = get_redis()
-    job_data = {
-        "status": status,  # pending, running, completed, failed, cancelled
-        "step": step,
-        "progress": progress,
-        "total_steps": total_steps,
-        "current_item": current_item,
-        "error": error,
-        "result": result,
-        "updated_at": datetime.utcnow().isoformat(),
-    }
-    redis.setex(get_job_key(job_id), IMPORT_JOB_TTL, json.dumps(job_data))
+    _store.update(
+        job_id,
+        status,
+        step,
+        progress=progress,
+        total_steps=total_steps,
+        current_item=current_item,
+        error=error,
+        result=result,
+    )
 
 
 def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:
     """Get import job status from Redis."""
-    redis = get_redis()
-    data = redis.get(get_job_key(job_id))
-    if data:
-        return json.loads(data)
-    return None
+    return _store.get(job_id)
 
 
 def is_job_cancelled(job_id: str) -> bool:
     """Check if import job has been cancelled."""
-    status = get_job_status(job_id)
-    return status is not None and status.get("status") == "cancelled"
+    return _store.is_cancelled(job_id)
 
 
 def cancel_job(job_id: str) -> bool:
     """Mark an import job as cancelled."""
-    status = get_job_status(job_id)
-    if status and status.get("status") in ("pending", "running"):
-        update_job_status(
-            job_id,
-            status="cancelled",
-            step="Cancelled by user",
-            progress=0,
-            total_steps=0,
-        )
-        return True
-    return False
+    return _store.cancel(job_id)
 
 
 def cleanup_job(job_id: str):
-    """Clean up import job data."""
-    redis = get_redis()
-    redis.delete(get_job_key(job_id))
+    """Remove job data from Redis."""
+    _store.delete(job_id)
 
 
 @dramatiq.actor(max_retries=0, time_limit=1800000)  # 30 min timeout, no retries
@@ -345,7 +325,11 @@ def import_blueprint_async(
             if content_id:
                 blueprint_content_ids.append(str(content_id))
 
-            config_dict = export_data.blueprint.config.model_dump()
+            # The stored document, not a model: an export carries whichever era wrote it, and
+            # forcing it through the v1 model dropped a v2 blueprint's workloads and
+            # capabilities on the way in -- then stopped working at all once the schema
+            # widened to a dict, which took Era A import down with it.
+            config_dict = dict(export_data.blueprint.config or {})
             if content_id:
                 config_dict["content_ids"] = blueprint_content_ids
 

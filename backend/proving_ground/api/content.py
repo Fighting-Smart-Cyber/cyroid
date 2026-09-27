@@ -9,11 +9,18 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
 from fastapi.responses import Response
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from proving_ground.api.deps import get_current_user, get_db
-from proving_ground.config import get_settings
+from proving_ground.api.deps import get_current_user, get_db, require_any_role
+
+# A Knowledge Check lives inside a Content row's walkthrough_data, so it leaves
+# the platform through this module as well as through api/walkthrough.py. One
+# function removes the answer key for both. It is defined beside the
+# learner-facing delivery route because that is where it is load-bearing;
+# api/msel.py imports it from there for the same reason.
+from proving_ground.api.walkthrough import strip_quiz_answers
+from proving_ground.services.object_store import content_bucket
 from proving_ground.models.user import User
 from proving_ground.models.content import Content, ContentAsset, ContentType
 from proving_ground.schemas.content import (
@@ -26,6 +33,11 @@ from proving_ground.schemas.content import (
     ContentImport,
 )
 from proving_ground.models.catalog import CatalogInstalledItem
+from proving_ground.schemas.content_bundle import (
+    BundleConflict,
+    BundleDecision,
+    BundleImportResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +46,128 @@ router = APIRouter(prefix="/content", tags=["content"])
 # Type aliases
 DBSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+# ============ Authorization ============
+#
+# Content is not a range, so none of the three range checks in api/deps.py fit
+# it: there is no tag model over content, no assignment, and no console. What
+# decides a read here is the author's own act of publishing, and what decides a
+# write is whether the caller writes content at all.
+
+# Content written for the people running the exercise, never handed to a
+# learner -- not even once it is published, because publishing releases a
+# document to its intended audience and these two were never written for the
+# learner's audience.
+INSTRUCTOR_ONLY_TYPES = frozenset({ContentType.INSTRUCTOR_NOTES, ContentType.MSEL})
+
+# There is no separate "author" role in the attribute model (see
+# models/user.py AVAILABLE_ROLES): admin and engineer are the roles that write
+# training material. An evaluator reviews an exercise rather than writing one,
+# and a student is the audience, so neither creates content.
+AUTHORING_ROLES = ("admin", "engineer")
+
+# Who the Content Library is for. The same three roles the browser lets into
+# /content, and deliberately so -- an evaluator whose job is to judge how an
+# exercise ran needs the instructor notes and the MSEL, and gating them out
+# would leave them on a page with almost nothing on it.
+LIBRARY_ROLES = ("admin", "engineer", "evaluator")
+
+# Declared on the route rather than called inside it, the way AdminUser already
+# is across admin.py, catalog.py and cache.py: a guard in the signature is
+# visible in the OpenAPI schema and cannot be skipped by an early return.
+AuthorUser = Annotated[User, Depends(require_any_role(*AUTHORING_ROLES))]
+
+
+def may_author(user: User) -> bool:
+    """True when the caller writes training material."""
+    return user.is_admin or user.has_any_role(*AUTHORING_ROLES)
+
+
+def may_read_everything(user: User) -> bool:
+    """True when the caller works in the library, so drafts are not secrets."""
+    return user.is_admin or user.has_any_role(*LIBRARY_ROLES)
+
+
+def may_read_content(content: Content, user: User) -> bool:
+    """True when this caller may read this document.
+
+    Someone who works in the library sees everything, including a colleague's
+    draft -- writing a course is collaborative and a draft is not a secret
+    from the people producing it. Anyone else sees a document only once its
+    author published it, and never the instructor-facing types.
+    """
+    if content.created_by_id == user.id or may_read_everything(user):
+        return True
+    return bool(content.is_published) and content.content_type not in INSTRUCTOR_ONLY_TYPES
+
+
+def may_read_authored_form(content: Content, user: User) -> bool:
+    """True when the caller may see the document as its author wrote it.
+
+    Everyone else reaches a document only because it was published to the
+    learner's audience, and the authored form carries two things that audience
+    must not have: the Knowledge Check answer key, and the bundle that would
+    carry it back out. This is the unconditional half of may_read_content --
+    the branch that grants a read without asking whether the document was
+    published.
+    """
+    return content.created_by_id == user.id or may_read_everything(user)
+
+
+def _require_read(content: Content, user: User) -> None:
+    if may_read_content(content, user):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="This content is unpublished or written for instructors",
+    )
+
+
+def _delivered(content: Content, user: User) -> ContentResponse:
+    """The document as this caller may have it.
+
+    A published student guide is readable by the learner it was written for,
+    and the range it is attached to hands out its id, so the Content API is a
+    second way to the same walkthrough that api/walkthrough.py delivers. It
+    has to withhold the same answer key, or stripping it there only moves the
+    leak one route sideways.
+    """
+    response = ContentResponse.model_validate(content)
+    if may_read_authored_form(content, user):
+        return response
+    return response.model_copy(
+        update={"walkthrough_data": strip_quiz_answers(content.walkthrough_data, None)}
+    )
+
+
+def _require_owner_or_admin(content: Content, user: User) -> None:
+    """Changing a document is its owner's call, or an admin's.
+
+    Deliberately narrower than may_author: an engineer may read a colleague's
+    draft without being able to rewrite, publish or delete it.
+    """
+    if content.created_by_id == user.id or user.is_admin:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Not authorized to change this content",
+    )
+
+
+def _readable_content_filter(user: User):
+    """The SQL half of may_read_content, for list queries.
+
+    Kept next to it so the two cannot drift: a document the list shows must be
+    one a direct GET would also return.
+    """
+    return or_(
+        Content.created_by_id == user.id,
+        and_(
+            Content.is_published.is_(True),
+            Content.content_type.notin_(tuple(INSTRUCTOR_ONLY_TYPES)),
+        ),
+    )
 
 
 def render_markdown_to_html(md_content: str) -> str:
@@ -110,7 +244,7 @@ def render_walkthrough_to_html(walkthrough_data: dict) -> str:
 def create_content(
     data: ContentCreate,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AuthorUser,
 ):
     """Create new content."""
     # Render HTML from markdown
@@ -145,15 +279,24 @@ def create_content(
 def list_content(
     db: DBSession,
     current_user: CurrentUser,
-    content_type: Optional[ContentType] = Query(None, description="Filter by content type"),
-    tag: Optional[str] = Query(None, description="Filter by tag"),
-    search: Optional[str] = Query(None, description="Search in title and description"),
-    published_only: bool = Query(False, description="Only show published content"),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    # Annotated, not `= Query(...)`: with the older style the Python default is
+    # the Query object itself, which is truthy, so a caller that is not FastAPI
+    # -- a test, or another route -- silently filters on garbage.
+    content_type: Annotated[
+        Optional[ContentType], Query(description="Filter by content type")
+    ] = None,
+    tag: Annotated[Optional[str], Query(description="Filter by tag")] = None,
+    search: Annotated[Optional[str], Query(description="Search in title and description")] = None,
+    published_only: Annotated[bool, Query(description="Only show published content")] = False,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
     """List all content with optional filters."""
     query = db.query(Content)
+
+    # Visibility first, so no later filter can widen it.
+    if not may_read_everything(current_user):
+        query = query.filter(_readable_content_filter(current_user))
 
     # Filter by content type
     if content_type:
@@ -196,7 +339,8 @@ def get_content(
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    return content
+    _require_read(content, current_user)
+    return _delivered(content, current_user)
 
 
 @router.put("/{content_id}", response_model=ContentResponse)
@@ -211,9 +355,7 @@ def update_content(
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    # Check permission (owner or admin)
-    if content.created_by_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized to edit this content")
+    _require_owner_or_admin(content, current_user)
 
     # Update fields
     update_data = data.model_dump(exclude_unset=True)
@@ -248,9 +390,7 @@ def delete_content(
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    # Check permission (owner or admin)
-    if content.created_by_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized to delete this content")
+    _require_owner_or_admin(content, current_user)
 
     # Clean up catalog installed item record if this content was installed from catalog
     db.query(CatalogInstalledItem).filter(
@@ -277,8 +417,7 @@ def publish_content(
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    if content.created_by_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    _require_owner_or_admin(content, current_user)
 
     content.is_published = True
     db.commit()
@@ -298,8 +437,7 @@ def unpublish_content(
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    if content.created_by_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    _require_owner_or_admin(content, current_user)
 
     content.is_published = False
     db.commit()
@@ -315,13 +453,19 @@ def unpublish_content(
 def create_content_version(
     content_id: UUID,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AuthorUser,
     new_version: str = Query(..., description="New version string (e.g., '1.1', '2.0')"),
 ):
     """Create a new version of content (duplicates with new version)."""
     content = db.query(Content).filter(Content.id == content_id).first()
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
+
+    # The role check is in the signature; this is the other half. The route
+    # copies the body into a row the caller owns, so without a read check it
+    # is a way to lift a draft out from behind the read rule and then read it
+    # back as your own.
+    _require_read(content, current_user)
 
     # Create new content as a copy
     new_content = Content(
@@ -353,12 +497,14 @@ def export_content(
     content_id: UUID,
     db: DBSession,
     current_user: CurrentUser,
-    format: str = Query("json", description="Export format: json, md, html"),
+    format: Annotated[str, Query(description="Export format: json, md, html")] = "json",
 ):
     """Export content in various formats."""
     content = db.query(Content).filter(Content.id == content_id).first()
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
+
+    _require_read(content, current_user)
 
     if format == "md":
         # Return raw markdown
@@ -447,7 +593,7 @@ def export_content(
 def import_content(
     data: ContentImport,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AuthorUser,
 ):
     """Import content from JSON."""
     body_html = render_markdown_to_html(data.body_markdown) if data.body_markdown else None
@@ -472,6 +618,191 @@ def import_content(
     return content
 
 
+# ============ Git-native bundle (PG-104) ============
+
+
+def _minio():
+    from proving_ground.services.object_store import object_client
+
+    return object_client()
+
+
+def _load_asset_bytes(asset: ContentAsset) -> Optional[bytes]:
+    """Fetch an asset's bytes, or None if object storage cannot produce them.
+
+    Returning None rather than raising is deliberate: a bundle that lists its
+    assets honestly is more useful than an export that fails outright because
+    one image is missing.
+    """
+    parts = (asset.file_path or "").split("/", 1)
+    if len(parts) != 2:
+        logger.warning("asset %s has a malformed path %r", asset.id, asset.file_path)
+        return None
+    try:
+        obj = _minio().get_object(parts[0], parts[1])
+        try:
+            return obj.read()
+        finally:
+            obj.close()
+            obj.release_conn()
+    except Exception as exc:  # noqa: BLE001 - any storage failure is the same answer here
+        logger.warning("could not read asset %s: %s", asset.id, exc)
+        return None
+
+
+def _save_asset_bytes(content_id: UUID, filename: str, mime_type: str, data: bytes) -> str:
+    from io import BytesIO
+
+    client = _minio()
+    bucket_name = content_bucket()
+    if not client.bucket_exists(bucket_name):
+        client.make_bucket(bucket_name)
+    digest = hashlib.sha256(data).hexdigest()
+    object_name = f"{content_id}/{digest[:8]}_{filename}"
+    client.put_object(bucket_name, object_name, BytesIO(data), len(data), content_type=mime_type)
+    return f"{bucket_name}/{object_name}"
+
+
+def _decision_response(decision) -> BundleDecision:
+    return BundleDecision(
+        slug=decision.slug,
+        title=decision.title,
+        action=decision.action,
+        content_id=decision.content_id,
+        conflicts=[
+            BundleConflict(
+                field=c.field,
+                local=c.local,
+                incoming=c.incoming,
+                summary=c.summary,
+                description=c.describe(),
+            )
+            for c in decision.conflicts
+        ],
+        reason=decision.reason,
+        writes=decision.writes,
+    )
+
+
+async def _read_bundle_upload(file: UploadFile):
+    """Read an uploaded bundle archive into a parsed bundle."""
+    from proving_ground.content.archive import ArchiveError, unpack
+    from proving_ground.content.bundle import BundleError, read_bundle
+
+    payload = await file.read()
+    try:
+        return read_bundle(unpack(payload))
+    except (ArchiveError, BundleError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _plan(db: Session, bundle, overwrite: bool):
+    from proving_ground.content.importer import plan_import
+    from proving_ground.content.store import find_local
+
+    local, content_id = find_local(db, bundle.slug, load_asset=_load_asset_bytes)
+    return plan_import(bundle, local, content_id=content_id, overwrite=overwrite)
+
+
+@router.get("/{content_id}/bundle")
+def export_content_bundle(content_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Export content as a git-native bundle: a directory of reviewable files.
+
+    Unlike `?format=json`, nothing in it varies between two exports of
+    unchanged content, so a diff shows what an author changed and nothing else.
+
+    Deliberately stricter than the read rule: library roles and the owner
+    only. A bundle is the authored form -- it exists to move a document
+    between environments intact, walkthrough and all -- so a learner allowed
+    to export one would hold the Knowledge Check answer key. Stripping the
+    bundle instead would be worse than refusing it: the copy would import
+    elsewhere as a quiz with no right answer, and nothing would say so.
+    """
+    from proving_ground.content.archive import pack
+    from proving_ground.content.store import bundle_from_content
+
+    content = db.query(Content).filter(Content.id == content_id).first()
+    if not content:
+        raise HTTPException(status_code=404, detail="Content not found")
+
+    if not may_read_authored_form(content, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Exporting a bundle is for the content library",
+        )
+
+    bundle = bundle_from_content(content, load_asset=_load_asset_bytes)
+    archive = pack(bundle.files(), bundle.slug)
+    return Response(
+        content=archive,
+        media_type="application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="{bundle.slug}-bundle.tar.gz"'},
+    )
+
+
+@router.post("/bundle/preview", response_model=BundleDecision)
+async def preview_content_bundle(
+    db: DBSession,
+    current_user: AuthorUser,
+    file: UploadFile = File(...),
+    # Annotated, not `= Query(...)`: with the older style the Python default is
+    # the Query object itself, which is truthy, so any caller that is not
+    # FastAPI gets overwrite=True.
+    overwrite: Annotated[bool, Query(description="Plan as if replacing local changes")] = False,
+):
+    """Report what importing this bundle would do, without writing anything.
+
+    It writes nothing, but the conflict report quotes the local document field
+    by field, so it reads a draft to whoever may call it -- hence AuthorUser.
+    """
+    bundle = await _read_bundle_upload(file)
+    return _decision_response(_plan(db, bundle, overwrite))
+
+
+@router.post("/bundle/import", response_model=BundleImportResult)
+async def import_content_bundle(
+    db: DBSession,
+    current_user: AuthorUser,
+    file: UploadFile = File(...),
+    overwrite: Annotated[
+        bool, Query(description="Replace content that exists and differs")
+    ] = False,
+):
+    """Import a bundle. Idempotent: re-importing identical content writes nothing.
+
+    Content that already exists and differs is reported as a conflict and left
+    alone unless `overwrite` is set.
+    """
+    from proving_ground.content.store import apply_bundle
+
+    bundle = await _read_bundle_upload(file)
+    decision = _plan(db, bundle, overwrite)
+
+    content = None
+    if decision.writes:
+        try:
+            content = apply_bundle(
+                db,
+                bundle,
+                decision,
+                current_user.id,
+                render_html=render_markdown_to_html,
+                save_asset=_save_asset_bytes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        db.commit()
+        logger.info(
+            "Content bundle %s: %s by %s", decision.action, bundle.slug, current_user.username
+        )
+
+    return BundleImportResult(
+        decision=_decision_response(decision),
+        content_id=content.id if content else decision.content_id,
+        imported=content is not None,
+    )
+
+
 # ============ Assets ============
 
 
@@ -487,8 +818,7 @@ async def upload_asset(
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    if content.created_by_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    _require_owner_or_admin(content, current_user)
 
     # Validate file type
     allowed_types = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"]
@@ -503,17 +833,11 @@ async def upload_asset(
     file_size = len(file_content)
 
     # Store in MinIO
-    settings = get_settings()
-    from minio import Minio
+    from proving_ground.services.object_store import object_client
 
-    minio_client = Minio(
-        settings.minio_endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        secure=settings.minio_secure,
-    )
+    minio_client = object_client()
 
-    bucket_name = "proving-ground-content"
+    bucket_name = content_bucket()
     # Ensure bucket exists
     if not minio_client.bucket_exists(bucket_name):
         minio_client.make_bucket(bucket_name)
@@ -560,8 +884,7 @@ def delete_asset(
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    if content.created_by_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    _require_owner_or_admin(content, current_user)
 
     asset = (
         db.query(ContentAsset)
@@ -576,15 +899,9 @@ def delete_asset(
 
     # Delete from MinIO
     try:
-        settings = get_settings()
-        from minio import Minio
+        from proving_ground.services.object_store import object_client
 
-        minio_client = Minio(
-            settings.minio_endpoint,
-            access_key=settings.minio_access_key,
-            secret_key=settings.minio_secret_key,
-            secure=settings.minio_secure,
-        )
+        minio_client = object_client()
 
         parts = asset.file_path.split("/", 1)
         if len(parts) == 2:
@@ -605,8 +922,13 @@ def serve_asset(asset_id: UUID, db: DBSession):
 
     Referenced directly by <img> tags in rendered walkthrough content, which
     cannot carry an Authorization header — so this endpoint is intentionally
-    unauthenticated. It only serves assets whose parent content is published,
-    which is the same gate the student-facing walkthrough already sits behind.
+    unauthenticated. It only serves assets whose parent content is published.
+
+    That is a weaker gate than may_read_content, which also withholds the
+    instructor-facing types. Matching it here would blank out the images in an
+    author's own view of their instructor notes, since the editor loads them
+    through this same URL. Closing the gap needs a signed, short-lived asset
+    URL rather than a tighter filter.
     """
     asset = db.query(ContentAsset).filter(ContentAsset.id == asset_id).first()
     if not asset:
@@ -623,16 +945,11 @@ def serve_asset(asset_id: UUID, db: DBSession):
         raise HTTPException(status_code=500, detail="Malformed asset path")
     bucket_name, object_name = parts
 
-    settings = get_settings()
-    from minio import Minio
     from minio.error import S3Error
 
-    minio_client = Minio(
-        settings.minio_endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        secure=settings.minio_secure,
-    )
+    from proving_ground.services.object_store import object_client
+
+    minio_client = object_client()
     try:
         obj = minio_client.get_object(bucket_name, object_name)
         data = obj.read()
@@ -670,6 +987,10 @@ def list_available_student_guides(
 
     Returns only content of type 'student_guide' that has been published.
     Used by the Training tab in Range settings.
+
+    No further check: a published student guide is readable by every role
+    under may_read_content, so this list can hold nothing the caller could not
+    already fetch by id.
     """
     return (
         db.query(Content)

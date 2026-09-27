@@ -1,16 +1,97 @@
 // frontend/src/pages/VMLibrary.tsx
 import { useEffect, useState } from 'react'
+import { isAxiosError } from 'axios'
 import { imagesApi, BaseImageUpdate, GoldenImageUpdate } from '../services/api'
 import type { BaseImage, GoldenImageLibrary, SnapshotWithLineage, LibraryStats, ContainerConfig } from '../types'
-import { Pencil, Trash2, Loader2, X, Server, HardDrive, Star, Camera, Upload, Database, ArrowRight, RefreshCw, LayoutGrid, List, ChevronDown } from 'lucide-react'
+import { AlertTriangle, Pencil, Trash2, Loader2, X, Server, HardDrive, Star, Camera, Upload, Database, ArrowRight, RefreshCw, LayoutGrid, List, ChevronDown } from 'lucide-react'
 import clsx from 'clsx'
 import { ConfirmDialog } from '../components/common/ConfirmDialog'
 import { toast } from '../stores/toastStore'
 import { Link } from 'react-router-dom'
 import { ContainerConfigEditor } from '../components/ContainerConfigEditor'
+import { useCapabilitiesStore, useFeature } from '../stores/capabilitiesStore'
+import { featureGate } from '../lib/featureGate'
 
 // Tab type for the VM Library
 type VMLibraryTab = 'base' | 'golden' | 'snapshots'
+
+/** Named so the two `<select>`s can narrow their own value instead of casting it away. */
+interface ImportMetadata {
+  name: string
+  description: string
+  os_type: 'windows' | 'linux' | 'network' | 'custom'
+  vm_type: 'container' | 'linux_vm' | 'windows_vm'
+  native_arch: string
+  default_cpu: number
+  default_ram_mb: number
+  default_disk_gb: number
+}
+
+/**
+ * Why a list has nothing in it.
+ *
+ * Every fetch on this page used to swallow its error into `console.error` and leave the list
+ * empty, so a request that failed and a library that is genuinely empty rendered the same "No
+ * Base Images" panel -- and that panel then told the user to go and cache some images. The reason
+ * has to survive as far as the render or the page invents an explanation of its own.
+ */
+export type LoadFailure = { kind: 'substrate' | 'error'; message: string }
+
+/**
+ * The `detail` FastAPI puts on a refusal, when it carries one a person can read.
+ *
+ * Only a non-empty string is accepted. A 422 answers with a list of objects, and rendering that
+ * straight into JSX throws in React rather than telling anyone anything.
+ */
+export function responseDetail(reason: unknown): string | null {
+  if (!isAxiosError(reason)) return null
+  const body = reason.response?.data as { detail?: unknown } | undefined
+  return typeof body?.detail === 'string' && body.detail.trim() !== '' ? body.detail : null
+}
+
+/**
+ * What to tell the user about one failed request. The server's own `detail` comes first because
+ * it is the only text that knows which route failed and why; axios contributes "Request failed
+ * with status code 500", which explains nothing.
+ *
+ * Only 501 means "this install does not have one". The app-level Docker handler answers 501 just
+ * when the install is Kubernetes and 503 when a Docker host has lost its daemon, so the two cases
+ * stay apart. A 404 must not join them: the image routes answer 404 for a base or golden image
+ * missing by id, and reading one as the substrate would tell a Docker operator that their install
+ * does not build machines from a library -- about the library they are looking at.
+ */
+export function describeFailure(reason: unknown, label: string): LoadFailure {
+  const detail = responseDetail(reason)
+  const status = isAxiosError(reason) ? reason.response?.status : undefined
+
+  if (status === 501) {
+    return { kind: 'substrate', message: detail ?? `${label} is not available on this install.` }
+  }
+  if (detail) return { kind: 'error', message: detail }
+  if (isAxiosError(reason) && !reason.response) {
+    return { kind: 'error', message: `${label} could not be read: the API did not answer.` }
+  }
+  if (status) return { kind: 'error', message: `${label} could not be read (HTTP ${status}).` }
+  return { kind: 'error', message: `${label} could not be read.` }
+}
+
+/** One failed list, stated where its contents would have been. */
+function FailurePanel({ failure, onRetry }: { failure: LoadFailure; onRetry: () => void }) {
+  return (
+    <div className="mt-8 text-center bg-white shadow rounded-lg p-8">
+      <AlertTriangle className="mx-auto h-12 w-12 text-amber-400" />
+      <h3 className="mt-4 text-lg font-medium text-gray-900">Nothing could be read here</h3>
+      <p className="mt-2 text-sm text-gray-600 max-w-md mx-auto">{failure.message}</p>
+      <button
+        onClick={onRetry}
+        className="mt-6 inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+      >
+        <RefreshCw className="h-4 w-4 mr-2" />
+        Try again
+      </button>
+    </div>
+  )
+}
 
 // Format bytes to human readable
 const formatBytes = (bytes: number | null): string => {
@@ -22,6 +103,13 @@ const formatBytes = (bytes: number | null): string => {
 }
 
 export default function VMLibrary() {
+  const features = useCapabilitiesStore((s) => s.features)
+  const substrateLabel = useCapabilitiesStore((s) => s.substrateLabel)
+  const gate = featureGate(features, 'image_library')
+  // The library's only route in is the image cache, so the link is worth offering only where
+  // that page exists. A call to action that lands on a refusal is worse than no call to action.
+  const hasImageCache = useFeature('image_cache')
+
   // Tab state - default to 'base'
   const [activeTab, setActiveTab] = useState<VMLibraryTab>('base')
   const [viewMode, setViewMode] = useState<'tile' | 'list'>('tile')
@@ -33,6 +121,12 @@ export default function VMLibrary() {
   const [goldenImages, setGoldenImages] = useState<GoldenImageLibrary[]>([])
   const [snapshots, setSnapshots] = useState<SnapshotWithLineage[]>([])
 
+  // Why each list is empty, when it is empty because a request failed.
+  const [baseFailure, setBaseFailure] = useState<LoadFailure | null>(null)
+  const [goldenFailure, setGoldenFailure] = useState<LoadFailure | null>(null)
+  const [snapshotsFailure, setSnapshotsFailure] = useState<LoadFailure | null>(null)
+  const [syncFailure, setSyncFailure] = useState<LoadFailure | null>(null)
+
   // Edit modal states
   const [editingBaseImage, setEditingBaseImage] = useState<BaseImage | null>(null)
   const [editingGoldenImage, setEditingGoldenImage] = useState<GoldenImageLibrary | null>(null)
@@ -42,11 +136,11 @@ export default function VMLibrary() {
   // Import modal
   const [showImportModal, setShowImportModal] = useState(false)
   const [importFile, setImportFile] = useState<File | null>(null)
-  const [importMetadata, setImportMetadata] = useState({
+  const [importMetadata, setImportMetadata] = useState<ImportMetadata>({
     name: '',
     description: '',
-    os_type: 'linux' as 'windows' | 'linux' | 'network' | 'custom',
-    vm_type: 'linux_vm' as 'container' | 'linux_vm' | 'windows_vm',
+    os_type: 'linux',
+    vm_type: 'linux_vm',
     native_arch: 'x86_64',
     default_cpu: 2,
     default_ram_mb: 4096,
@@ -68,8 +162,9 @@ export default function VMLibrary() {
     try {
       const response = await imagesApi.getLibraryStats()
       setStats(response.data)
-    } catch (err) {
-      console.error('Failed to fetch library stats:', err)
+    } catch {
+      // The counts beside the tab names are decoration; the lists below carry their own reason.
+      setStats(null)
     }
   }
 
@@ -77,8 +172,10 @@ export default function VMLibrary() {
     try {
       const response = await imagesApi.listBaseImages()
       setBaseImages(response.data)
-    } catch (err) {
-      console.error('Failed to fetch base images:', err)
+      setBaseFailure(null)
+    } catch (err: unknown) {
+      setBaseImages([])
+      setBaseFailure(describeFailure(err, 'The base images'))
     }
   }
 
@@ -86,8 +183,10 @@ export default function VMLibrary() {
     try {
       const response = await imagesApi.listGoldenImages()
       setGoldenImages(response.data)
-    } catch (err) {
-      console.error('Failed to fetch golden images:', err)
+      setGoldenFailure(null)
+    } catch (err: unknown) {
+      setGoldenImages([])
+      setGoldenFailure(describeFailure(err, 'The golden images'))
     }
   }
 
@@ -95,8 +194,10 @@ export default function VMLibrary() {
     try {
       const response = await imagesApi.listLibrarySnapshots()
       setSnapshots(response.data)
-    } catch (err) {
-      console.error('Failed to fetch snapshots:', err)
+      setSnapshotsFailure(null)
+    } catch (err: unknown) {
+      setSnapshots([])
+      setSnapshotsFailure(describeFailure(err, 'The snapshots'))
     }
   }
 
@@ -104,11 +205,14 @@ export default function VMLibrary() {
     setSyncing(true)
     try {
       const response = await imagesApi.syncFromCache()
+      setSyncFailure(null)
       if (response.data.total_synced > 0) {
-        toast.success(`Synced ${response.data.total_synced} image(s) from cache`)
+        toast.success(`Synced ${response.data.total_synced} image(s) from the cache`)
       }
-    } catch (err) {
-      console.error('Failed to sync from cache:', err)
+    } catch (err: unknown) {
+      // The refresh button promises a sync. A sync that failed silently left the user reading a
+      // list that was short for a reason nothing on the page mentioned.
+      setSyncFailure(describeFailure(err, 'The sync from the image cache'))
     } finally {
       setSyncing(false)
     }
@@ -125,8 +229,11 @@ export default function VMLibrary() {
   }
 
   useEffect(() => {
+    // Only ask an install that has a library. The route is gated too; this is the second line,
+    // for a render that reaches the component some other way.
+    if (gate !== 'allow') return
     fetchAll()
-  }, [])
+  }, [gate])
 
   // Edit handlers
   const openEditBaseImage = (image: BaseImage) => {
@@ -169,8 +276,8 @@ export default function VMLibrary() {
         fetchGoldenImages()
       }
       setShowEditModal(false)
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to save changes')
+    } catch (err: unknown) {
+      toast.error(responseDetail(err) ?? 'The changes could not be saved.')
     } finally {
       setSubmitting(false)
     }
@@ -200,9 +307,9 @@ export default function VMLibrary() {
       }
       fetchStats()
       setDeleteConfirm({ type: null, item: null, isLoading: false })
-    } catch (err: any) {
+    } catch (err: unknown) {
       setDeleteConfirm({ type: null, item: null, isLoading: false })
-      toast.error(err.response?.data?.detail || 'Failed to delete image')
+      toast.error(responseDetail(err) ?? 'The image could not be deleted.')
     }
   }
 
@@ -227,8 +334,8 @@ export default function VMLibrary() {
       })
       fetchGoldenImages()
       fetchStats()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to import image')
+    } catch (err: unknown) {
+      toast.error(responseDetail(err) ?? 'The image could not be imported.')
     } finally {
       setImporting(false)
     }
@@ -249,31 +356,38 @@ export default function VMLibrary() {
 
   // Render Base Images tab
   const renderBaseImagesTab = () => {
+    if (baseFailure) {
+      return <FailurePanel failure={baseFailure} onRetry={() => fetchAll(false)} />
+    }
+
     if (baseImages.length === 0) {
       return (
         <div className="mt-8 text-center bg-white shadow rounded-lg p-8">
           <Database className="mx-auto h-12 w-12 text-gray-400" />
           <h3 className="mt-4 text-lg font-medium text-gray-900">No Base Images</h3>
           <p className="mt-2 text-sm text-gray-500 max-w-md mx-auto">
-            Base images include pulled Docker containers and downloaded ISOs. They serve as the foundation for creating VMs.
+            A base image is a pulled Docker image or a downloaded installer ISO. It is what a
+            machine in a range is first created from.
           </p>
           <div className="mt-4 bg-gray-50 rounded-lg p-4 max-w-lg mx-auto text-left">
             <h4 className="text-sm font-medium text-gray-700 mb-2">To add Base Images:</h4>
             <ul className="text-sm text-gray-600 list-disc list-inside space-y-1">
-              <li>Pull Docker images from the <strong>Image Cache</strong></li>
-              <li>Download Windows or Linux ISOs</li>
-              <li>Upload custom ISO files</li>
+              <li>Pull a Docker image into the <strong>Image Cache</strong></li>
+              <li>Download a Windows or Linux ISO</li>
+              <li>Upload your own ISO file</li>
             </ul>
           </div>
-          <div className="mt-6">
-            <Link
-              to="/cache"
-              className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary-600 hover:bg-primary-700"
-            >
-              <HardDrive className="h-4 w-4 mr-2" />
-              Go to Image Cache
-            </Link>
-          </div>
+          {hasImageCache && (
+            <div className="mt-6">
+              <Link
+                to="/cache"
+                className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary-600 hover:bg-primary-700"
+              >
+                <HardDrive className="h-4 w-4 mr-2" />
+                Go to Image Cache
+              </Link>
+            </div>
+          )}
         </div>
       )
     }
@@ -448,6 +562,10 @@ export default function VMLibrary() {
 
   // Render Golden Images tab
   const renderGoldenImagesTab = () => {
+    if (goldenFailure) {
+      return <FailurePanel failure={goldenFailure} onRetry={() => fetchAll(false)} />
+    }
+
     if (goldenImages.length === 0) {
       return (
         <div className="mt-8 text-center bg-white shadow rounded-lg p-8">
@@ -629,6 +747,10 @@ export default function VMLibrary() {
 
   // Render Snapshots tab
   const renderSnapshotsTab = () => {
+    if (snapshotsFailure) {
+      return <FailurePanel failure={snapshotsFailure} onRetry={() => fetchAll(false)} />
+    }
+
     if (snapshots.length === 0) {
       return (
         <div className="mt-8 text-center bg-white shadow rounded-lg p-8">
@@ -746,6 +868,34 @@ export default function VMLibrary() {
     )
   }
 
+  // Waiting on /system/capabilities: render nothing rather than a library this install may not
+  // have, which would then have to disappear.
+  if (gate === 'pending') {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="h-8 w-8 animate-spin text-primary-600" />
+      </div>
+    )
+  }
+
+  // A refusal that names the reason. The route redirects before this on a normal navigation; this
+  // covers a render that arrives some other way, and it says the same thing the redirect does.
+  if (gate === 'deny') {
+    return (
+      <div className="mt-8 text-center bg-white shadow rounded-lg p-8">
+        <Database className="mx-auto h-12 w-12 text-gray-400" />
+        <h3 className="mt-4 text-lg font-medium text-gray-900">
+          No VM library on this install
+        </h3>
+        <p className="mt-2 text-sm text-gray-600 max-w-xl mx-auto">
+          {substrateLabel ? `This ${substrateLabel} install` : 'This install'} does not build
+          machines from a library of images. A range&apos;s machines are declared in its blueprint,
+          and the cluster pulls the images that blueprint names.
+        </p>
+      </div>
+    )
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -758,9 +908,9 @@ export default function VMLibrary() {
     <div>
       <div className="sm:flex sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Image Library</h1>
+          <h1 className="text-2xl font-bold text-gray-900">VM Library</h1>
           <p className="mt-2 text-sm text-gray-700">
-            Manage base images, golden images, and snapshots for VM creation
+            The base images, golden images and snapshots a virtual machine can be created from
           </p>
         </div>
         <div className="mt-4 sm:mt-0 flex items-center space-x-3">
@@ -826,6 +976,16 @@ export default function VMLibrary() {
           )}
         </div>
       </div>
+
+      {syncFailure && (
+        <div className="mt-4 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-3">
+          <AlertTriangle className="h-4 w-4 text-amber-500 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-amber-800">
+            {syncFailure.message} Anything cached since the last successful sync is missing from
+            the Base Images list below.
+          </p>
+        </div>
+      )}
 
       {/* Tab Navigation */}
       <div className="mt-6 border-b border-gray-200">
@@ -1117,7 +1277,7 @@ export default function VMLibrary() {
                     <label className="block text-sm font-medium text-gray-700">OS Type</label>
                     <select
                       value={importMetadata.os_type}
-                      onChange={(e) => setImportMetadata({ ...importMetadata, os_type: e.target.value as any })}
+                      onChange={(e) => setImportMetadata({ ...importMetadata, os_type: e.target.value as ImportMetadata['os_type'] })}
                       className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500 sm:text-sm"
                     >
                       <option value="linux">Linux</option>
@@ -1130,7 +1290,7 @@ export default function VMLibrary() {
                     <label className="block text-sm font-medium text-gray-700">VM Type</label>
                     <select
                       value={importMetadata.vm_type}
-                      onChange={(e) => setImportMetadata({ ...importMetadata, vm_type: e.target.value as any })}
+                      onChange={(e) => setImportMetadata({ ...importMetadata, vm_type: e.target.value as ImportMetadata['vm_type'] })}
                       className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500 sm:text-sm"
                     >
                       <option value="linux_vm">Linux VM</option>

@@ -39,9 +39,19 @@ class TestNotKnowingIsNotUpToDate:
             "A failure path omits checked=False and would be rendered as " "'up to date'."
         )
 
-    def test_the_success_path_derives_availability_from_the_commit_count(self):
+    def test_the_success_path_derives_availability_from_a_measurement(self):
+        """Availability is computed, never assumed.
+
+        Which measurement depends on the channel: commits behind the branch tip
+        for "branch", a strictly newer release tag for "release". Both must be
+        present -- a channel that fell through to a constant would report
+        "up to date" without having measured anything.
+        """
         src = inspect.getsource(admin_api.check_for_platform_update)
-        assert "update_available=behind > 0" in src
+        assert "available = behind > 0" in src, "branch channel lost its measurement"
+        assert (
+            "is_newer(latest_tag, current_version)" in src
+        ), "release channel lost its measurement"
 
 
 class TestItRunsAgainstTheRepoLikeTheUpdateDoes:
@@ -89,11 +99,22 @@ class TestATagDisagreementCannotBreakTheCheck:
         )
         assert '"git fetch --prune origin\\n"' in src
 
-    def test_fetching_tags_is_explicitly_not_fatal(self):
+    def test_a_tag_disagreement_cannot_break_the_check(self):
+        """The guarantee is now structural rather than a swallowed error.
+
+        This used to assert `|| true` on a `git fetch --tags`, making a
+        clobbering fetch non-fatal. Tags are now read with `git ls-remote`,
+        which asks the remote what it has and writes no local refs at all, so
+        there is no local tag state left to disagree with anything. Asserting
+        the mechanism is absent is stronger than asserting its failure was
+        tolerated.
+        """
         src = inspect.getsource(admin_api.check_for_platform_update)
-        assert "|| true" in src, (
-            "Tag fetching can still abort the script; the latest tag is a "
-            "nicety on top of the commit count, not a precondition for it."
+        assert "ls-remote" in src, "tags are being fetched again rather than listed"
+        code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+        assert "fetch --tags" not in code, (
+            "a clobbering tag fetch is back in the check; that is what broke "
+            "this endpoint the first time"
         )
 
     def test_the_commit_count_fetch_keeps_its_errors(self):

@@ -4,16 +4,22 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from proving_ground.models.content import ContentType
 
 
 # ============ Walkthrough Schemas ============
+#
+# There are two shapes for a walkthrough here, and the difference is the point.
+# The authoring shape below carries the answer key, because an author writing a
+# Knowledge Check has to say which option is right. The learner shape further
+# down does not carry it at all, because the browser is the one party to an
+# assessment whose copy of the answers cannot be trusted.
 
 
 class QuizOptionSchema(BaseModel):
-    """One selectable answer within a quiz question."""
+    """One selectable answer within a quiz question, as its author writes it."""
 
     id: str
     text: str
@@ -54,6 +60,83 @@ class WalkthroughSchema(BaseModel):
 
     title: str
     phases: List[WalkthroughPhaseSchema] = Field(default_factory=list)
+
+
+# ============ Learner-facing Walkthrough Schemas ============
+#
+# What a range hands to a browser. Every field below is optional or defaulted
+# and the containers accept unknown keys, because this is a read path: content
+# authored before a field existed must still render rather than fail
+# validation. The quiz schemas are the exception -- they accept no extras, so
+# no answer key can arrive through one.
+
+
+class QuizAnswerRecordSchema(BaseModel):
+    """One graded answer, as held in the learner record and returned on submit.
+
+    The answer key lives here and nowhere else in a learner response: by the
+    time this exists the learner has already answered, so telling them which
+    option was right reveals nothing they can still use.
+    """
+
+    question_id: str
+    step_id: Optional[str] = None
+    selected_option_id: str
+    correct: bool
+    correct_option_id: Optional[str] = None
+    explanation: Optional[str] = None
+    answered_at: Optional[str] = None
+
+
+class LearnerQuizOptionSchema(BaseModel):
+    """A selectable answer as the learner receives it.
+
+    It has no `correct` field, and that absence is the fix: every option used
+    to arrive carrying its own flag, so the key to the Knowledge Check was
+    readable in the page source before the learner picked anything.
+    """
+
+    id: str = ""
+    text: str = ""
+
+
+class LearnerQuizQuestionSchema(BaseModel):
+    """A question as the learner receives it.
+
+    No `explanation` either -- an explanation that says why an option is right
+    is the answer key in prose.
+    """
+
+    id: str = ""
+    prompt: str = ""
+    options: List[LearnerQuizOptionSchema] = Field(default_factory=list)
+    answered: Optional[QuizAnswerRecordSchema] = None
+
+
+class LearnerWalkthroughStepSchema(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str = ""
+    title: str = ""
+    content: str = ""
+    vm: Optional[str] = None
+    hints: Optional[List[str]] = None
+    quiz: Optional[List[LearnerQuizQuestionSchema]] = None
+
+
+class LearnerWalkthroughPhaseSchema(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str = ""
+    name: str = ""
+    steps: List[LearnerWalkthroughStepSchema] = Field(default_factory=list)
+
+
+class LearnerWalkthroughSchema(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    title: str = ""
+    phases: List[LearnerWalkthroughPhaseSchema] = Field(default_factory=list)
 
 
 # ============ Content Asset Schemas ============

@@ -13,7 +13,13 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { Modal, ModalBody, ModalFooter } from '../common/Modal';
-import { blueprintsApi, BlueprintDetail, BlueprintConfig } from '../../services/api';
+import { blueprintsApi, BlueprintDetail } from '../../services/api';
+import {
+  apiErrorDetail,
+  blueprintLegacyVms,
+  blueprintNetworks,
+  isKubernetesBlueprint,
+} from '../../lib/blueprints';
 import { toast } from '../../stores/toastStore';
 
 interface VisualBlueprintEditorProps {
@@ -56,19 +62,40 @@ interface VMConfig {
   network_name?: string;
 }
 
+/** One boolean off the stored document, for a field the blueprint reader does not model. */
+function rawNetworkFlag(config: unknown, index: number, key: string): boolean {
+  if (config === null || typeof config !== 'object') return false
+  const networks = (config as Record<string, unknown>).networks
+  if (!Array.isArray(networks)) return false
+  const entry = networks[index]
+  if (entry === null || typeof entry !== 'object') return false
+  return (entry as Record<string, unknown>)[key] === true
+}
+
 export function VisualBlueprintEditor({
   blueprint,
   isOpen,
   onClose,
   onSaved,
 }: VisualBlueprintEditorProps) {
-  // Deep clone the config to avoid mutating the original
+  // The config is the stored document, not a shape this component can assume: it is v1
+  // (networks and VMs) or v2 (workloads and capabilities), and it is hand-edited by turns.
+  // Reading `config.networks` and `config.vms` straight threw on any v2 blueprint, which took
+  // the whole page down rather than saying what it could not edit.
+  const isKubernetes = isKubernetesBlueprint(blueprint.config);
   const [networks, setNetworks] = useState<NetworkConfig[]>(() =>
-    JSON.parse(JSON.stringify(blueprint.config.networks))
+    blueprintNetworks(blueprint.config).map((n, i) => ({
+      name: n.name,
+      subnet: n.subnet ?? '',
+      gateway: n.gateway ?? '',
+      // Not part of the reader's shape, so it is read off the raw document -- the editor
+      // round-trips it and the reader has no reason to model it.
+      is_isolated: rawNetworkFlag(blueprint.config, i, 'is_isolated'),
+    }))
   );
   const [vms, setVMs] = useState<VMConfig[]>(() => {
     // Normalize VMs to always use network_interfaces
-    return blueprint.config.vms.map((vm) => {
+    return (blueprintLegacyVms(blueprint.config) as unknown as VMConfig[]).map((vm) => {
       const normalized: VMConfig = {
         ...vm,
         cpu: vm.cpu || 1,
@@ -155,24 +182,25 @@ export function VisualBlueprintEditor({
 
     setSaving(true);
     try {
-      const config: BlueprintConfig = {
+      // Everything the editor does not touch is carried over verbatim. Rebuilding the document
+      // from the four keys this component knows about is what silently dropped schemaVersion,
+      // workloads, capabilities and content_ids from any config that had them.
+      const config: Record<string, unknown> = {
+        ...blueprint.config,
         networks,
         vms: vms.map((vm) => {
           // Destructure to exclude legacy fields, keep everything else
           const { ip_address, network_name, ...rest } = vm;
           return rest;
         }),
-        router: blueprint.config.router,
-        msel: blueprint.config.msel,
       };
 
       await blueprintsApi.update(blueprint.id, { config });
       toast.success(`Blueprint updated to version ${blueprint.version + 1}`);
       onSaved?.();
       onClose();
-    } catch (err: any) {
-      const detail = err.response?.data?.detail || 'Failed to save blueprint';
-      toast.error(detail);
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to save blueprint'));
     } finally {
       setSaving(false);
     }
@@ -331,6 +359,38 @@ export function VisualBlueprintEditor({
       })
     );
   };
+
+  if (isKubernetes) {
+    // A refusal, not a throw. The visual editor composes networks and virtual machines, which
+    // is how an Era A range is described; a Kubernetes blueprint declares workloads and
+    // capabilities and has no such rows to draw.
+    return (
+      <Modal
+        isOpen={isOpen}
+        onClose={onClose}
+        title={`Edit: ${blueprint.name}`}
+        description="Kubernetes blueprint"
+        size="md"
+      >
+        <ModalBody>
+          <p className="text-sm text-gray-300">
+            This blueprint describes workloads and capabilities, which the visual editor cannot
+            draw &mdash; it composes networks and virtual machines. Edit it as a configuration
+            document instead.
+          </p>
+        </ModalBody>
+        <ModalFooter>
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-sm rounded-md bg-gray-700 hover:bg-gray-600 text-white"
+          >
+            Close
+          </button>
+        </ModalFooter>
+      </Modal>
+    );
+  }
 
   return (
     <Modal

@@ -31,9 +31,76 @@ export interface Branding {
   tagline: string
 }
 
+/**
+ * Defaults, used until the API answers and whenever it cannot.
+ *
+ * These are the ENGINE's. A distribution overrides them through
+ * GET /api/v1/branding rather than by editing this file, which is what makes
+ * standing one up a configuration change instead of a rebuild.
+ */
 export const BRANDING: Branding = {
-  productName: 'PROVING GROUND',
+  productName: 'CYROID',
   tagline: 'Cyber Range Orchestrator',
+}
+
+interface RemoteBranding {
+  product_name?: string
+  tagline?: string
+  primary_palette?: Record<string, string>
+}
+
+/** "#2563eb" -> "37 99 235", the form Tailwind's <alpha-value> needs.
+ *  Exported for the tests: it is the part with real edge cases. */
+export function rgbTriplet(hex: string): string | null {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim())
+  if (!m) return null
+  const n = parseInt(m[1], 16)
+  return `${(n >> 16) & 255} ${(n >> 8) & 255} ${n & 255}`
+}
+
+/**
+ * Apply what the API returned. Exported for the tests; call `loadBranding()`.
+ *
+ * Every field is optional and every bad value is ignored rather than thrown on:
+ * a malformed colour in someone's configuration should cost them that colour,
+ * not the whole application.
+ */
+export function applyBranding(remote: RemoteBranding): void {
+  if (remote.product_name?.trim()) BRANDING.productName = remote.product_name.trim()
+  if (remote.tagline?.trim()) BRANDING.tagline = remote.tagline.trim()
+
+  // Guarded so this is callable without a DOM — the tests run in vitest's
+  // node environment, and the name/tagline half is worth testing there.
+  if (typeof document === 'undefined') return
+  for (const [shade, hex] of Object.entries(remote.primary_palette ?? {})) {
+    const triplet = rgbTriplet(hex)
+    if (!triplet) continue
+    document.documentElement.style.setProperty(`--color-primary-${shade}`, triplet)
+  }
+}
+
+/**
+ * Fetch the branding before the app renders.
+ *
+ * Called from main.tsx ahead of the first render so the name is right the first
+ * time — the alternative is every screen flashing the engine's name and then
+ * correcting itself, which looks like a bug on the sign-in page.
+ *
+ * Never rejects, and never blocks for long: a deployment whose API is down
+ * should still render, with the defaults above.
+ */
+export async function loadBranding(timeoutMs = 2000): Promise<void> {
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const res = await fetch('/api/v1/branding', { signal: controller.signal })
+    clearTimeout(timer)
+    if (!res.ok) return
+    applyBranding(await res.json())
+  } catch {
+    // Offline, timed out, or serving something that is not JSON. The defaults
+    // are already correct for the engine.
+  }
 }
 
 /** `Console: web-01 - PROVING GROUND`, and the plain product name with no page. */

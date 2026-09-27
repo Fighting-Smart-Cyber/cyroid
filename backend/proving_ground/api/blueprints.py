@@ -1,15 +1,20 @@
 # backend/proving_ground/api/blueprints.py
+import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import Any, List, Mapping, Optional, Tuple
 from uuid import UUID
 from fastapi import APIRouter, HTTPException, status, UploadFile, File, Query
 from fastapi.responses import FileResponse
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from proving_ground.api import kubernetes_ranges
 from proving_ground.api.deps import DBSession, CurrentUser, DownloadUser
+from proving_ground.capability.blueprint import SCHEMA_VERSION_LEGACY, RangeSpec, read_blueprint
 from proving_ground.models import Range, RangeBlueprint, RangeInstance
+from proving_ground.models.range import RangeStatus
 from proving_ground.models.catalog import CatalogInstalledItem
 from proving_ground.schemas.blueprint import (
     BlueprintCreate,
@@ -19,6 +24,13 @@ from proving_ground.schemas.blueprint import (
     InstanceDeploy,
     InstanceResponse,
     BlueprintConfig,
+)
+from proving_ground.schemas.catalog_contribution import (
+    BlueprintCatalogDiff,
+    BlueprintCatalogOrigin,
+    BlueprintContribution,
+    BlueprintContributionRequest,
+    BlueprintFieldChange,
 )
 from proving_ground.schemas.blueprint_export import (
     BlueprintImportValidation,
@@ -35,24 +47,149 @@ from proving_ground.tasks.deployment import deploy_range_task
 
 router = APIRouter(prefix="/blueprints", tags=["blueprints"])
 
+logger = logging.getLogger(__name__)
+
+
+def _read(config: Optional[Mapping[str, Any]]) -> RangeSpec:
+    """Read a config the caller supplied, turning the reader's own refusal into a 422.
+
+    `read_blueprint` is the one authority on what a blueprint config means in either era, and its
+    messages name the workload, the capability and the field. A generic "invalid blueprint" would
+    throw that away, and a config is hand-edited as often as it is generated.
+    """
+    try:
+        return read_blueprint(config)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except TypeError as exc:
+        # The reader coerces the fields it reads -- `int(entry["cpus"])` -- so a config that puts
+        # an object where a number belongs raises TypeError rather than ValueError. It is still a
+        # config somebody wrote, and a bare 500 would blame the server for it.
+        raise HTTPException(
+            status_code=422, detail=f"blueprint config has a field of the wrong type: {exc}"
+        ) from exc
+
+
+def _config_to_store(config: Mapping[str, Any]) -> dict:
+    """Validate an incoming config and return the document to persist.
+
+    A v2 config is stored as written: `BlueprintConfig` describes Era A and nothing else, and
+    forcing a Kubernetes config through it is what replaced an install's workloads and
+    capabilities with empty lists. A v1 config still goes through `BlueprintConfig`, because the
+    Era A deploy path reads it back as that model and depends on its defaults -- but the keys
+    that model does not know are kept rather than dropped, capability packages among them, which
+    `read_blueprint` reads from either era.
+    """
+    spec = _read(config)
+    if spec.deployable_on_kubernetes:
+        return dict(config)
+    try:
+        legacy = BlueprintConfig.model_validate(config)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {**config, **legacy.model_dump()}
+
+
+def _is_kubernetes_config(config: Optional[Mapping[str, Any]]) -> bool:
+    """Whether a stored config describes a Kubernetes range, without ever raising.
+
+    A config too malformed for `read_blueprint` still has an era -- the one it declares -- and on
+    the guard paths below that answer matters more than deployability: a broken v2 blueprint can
+    be repaired, an overwritten one cannot.
+    """
+    config = config or {}
+    try:
+        return read_blueprint(config).deployable_on_kubernetes
+    except ValueError:
+        return config.get("schemaVersion", SCHEMA_VERSION_LEGACY) != SCHEMA_VERSION_LEGACY
+
+
+def _is_kubernetes_range(db: Session, range_id: UUID) -> bool:
+    """Whether this range's machines live on the cluster rather than in Network and VM rows.
+
+    Either the host deploys ranges on Kubernetes, or the range was instantiated from a v2
+    blueprint. `extract_config_from_range` describes neither: it reads Network, VM and VMNetwork
+    rows, so against such a range it returns an empty v1 config rather than failing.
+    """
+    if kubernetes_ranges.is_kubernetes():
+        return True
+    instance = db.query(RangeInstance).filter(RangeInstance.range_id == range_id).first()
+    if instance is None or instance.blueprint is None:
+        return False
+    return _is_kubernetes_config(instance.blueprint.config)
+
+
+def _require_blueprint_control(blueprint: RangeBlueprint, current_user) -> None:
+    """Admin, or the person who created it. A blueprint with no creator needs an admin.
+
+    Three routes used to spell this inline and each spelled it slightly differently: the config
+    branch of PUT checked it, PUT's metadata branch did not, and DELETE had no check at all -- so
+    any authenticated account could rename or delete any blueprint. All three also guarded on
+    `if blueprint.created_by and ...`, which reads as "an unowned blueprint is everyone's":
+    a seeded blueprint has `created_by` NULL, and on a Kubernetes install the seeded one is the
+    only blueprint that can be deployed at all.
+    """
+    # `current_user.is_admin`, not `any(role.name == "admin" for role in current_user.roles)`:
+    # `User.roles` is a list of strings, so the old spelling compared a string's `.name` and
+    # raised -- caught nowhere, because the branch was only reached for a blueprint somebody
+    # else owned. The admin bypass these routes claimed to have has never worked.
+    if current_user.is_admin:
+        return
+    if blueprint.created_by and blueprint.created_by == current_user.id:
+        return
+    raise HTTPException(status_code=403, detail="Not authorized to modify this blueprint")
+
+
+def _schema_version(config: Optional[Mapping[str, Any]]) -> int:
+    """2 for a Kubernetes blueprint, 1 for an Era A one -- what a card labels its count from."""
+    return 2 if _is_kubernetes_config(config or {}) else 1
+
+
+def _counts(config: Optional[Mapping[str, Any]]) -> Tuple[int, int]:
+    """Networks and machines for a blueprint card, whichever era wrote the config.
+
+    A v2 blueprint's machines are its workloads and it has no `vms` key at all, so counting `vms`
+    reports every Kubernetes blueprint as empty.
+    """
+    config = config or {}
+    networks = config.get("networks")
+    machines = config.get("workloads" if _is_kubernetes_config(config) else "vms")
+    return (
+        len(networks) if isinstance(networks, list) else 0,
+        len(machines) if isinstance(machines, list) else 0,
+    )
+
 
 @router.post("", response_model=BlueprintDetailResponse, status_code=status.HTTP_201_CREATED)
 def create_blueprint(data: BlueprintCreate, db: DBSession, current_user: CurrentUser):
-    """Create a new blueprint from an existing range."""
-    # Verify range exists
-    range_obj = db.query(Range).filter(Range.id == data.range_id).first()
-    if not range_obj:
-        raise HTTPException(status_code=404, detail="Range not found")
+    """Create a new blueprint, from an existing range or from a config supplied directly."""
+    if data.config is not None:
+        config = _config_to_store(data.config)
+    else:
+        # Verify range exists
+        range_obj = db.query(Range).filter(Range.id == data.range_id).first()
+        if not range_obj:
+            raise HTTPException(status_code=404, detail="Range not found")
 
-    # Extract config from range
-    config = extract_config_from_range(db, data.range_id)
+        if _is_kubernetes_range(db, data.range_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Saving a range as a blueprint reads its networks and VM rows, which a range "
+                    "on the Kubernetes substrate does not have -- the blueprint would describe an "
+                    "empty range that cannot be deployed. Author it as a v2 config instead."
+                ),
+            )
+
+        # Extract config from range
+        config = extract_config_from_range(db, data.range_id).model_dump()
 
     # Create blueprint
     # Note: base_subnet_prefix and next_offset are deprecated with DinD isolation
     blueprint = RangeBlueprint(
         name=data.name,
         description=data.description,
-        config=config.model_dump(),
+        config=config,
         base_subnet_prefix=data.base_subnet_prefix,  # Optional, kept for backward compatibility
         created_by=current_user.id,
         version=1,
@@ -62,7 +199,7 @@ def create_blueprint(data: BlueprintCreate, db: DBSession, current_user: Current
     db.commit()
     db.refresh(blueprint)
 
-    return _blueprint_to_detail_response(blueprint, config, current_user.username)
+    return _blueprint_to_detail_response(blueprint, blueprint.config, current_user.username)
 
 
 @router.get("", response_model=List[BlueprintResponse])
@@ -79,15 +216,13 @@ def get_blueprint(blueprint_id: UUID, db: DBSession, current_user: CurrentUser):
     if not blueprint:
         raise HTTPException(status_code=404, detail="Blueprint not found")
 
-    config = BlueprintConfig.model_validate(blueprint.config)
-
     # Get creator username
     from proving_ground.models import User
 
     creator = db.query(User).filter(User.id == blueprint.created_by).first()
     username = creator.username if creator else None
 
-    return _blueprint_to_detail_response(blueprint, config, username)
+    return _blueprint_to_detail_response(blueprint, blueprint.config, username)
 
 
 @router.put("/{blueprint_id}", response_model=BlueprintDetailResponse)
@@ -101,13 +236,11 @@ def update_blueprint(
     if not blueprint:
         raise HTTPException(status_code=404, detail="Blueprint not found")
 
-    # Check authorization for config changes - owner or admin
-    if data.config is not None:
-        if blueprint.created_by and blueprint.created_by != current_user.id:
-            if not any(role.name == "admin" for role in current_user.roles):
-                raise HTTPException(
-                    status_code=403, detail="Not authorized to modify this blueprint"
-                )
+    _require_blueprint_control(blueprint, current_user)
+
+    # Read the config before anything is written, so a config the reader refuses is a 422 and
+    # not a saved edit followed by a failed response.
+    new_config = _config_to_store(data.config) if data.config is not None else None
 
     if data.name is not None:
         blueprint.name = data.name
@@ -117,20 +250,18 @@ def update_blueprint(
         blueprint.content_ids = data.content_ids
 
     # Update config and increment version
-    if data.config is not None:
-        blueprint.config = data.config.model_dump()
+    if new_config is not None:
+        blueprint.config = new_config
         blueprint.version += 1
 
     db.commit()
     db.refresh(blueprint)
 
-    config = BlueprintConfig.model_validate(blueprint.config)
-
     # Get creator username for response
     creator = db.query(User).filter(User.id == blueprint.created_by).first()
     username = creator.username if creator else None
 
-    return _blueprint_to_detail_response(blueprint, config, username)
+    return _blueprint_to_detail_response(blueprint, blueprint.config, username)
 
 
 @router.put("/{blueprint_id}/update-from-range/{range_id}", response_model=BlueprintDetailResponse)
@@ -148,11 +279,7 @@ def update_blueprint_from_range(
     if not blueprint:
         raise HTTPException(status_code=404, detail="Blueprint not found")
 
-    # Check authorization - owner or admin
-    if blueprint.created_by and blueprint.created_by != current_user.id:
-        # Check if user is admin (has admin role)
-        if not any(role.name == "admin" for role in current_user.roles):
-            raise HTTPException(status_code=403, detail="Not authorized to modify this blueprint")
+    _require_blueprint_control(blueprint, current_user)
 
     # Verify range is an instance of this blueprint
     instance = (
@@ -166,11 +293,39 @@ def update_blueprint_from_range(
     if not instance:
         raise HTTPException(status_code=404, detail="Range is not an instance of this blueprint")
 
+    # `extract_config_from_range` builds its answer out of Network, VM and VMNetwork rows, which
+    # is an Era A range and nothing else. Run against a Kubernetes range it returns an empty v1
+    # config -- and writing that back replaces the blueprint's workloads and capability packages
+    # with empty lists, bumps the version and reports success. One click, and the only blueprint
+    # a Kubernetes install has describes nothing.
+    if _is_kubernetes_config(blueprint.config):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This blueprint describes a Kubernetes range (schema v2), and updating a "
+                "blueprint from a range reads networks and VM rows that such a range does not "
+                "have. It would replace the blueprint's workloads and capabilities with nothing. "
+                "Edit the blueprint's config instead."
+            ),
+        )
+    if _is_kubernetes_range(db, range_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This range is deployed on the Kubernetes substrate, whose networks and machines "
+                "live on the cluster rather than in this platform's rows. There is nothing here "
+                "to extract, so the blueprint would be emptied rather than updated."
+            ),
+        )
+
     # Extract new config from range
     new_config = extract_config_from_range(db, range_id)
 
-    # Update blueprint
-    blueprint.config = new_config.model_dump()
+    # Merged over the stored document rather than written in its place. Extraction answers out of
+    # Network and VM rows, and a capability package has none of those -- it is declared in the
+    # config and read from a v1 blueprint too. Replacing the document outright dropped every
+    # capability the blueprint declared, silently, with the version bumped and a green toast.
+    blueprint.config = {**(blueprint.config or {}), **new_config.model_dump()}
     blueprint.version += 1
 
     db.commit()
@@ -180,7 +335,7 @@ def update_blueprint_from_range(
     creator = db.query(User).filter(User.id == blueprint.created_by).first()
     username = creator.username if creator else None
 
-    return _blueprint_to_detail_response(blueprint, new_config, username)
+    return _blueprint_to_detail_response(blueprint, blueprint.config, username)
 
 
 @router.delete("/{blueprint_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -191,6 +346,8 @@ def delete_blueprint(blueprint_id: UUID, db: DBSession, current_user: CurrentUse
     blueprint = db.query(RangeBlueprint).filter(RangeBlueprint.id == blueprint_id).first()
     if not blueprint:
         raise HTTPException(status_code=404, detail="Blueprint not found")
+
+    _require_blueprint_control(blueprint, current_user)
 
     # Check for instances
     instance_count = (
@@ -237,25 +394,38 @@ def deploy_instance(
     if not blueprint:
         raise HTTPException(status_code=404, detail="Blueprint not found")
 
-    config = BlueprintConfig.model_validate(blueprint.config)
-
-    # Include linked content from blueprint model (saved separately from config JSON)
-    if blueprint.content_ids:
-        config.content_ids = blueprint.content_ids
-
     # Get next offset and increment
     offset = blueprint.next_offset
     blueprint.next_offset += 1
 
-    # Create range from blueprint with offset
-    range_obj = create_range_from_blueprint(
-        db=db,
-        config=config,
-        range_name=data.name,
-        base_prefix=blueprint.base_subnet_prefix,
-        offset=offset,
-        created_by=current_user.id,
-    )
+    if _read(blueprint.config).deployable_on_kubernetes:
+        # An Era B blueprint (PG-122): networks and workloads are realised on the cluster from
+        # the config at deploy time, not stored as Network and VM rows. The range row is the
+        # instance's handle and nothing more.
+        range_obj = Range(
+            name=data.name,
+            description=f"Instance of blueprint '{blueprint.name}' (Kubernetes substrate)",
+            created_by=current_user.id,
+            status=RangeStatus.DRAFT,
+        )
+        db.add(range_obj)
+        db.flush()
+    else:
+        config = BlueprintConfig.model_validate(blueprint.config)
+
+        # Include linked content from blueprint model (saved separately from config JSON)
+        if blueprint.content_ids:
+            config.content_ids = blueprint.content_ids
+
+        # Create range from blueprint with offset
+        range_obj = create_range_from_blueprint(
+            db=db,
+            config=config,
+            range_name=data.name,
+            base_prefix=blueprint.base_subnet_prefix,
+            offset=offset,
+            created_by=current_user.id,
+        )
 
     # Create instance record
     instance = RangeInstance(
@@ -267,6 +437,25 @@ def deploy_instance(
         range_id=range_obj.id,
     )
     db.add(instance)
+
+    # Flushed, not committed, so the refusal below can undo the whole thing. `validate_for_deploy`
+    # reads the instance back through this session to find the blueprint, and a flushed row is
+    # visible to a query in the same transaction -- but an uncommitted one leaves nothing behind
+    # if the deploy is refused. Committing first and then refusing is how a 400 used to strand a
+    # range and an instance the user never got.
+    db.flush()
+
+    if data.auto_deploy and kubernetes_ranges.is_kubernetes():
+        # The same check `POST /ranges/{id}/deploy` already makes, made here too. This endpoint
+        # answered 201 the moment the task was enqueued and then let the worker discover the
+        # refusal, which reached the user as a range stuck on "deploying" and an explanation in
+        # an event log nobody is looking at.
+        try:
+            kubernetes_ranges.validate_for_deploy(db, range_obj.id)
+        except HTTPException:
+            db.rollback()
+            raise
+
     db.commit()
     db.refresh(instance)
 
@@ -292,6 +481,45 @@ def list_instances(blueprint_id: UUID, db: DBSession, current_user: CurrentUser)
 # ============ Export/Import Endpoints ============
 
 
+def _blueprint_for_export(blueprint_id: UUID, db: Session) -> RangeBlueprint:
+    """The blueprint, or a 404 that means what it says.
+
+    Both export routes turned every `ValueError` the export service could raise into "not found",
+    so a blueprint that was sitting in front of the user reported itself missing and sent them
+    hunting for it. Asking the question here leaves 404 meaning only a genuine miss.
+    """
+    blueprint = db.query(RangeBlueprint).filter(RangeBlueprint.id == blueprint_id).first()
+    if not blueprint:
+        raise HTTPException(status_code=404, detail="Blueprint not found")
+    return blueprint
+
+
+def _export_refusal(blueprint: RangeBlueprint, exc: Exception, *, action: str) -> HTTPException:
+    """Refuse without quoting the blueprint's own config back to the caller.
+
+    Pydantic renders each validation error with a repr of the input value, and the input value
+    here is the stored document -- hook commands, chart values, whatever the author put in it.
+    `ValidationError` is a subclass of `ValueError`, so the handler that interpolated `str(e)`
+    into the response body shipped a fragment of that document to anyone who could reach the
+    endpoint. The detail belongs in the log, where an operator can read it; the caller gets the
+    part they can act on, which is which blueprint and what kind of failure it was.
+    """
+    logger.warning("blueprint %s could not be %s", blueprint.id, action, exc_info=exc)
+    if isinstance(exc, ValidationError):
+        return HTTPException(
+            status_code=409,
+            detail=(
+                f"This blueprint's stored configuration (schema v"
+                f"{_schema_version(blueprint.config)}) could not be read, so it cannot be "
+                f"{action}. The validation detail is in the platform's log."
+            ),
+        )
+    return HTTPException(
+        status_code=500,
+        detail=f"This blueprint could not be {action}. The reason is in the platform's log.",
+    )
+
+
 @router.get("/{blueprint_id}/export-size")
 def get_export_size(
     blueprint_id: UUID,
@@ -308,18 +536,18 @@ def get_export_size(
     Useful for showing users expected download size before exporting.
     """
     export_service = get_blueprint_export_service()
+    blueprint = _blueprint_for_export(blueprint_id, db)
 
     try:
-        result = export_service.estimate_export_size(
+        return export_service.estimate_export_size(
             blueprint_id=blueprint_id,
             db=db,
             include_docker_images=include_docker_images,
         )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to estimate size: {str(e)}") from e
+        raise _export_refusal(blueprint, e, action="measured") from e
 
 
 @router.get("/{blueprint_id}/export")
@@ -367,6 +595,7 @@ def export_blueprint(
     - content_id: Specific Content ID to include
     """
     export_service = get_blueprint_export_service()
+    blueprint = _blueprint_for_export(blueprint_id, db)
 
     try:
         options = BlueprintExportOptions(
@@ -401,10 +630,13 @@ def export_blueprint(
             media_type="application/zip",
             background=None,  # Don't delete file immediately
         )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    except HTTPException:
+        # The bad-content_id 400 above is raised inside this try. Without this branch the
+        # catch-all below swallowed it and answered 500, blaming the server for the caller's
+        # query string.
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}") from e
+        raise _export_refusal(blueprint, e, action="exported") from e
 
 
 # ============ Async Export Endpoints ============
@@ -776,8 +1008,141 @@ def cancel_import(job_id: str, current_user: CurrentUser):
 # ============ Helper Functions ============
 
 
+def _catalog_origin(blueprint_id: UUID, db: Session):
+    """Resolve the catalog item a blueprint came from, or explain why it has none."""
+    from proving_ground.services.catalog_service import CatalogService
+
+    blueprint = db.query(RangeBlueprint).filter(RangeBlueprint.id == blueprint_id).first()
+    if not blueprint:
+        raise HTTPException(status_code=404, detail="Blueprint not found")
+
+    try:
+        origin = CatalogService(db).resolve_blueprint_origin(blueprint_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if not origin:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "This blueprint was not installed from a catalog, or its catalog "
+                "source is no longer available, so there is nothing to contribute back to."
+            ),
+        )
+    return blueprint, origin
+
+
+def _origin_response(origin) -> BlueprintCatalogOrigin:
+    return BlueprintCatalogOrigin(
+        source_id=origin.source_id,
+        source_name=origin.source_name,
+        source_url=origin.source_url,
+        source_branch=origin.source_branch,
+        item_id=origin.item_id,
+        item_name=origin.item_name,
+        installed_version=origin.installed_version,
+        item_path=origin.item_path,
+    )
+
+
+@router.get("/{blueprint_id}/catalog-diff", response_model=BlueprintCatalogDiff)
+def get_blueprint_catalog_diff(blueprint_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Show which fields differ from the catalog version this blueprint came from."""
+    from proving_ground.catalog.contribution import diff_blueprint_against_catalog
+
+    blueprint, origin = _catalog_origin(blueprint_id, db)
+    diff = diff_blueprint_against_catalog(
+        origin.document,
+        blueprint.config or {},
+        name=blueprint.name,
+        description=blueprint.description,
+    )
+    return BlueprintCatalogDiff(
+        origin=_origin_response(origin),
+        changes=[
+            BlueprintFieldChange(
+                key=c.key,
+                path=list(c.path),
+                kind=c.kind,
+                label=c.label,
+                before=c.before,
+                after=c.after,
+            )
+            for c in diff.changes
+        ],
+        notes=diff.notes,
+        has_changes=bool(diff),
+    )
+
+
+@router.post("/{blueprint_id}/catalog-contribution", response_model=BlueprintContribution)
+def build_blueprint_catalog_contribution(
+    blueprint_id: UUID,
+    data: BlueprintContributionRequest,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """Render selected local changes as a patch against the catalog's blueprint.yaml.
+
+    Nothing is sent anywhere: the patch and the updated file come back to the
+    caller, who applies them to a catalog clone and opens the pull request.
+    """
+    from proving_ground.catalog.contribution import (
+        build_patch,
+        diff_blueprint_against_catalog,
+    )
+
+    blueprint, origin = _catalog_origin(blueprint_id, db)
+    diff = diff_blueprint_against_catalog(
+        origin.document,
+        blueprint.config or {},
+        name=blueprint.name,
+        description=blueprint.description,
+    )
+
+    if data.changes is not None:
+        known = {c.key for c in diff.changes}
+        unknown = sorted(set(data.changes) - known)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No such change(s): {', '.join(unknown)}. The blueprint may have "
+                    "changed since the diff was loaded; reload it and try again."
+                ),
+            )
+
+    selected = diff.select(data.changes)
+    if not selected:
+        raise HTTPException(
+            status_code=400,
+            detail="No changes selected, so there is nothing to contribute.",
+        )
+
+    try:
+        result = build_patch(
+            origin.document,
+            selected,
+            item_path=origin.item_path,
+            original_text=origin.text,
+            notes=diff.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return BlueprintContribution(
+        origin=_origin_response(origin),
+        patch=result.patch,
+        blueprint_yaml=result.blueprint_yaml,
+        applied=[c.key for c in result.applied],
+        notes=result.notes,
+        applies_to_source=result.applies_to_source,
+        suggested_filename=f"{origin.item_id}-contribution.patch",
+    )
+
+
 def _blueprint_to_response(blueprint: RangeBlueprint, db: Session) -> BlueprintResponse:
-    config = blueprint.config
+    network_count, machine_count = _counts(blueprint.config)
     return BlueprintResponse(
         id=blueprint.id,
         name=blueprint.name,
@@ -789,16 +1154,19 @@ def _blueprint_to_response(blueprint: RangeBlueprint, db: Session) -> BlueprintR
         created_by=blueprint.created_by,
         created_at=blueprint.created_at,
         updated_at=blueprint.updated_at,
-        network_count=len(config.get("networks", [])),
-        vm_count=len(config.get("vms", [])),
+        network_count=network_count,
+        vm_count=machine_count,
+        schema_version=_schema_version(blueprint.config),
         instance_count=len(blueprint.instances),
         is_seed=blueprint.is_seed if hasattr(blueprint, "is_seed") else False,
     )
 
 
 def _blueprint_to_detail_response(
-    blueprint: RangeBlueprint, config: BlueprintConfig, username: str = None
+    blueprint: RangeBlueprint, config: Optional[Mapping[str, Any]], username: str = None
 ) -> BlueprintDetailResponse:
+    config = dict(config or {})
+    network_count, machine_count = _counts(config)
     return BlueprintDetailResponse(
         id=blueprint.id,
         name=blueprint.name,
@@ -810,8 +1178,9 @@ def _blueprint_to_detail_response(
         created_by=blueprint.created_by,
         created_at=blueprint.created_at,
         updated_at=blueprint.updated_at,
-        network_count=len(config.networks),
-        vm_count=len(config.vms),
+        network_count=network_count,
+        vm_count=machine_count,
+        schema_version=_schema_version(config),
         instance_count=len(blueprint.instances) if hasattr(blueprint, "instances") else 0,
         config=config,
         created_by_username=(

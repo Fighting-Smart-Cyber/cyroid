@@ -1,0 +1,13 @@
+apiVersion: v2
+name: proving-ground
+description: >-
+  PROVING GROUND's control plane as an application on a conformant Kubernetes cluster (ADR-0012):
+  API, workers, frontend, and -- on the k3s profile only -- the Postgres, Redis and MinIO the
+  environment would otherwise supply. Ranges are not in this chart; the control plane creates them.
+type: application
+# The chart version tracks the engine: `helm upgrade` at a VERSION is the update path on this
+# profile, and a chart whose version drifted from the images it deploys would say one thing and run
+# another. scripts/install-k8s.sh passes both from the VERSION file.
+version: 0.0.0
+appVersion: "0.0.0"
+kubeVersion: ">=1.29.0-0"

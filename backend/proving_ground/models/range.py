@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Optional, List
 from uuid import UUID
-from sqlalchemy import String, Text, ForeignKey, DateTime, JSON
+from sqlalchemy import String, Text, ForeignKey, DateTime, JSON, Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from proving_ground.models.base import Base, TimestampMixin, UUIDMixin
@@ -26,10 +26,68 @@ class RangeStatus(str, Enum):
     ERROR = "error"
 
 
+class RangeVisibility(str, Enum):
+    """Who may see a range.
+
+    Before this existed, visibility was inferred: a range with no tags was
+    treated as public, so every range anyone created was visible to every
+    non-student account. That was a default nobody chose, not a decision.
+
+    PRIVATE is the default now. Sharing is something you do, not something
+    that happens because you did not do anything.
+    """
+
+    PRIVATE = "private"  # owner and admins only
+    SHARED = "shared"  # plus named users and matching tags
+    PUBLIC = "public"  # any authenticated user
+
+
+class RangeShare(Base, UUIDMixin, TimestampMixin):
+    """One person granted sight of one range.
+
+    Named users and tags are both grant paths for a SHARED range: a person is
+    for "let Jon see this", a tag is for a cohort. Neither implies control --
+    sharing shows a range, it does not hand over the power to tear it down.
+    """
+
+    __tablename__ = "range_shares"
+
+    range_id: Mapped[UUID] = mapped_column(ForeignKey("ranges.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # Who granted it, kept for the audit question "why can this person see it".
+    granted_by: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        return f"<RangeShare range={self.range_id} user={self.user_id}>"
+
+
 class Range(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "ranges"
 
     name: Mapped[str] = mapped_column(String(100), index=True)
+    # Stored as the enum VALUE ("private"), not its NAME ("PRIVATE").
+    #
+    # SQLAlchemy infers an Enum type from Mapped[RangeVisibility] and persists
+    # member NAMES by default. The migration that added this column declared it
+    # String(20) with server_default="private" -- the value -- so the two
+    # disagreed: rows the ORM wrote read back fine, rows the server_default
+    # wrote raised LookupError on hydration and took the whole range list with
+    # them. values_callable settles it on the value, which is also what the API
+    # puts on the wire and what the frontend's RangeVisibility union expects.
+    visibility: Mapped[RangeVisibility] = mapped_column(
+        SAEnum(
+            RangeVisibility,
+            native_enum=False,
+            create_constraint=False,
+            length=20,
+            values_callable=lambda enum_cls: [m.value for m in enum_cls],
+        ),
+        default=RangeVisibility.PRIVATE,
+        server_default="private",
+        nullable=False,
+    )
     description: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[RangeStatus] = mapped_column(default=RangeStatus.DRAFT)
 

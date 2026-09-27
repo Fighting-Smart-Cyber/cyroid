@@ -17,10 +17,23 @@ from typing import Dict, List, Optional
 from uuid import UUID
 
 import yaml
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from .registry_service import get_registry_service, RegistryPushError
 
+from proving_ground.capability.blueprint import (
+    SCHEMA_VERSION_K8S,
+    SCHEMA_VERSION_LEGACY,
+    read_blueprint,
+)
+from proving_ground.catalog.dependencies import (
+    ERA_A_ON_KUBERNETES,
+    ERA_B_ON_DOCKER,
+    SUBSTRATE_DOCKER,
+    SUBSTRATE_KUBERNETES,
+)
+from proving_ground.catalog.origin import CatalogOrigin
 from proving_ground.config import get_settings
 from proving_ground.models.base_image import BaseImage, ImageType
 from proving_ground.models.blueprint import RangeBlueprint
@@ -32,7 +45,12 @@ from proving_ground.models.catalog import (
     CatalogSyncStatus,
 )
 from proving_ground.models.content import Content, ContentType
-from proving_ground.schemas.catalog import CatalogItemDetail, CatalogItemSummary
+from proving_ground.schemas.catalog import (
+    CatalogItemDetail,
+    CatalogItemSummary,
+    validate_source_branch,
+    validate_source_url,
+)
 from proving_ground.services.walkthrough_parser import parse_markdown_to_walkthrough
 
 logger = logging.getLogger(__name__)
@@ -41,8 +59,123 @@ logger = logging.getLogger(__name__)
 IMAGES_DIR = "/data/images"
 
 
-def build_config_from_yaml(blueprint_data: dict) -> dict:
-    """Build the config JSON from blueprint YAML structure."""
+def resolve_declared_path(
+    root: Path,
+    declared: str,
+    *,
+    what: str,
+    root_label: str = "the catalog root",
+) -> Path:
+    """Resolve a path a catalog declared against ``root``, refusing any escape.
+
+    index.json is fetched from a remote repository, so every path it names is
+    attacker-controlled: a '../..' segment would otherwise let a browse read a
+    file from anywhere the API can reach, and an install copy an arbitrary
+    directory tree into /data. Symlinks are resolved before the containment
+    check, because a symlink committed into the catalog escapes without a '..'
+    appearing in the index at all. The same helper guards the directories an
+    install writes into, where the declared segment is an item id.
+
+    Raises:
+        ValueError: if the resolved path lies outside ``root``.
+    """
+    text = str(declared or "").strip()
+    if "\x00" in text:
+        raise ValueError(f"{what} contains a null byte: {declared!r}")
+
+    resolved_root = root.resolve()
+    candidate = (resolved_root / text).resolve()
+    if not candidate.is_relative_to(resolved_root):
+        raise ValueError(f"{what} resolves outside {root_label}: {declared!r}")
+    return candidate
+
+
+def declared_schema_version(document: Optional[dict]) -> object:
+    """The ``schemaVersion`` a blueprint document declares; absence means v1.
+
+    Returned exactly as declared rather than coerced to an int. A version this engine does not
+    understand is refused by ``read_blueprint``, which says so in a sentence; a silent fallback to
+    1 here would install a newer blueprint as an Era A one and drop everything it declared.
+    """
+    if not isinstance(document, dict):
+        return SCHEMA_VERSION_LEGACY
+    return document.get("schemaVersion", SCHEMA_VERSION_LEGACY)
+
+
+def catalog_item_schema_version(document: Optional[dict]) -> Optional[int]:
+    """The version to report to the browser, or None when the document does not say.
+
+    None is not the same answer as 1, which is why it is not folded into one. A blueprint that
+    declares no ``schemaVersion`` is Era A by definition, but an *index entry* that does not carry
+    the field may simply be from a catalog written before the field existed -- and the storefront
+    words those two cases differently. A declared value that is not an integer is reported as
+    unknown rather than guessed at; the install itself refuses it by name.
+    """
+    if not isinstance(document, dict) or "schemaVersion" not in document:
+        return None
+    declared = document["schemaVersion"]
+    if isinstance(declared, bool) or not isinstance(declared, int):
+        return None
+    return declared
+
+
+def build_config_from_yaml(blueprint_data: dict, *, item_name: str = "") -> dict:
+    """Build the config JSON a RangeBlueprint stores, from a catalog blueprint document.
+
+    One catalog serves both substrates, so this has to produce both shapes. An Era A document is
+    converted field by field, because the catalog YAML and the stored config genuinely disagree
+    about shape (``template_name`` versus ``base_image_tag``, events versus MSEL). An Era B
+    document is already the shape ``capability.blueprint.read_blueprint`` reads, so converting it
+    could only lose something -- which is exactly what used to happen: the result was assembled
+    from a fixed set of Era A keys, and a v2 item's workloads and capabilities were dropped on the
+    way in and never missed until the range refused to deploy.
+
+    Raises:
+        ValueError: if the document is not a blueprint this engine can read, named so that a
+            catalog item is refused rather than stored half-read.
+    """
+    where = f"catalog item '{item_name}'" if item_name else "this catalog blueprint"
+    # blueprint.yaml is remote content and may be any YAML document at all. A list or a bare
+    # string reaches .get() below and raises AttributeError, which the install route turns into a
+    # 500 rather than a refusal naming the item.
+    if not isinstance(blueprint_data, dict):
+        raise ValueError(f"{where} has a blueprint.yaml that is not a mapping")
+
+    version = declared_schema_version(blueprint_data)
+    if version == SCHEMA_VERSION_LEGACY:
+        config = _legacy_config_from_yaml(blueprint_data)
+    else:
+        config = _kubernetes_config_from_yaml(blueprint_data, version)
+
+    # Capabilities are era-neutral -- a capability package does not care which substrate runs it,
+    # and read_blueprint reads them from a v1 config for that reason -- so they are carried
+    # through whichever era wrote the document.
+    if blueprint_data.get("capabilities") is not None:
+        config["capabilities"] = blueprint_data["capabilities"]
+
+    try:
+        read_blueprint(config)
+    except ValueError as exc:
+        raise ValueError(f"{where} is not a blueprint this install can read: {exc}") from exc
+    return config
+
+
+def _kubernetes_config_from_yaml(blueprint_data: dict, version: object) -> dict:
+    """Carry an Era B document through intact.
+
+    Copied rather than translated, and the declared version is copied too rather than replaced
+    with ``SCHEMA_VERSION_K8S``: a document declaring a version this engine does not know must
+    reach ``read_blueprint`` still saying so, or it would be refused for the wrong reason.
+    """
+    config: dict = {"schemaVersion": version}
+    for key in ("networks", "workloads", "content_ids"):
+        if blueprint_data.get(key) is not None:
+            config[key] = blueprint_data[key]
+    return config
+
+
+def _legacy_config_from_yaml(blueprint_data: dict) -> dict:
+    """Build the Era A config: networks, VMs, a router and an MSEL."""
     config = {"networks": [], "vms": [], "router": blueprint_data.get("router"), "msel": None}
 
     # Convert networks
@@ -194,7 +327,17 @@ class CatalogService:
 
         Args:
             source: The git catalog source.
+
+        Raises:
+            ValueError: if the stored url or branch could be read by git as an
+                option or names a transport that runs a command.
         """
+        # Re-validated here rather than trusted from the schema: a row can reach
+        # this point from an older release, from a restored database, or from a
+        # caller that never went through CatalogSourceCreate.
+        url = validate_source_url(source.url, CatalogSourceType.GIT)
+        branch = validate_source_branch(source.branch)
+
         source_dir = self.get_source_dir(source)
         git_dir = source_dir / ".git"
 
@@ -217,9 +360,11 @@ class CatalogService:
             source_dir.mkdir(parents=True, exist_ok=True)
 
             cmd = ["git", "clone", "--depth", "1"]
-            if source.branch:
-                cmd.extend(["--branch", source.branch])
-            cmd.extend([source.url, str(source_dir)])
+            if branch:
+                cmd.extend(["--branch", branch])
+            # '--' so that whatever the url turns out to be, git reads it as a
+            # remote and not as an option.
+            cmd.extend(["--", url, str(source_dir)])
 
             result = subprocess.run(
                 cmd,
@@ -245,11 +390,13 @@ class CatalogService:
         """
         import httpx
 
+        validated = validate_source_url(source.url, CatalogSourceType.HTTP)
+
         source_dir = self.get_source_dir(source)
         source_dir.mkdir(parents=True, exist_ok=True)
 
         # Ensure URL points to index.json
-        url = source.url.rstrip("/")
+        url = validated.rstrip("/")
         if not url.endswith("index.json"):
             url = f"{url}/index.json"
 
@@ -271,8 +418,9 @@ class CatalogService:
 
         Raises:
             FileNotFoundError: If the path or index.json doesn't exist.
+            ValueError: If the stored url is not usable as a filesystem path.
         """
-        local_path = Path(source.url)
+        local_path = Path(validate_source_url(source.url, CatalogSourceType.LOCAL))
         if not local_path.exists():
             raise FileNotFoundError(f"Local catalog path does not exist: {source.url}")
         if not (local_path / "index.json").exists():
@@ -309,6 +457,40 @@ class CatalogService:
         if source.source_type == CatalogSourceType.LOCAL:
             return Path(source.url)
         return self.get_source_dir(source)
+
+    def _file_in(self, item_dir: Path, name: str) -> Path:
+        """Resolve one of the well-known filenames inside a catalog item directory.
+
+        The filename is ours; the file it lands on is the catalog's. A symlink
+        committed as blueprint.yaml, msel.md or README.md would otherwise be
+        read from wherever it points, which is how a repository nobody trusts
+        reads /etc back to the browser.
+
+        Raises:
+            ValueError: if the name resolves outside ``item_dir``.
+        """
+        return resolve_declared_path(
+            item_dir,
+            name,
+            what=f"the catalog's {name}",
+            root_label="its catalog item directory",
+        )
+
+    def _file_in_project(self, project_dir: Path, name: str) -> Path:
+        """Resolve a metadata filename inside an installed image project.
+
+        The project was copied out of a catalog with its symlinks intact, so the
+        same rule applies as inside the catalog itself.
+
+        Raises:
+            ValueError: if the name resolves outside ``project_dir``.
+        """
+        return resolve_declared_path(
+            project_dir,
+            name,
+            what=f"the image project's {name}",
+            root_label="the image project directory",
+        )
 
     def _load_index(self, source: CatalogSource) -> dict:
         """Load and parse the index.json for a catalog source.
@@ -388,41 +570,65 @@ class CatalogService:
             item_id = item_data.get("id", "")
             installed = installed_lookup.get(item_id)
 
-            # Normalize arch (catalog may provide string, list, or null)
-            raw_arch = item_data.get("arch")
-            if isinstance(raw_arch, list):
-                arch = ", ".join(raw_arch)
-            else:
-                arch = raw_arch
-
-            # Filter out empty-string tags from catalog data
-            cleaned_tags = [t for t in item_data.get("tags", []) if t]
-
-            summary = CatalogItemSummary(
-                id=item_id,
-                type=CatalogItemType(item_data.get("type", "blueprint")),
-                name=item_data.get("name", ""),
-                description=item_data.get("description", ""),
-                tags=cleaned_tags,
-                version=item_data.get("version", "1.0"),
-                path=item_data.get("path", ""),
-                checksum=item_data.get("checksum", ""),
-                requires_images=item_data.get("requires_images", []),
-                requires_base_images=item_data.get("requires_base_images", []),
-                includes_msel=item_data.get("includes_msel", False),
-                includes_content=item_data.get("includes_content", False),
-                arch=arch,
-                docker_tag=item_data.get("docker_tag"),
-                installed=installed is not None,
-                installed_version=installed.installed_version if installed else None,
-                update_available=(
-                    installed is not None
-                    and installed.installed_version != item_data.get("version", "1.0")
-                ),
-            )
+            try:
+                summary = self._summarise(item_data, item_id, installed)
+            except (ValidationError, ValueError) as exc:
+                # An entry the catalog declared unusably -- an id that is a path,
+                # a path leaving the catalog, an unknown type -- is omitted
+                # rather than served. Browsing must still render the rest of the
+                # catalog: one bad entry may not blank the page.
+                logger.warning(
+                    f"Skipping catalog item '{item_id}' from source '{source.name}': {exc}"
+                )
+                continue
             results.append(summary)
 
         return results
+
+    def _summarise(
+        self,
+        item_data: dict,
+        item_id: str,
+        installed: Optional[CatalogInstalledItem],
+    ) -> CatalogItemSummary:
+        """Build one browse row from an index entry, applying the schema's checks."""
+        # Normalize arch (catalog may provide string, list, or null)
+        raw_arch = item_data.get("arch")
+        if isinstance(raw_arch, list):
+            arch = ", ".join(raw_arch)
+        else:
+            arch = raw_arch
+
+        # Filter out empty-string tags from catalog data
+        cleaned_tags = [t for t in item_data.get("tags", []) if t]
+
+        # From the index only. The storefront marks an item written for the other substrate before
+        # anyone installs it, and the index is where a listing can learn that without opening one
+        # file per row. `CatalogItemDetail` re-reads the blueprint document, which is the
+        # authoritative answer, for the page carrying the Install button.
+        return CatalogItemSummary(
+            id=item_id,
+            schema_version=catalog_item_schema_version(item_data),
+            type=CatalogItemType(item_data.get("type", "blueprint")),
+            name=item_data.get("name", ""),
+            description=item_data.get("description", ""),
+            tags=cleaned_tags,
+            version=item_data.get("version", "1.0"),
+            path=item_data.get("path", ""),
+            checksum=item_data.get("checksum", ""),
+            requires_images=item_data.get("requires_images", []),
+            requires_base_images=item_data.get("requires_base_images", []),
+            includes_msel=item_data.get("includes_msel", False),
+            includes_content=item_data.get("includes_content", False),
+            arch=arch,
+            docker_tag=item_data.get("docker_tag"),
+            installed=installed is not None,
+            installed_version=installed.installed_version if installed else None,
+            update_available=(
+                installed is not None
+                and installed.installed_version != item_data.get("version", "1.0")
+            ),
+        )
 
     def get_item_detail(
         self,
@@ -436,7 +642,10 @@ class CatalogService:
             item_id: The unique item identifier within the catalog.
 
         Returns:
-            CatalogItemDetail with readme content and install status, or None if not found.
+            CatalogItemDetail with readme content and install status, or None if
+            the item is not in the index, or is declared in a way that puts it
+            outside the catalog -- an unusable item is treated as absent, which
+            is what browsing already shows and what install then refuses.
         """
         index = self._load_index(source)
         items = index.get("items", [])
@@ -460,47 +669,110 @@ class CatalogService:
             .first()
         )
 
-        # Try to load README
-        readme_content = None
-        item_path = item_data.get("path", "")
-        if item_path:
-            catalog_root = self._get_catalog_root(source)
-            readme_path = catalog_root / item_path
-            # If path points to a directory, look for README.md inside it
-            if readme_path.is_dir():
-                readme_file = readme_path / "README.md"
-                if readme_file.exists():
-                    try:
-                        readme_content = readme_file.read_text(encoding="utf-8")
-                    except (IOError, UnicodeDecodeError) as e:
-                        logger.warning(f"Could not read README for {item_id}: {e}")
-            # If path points to a file (e.g., scenario YAML), no README
-
-        detail = CatalogItemDetail(
-            id=item_data.get("id", ""),
-            type=CatalogItemType(item_data.get("type", "blueprint")),
-            name=item_data.get("name", ""),
-            description=item_data.get("description", ""),
-            tags=item_data.get("tags", []),
-            version=item_data.get("version", "1.0"),
-            path=item_data.get("path", ""),
-            checksum=item_data.get("checksum", ""),
-            requires_images=item_data.get("requires_images", []),
-            requires_base_images=item_data.get("requires_base_images", []),
-            includes_msel=item_data.get("includes_msel", False),
-            includes_content=item_data.get("includes_content", False),
-            arch=item_data.get("arch"),
-            docker_tag=item_data.get("docker_tag"),
-            installed=installed is not None,
-            installed_version=installed.installed_version if installed else None,
-            update_available=(
-                installed is not None
-                and installed.installed_version != item_data.get("version", "1.0")
-            ),
-            readme=readme_content,
-            source_id=source.id,
-        )
+        try:
+            readme_content = self._read_item_readme(source, item_id, item_data)
+            detail = CatalogItemDetail(
+                id=item_data.get("id", ""),
+                schema_version=self._item_schema_version(source, item_id, item_data),
+                type=CatalogItemType(item_data.get("type", "blueprint")),
+                name=item_data.get("name", ""),
+                description=item_data.get("description", ""),
+                tags=item_data.get("tags", []),
+                version=item_data.get("version", "1.0"),
+                path=item_data.get("path", ""),
+                checksum=item_data.get("checksum", ""),
+                requires_images=item_data.get("requires_images", []),
+                requires_base_images=item_data.get("requires_base_images", []),
+                includes_msel=item_data.get("includes_msel", False),
+                includes_content=item_data.get("includes_content", False),
+                arch=item_data.get("arch"),
+                docker_tag=item_data.get("docker_tag"),
+                installed=installed is not None,
+                installed_version=installed.installed_version if installed else None,
+                update_available=(
+                    installed is not None
+                    and installed.installed_version != item_data.get("version", "1.0")
+                ),
+                readme=readme_content,
+                source_id=source.id,
+            )
+        except (ValidationError, ValueError) as exc:
+            logger.warning(f"Ignoring catalog item '{item_id}' from source '{source.name}': {exc}")
+            return None
         return detail
+
+    def _item_schema_version(
+        self,
+        source: CatalogSource,
+        item_id: str,
+        item_data: dict,
+    ) -> Optional[int]:
+        """The era of one item, preferring the blueprint document over the index entry.
+
+        The index is a summary a catalog maintainer writes by hand and can forget to update; the
+        document is what the installer will actually read, and what the install refusal will be
+        decided from. A document present and silent is a definite answer -- a blueprint with no
+        ``schemaVersion`` is Era A by definition -- so it reports 1 rather than "not stated".
+
+        A document that cannot be read falls back to the index rather than raising: an item whose
+        blueprint.yaml is missing or unparseable still has a detail page to render, and the
+        install is where it is refused by name.
+        """
+        declared = catalog_item_schema_version(item_data)
+        if item_data.get("type") != CatalogItemType.BLUEPRINT.value:
+            return declared
+        try:
+            item_root = resolve_declared_path(
+                self._get_catalog_root(source),
+                item_data.get("path", ""),
+                what=f"catalog item '{item_id}' path",
+            )
+            if not item_root.is_dir():
+                return declared
+            yaml_path = self._file_in(item_root, "blueprint.yaml")
+            if not yaml_path.exists():
+                return declared
+            document = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+            logger.warning(f"Could not read the schema version for '{item_id}': {exc}")
+            return declared
+        if not isinstance(document, dict):
+            return declared
+        version = catalog_item_schema_version(document)
+        return SCHEMA_VERSION_LEGACY if version is None else version
+
+    def _read_item_readme(
+        self,
+        source: CatalogSource,
+        item_id: str,
+        item_data: dict,
+    ) -> Optional[str]:
+        """Read an item's README, from inside the catalog only.
+
+        Raises:
+            ValueError: if the item's declared path leaves the catalog root.
+        """
+        item_path = item_data.get("path", "")
+        if not item_path:
+            return None
+
+        readme_path = resolve_declared_path(
+            self._get_catalog_root(source),
+            item_path,
+            what=f"catalog item '{item_id}' path",
+        )
+        # If path points to a file (e.g., scenario YAML), there is no README.
+        if not readme_path.is_dir():
+            return None
+
+        readme_file = self._file_in(readme_path, "README.md")
+        if not readme_file.exists():
+            return None
+        try:
+            return readme_file.read_text(encoding="utf-8")
+        except (IOError, UnicodeDecodeError) as e:
+            logger.warning(f"Could not read README for {item_id}: {e}")
+            return None
 
     # =========================================================================
     # Installation
@@ -512,6 +784,7 @@ class CatalogService:
         item_id: str,
         user_id: UUID,
         build_images: bool = False,
+        install_dependencies: bool = True,
     ) -> CatalogInstalledItem:
         """Install a catalog item into the local PROVING GROUND instance.
 
@@ -547,14 +820,21 @@ class CatalogService:
             raise ValueError(f"Item '{item_id}' not found in catalog source")
 
         catalog_root = self._get_catalog_root(source)
-        item_path = catalog_root / detail.path if detail.path else catalog_root
+        item_path = resolve_declared_path(
+            catalog_root, detail.path, what=f"catalog item '{item_id}' path"
+        )
 
         # Dispatch by type
         local_resource_id: Optional[UUID] = None
 
         if detail.type == CatalogItemType.BLUEPRINT:
             local_resource_id = self._install_blueprint(
-                item_path, detail, user_id, build_images, catalog_root
+                item_path,
+                detail,
+                user_id,
+                build_images,
+                catalog_root,
+                install_dependencies=install_dependencies,
             )
         elif detail.type == CatalogItemType.SCENARIO:
             self._install_scenario(item_path, detail)
@@ -598,6 +878,7 @@ class CatalogService:
         user_id: UUID,
         build_images: bool,
         catalog_root: Path,
+        install_dependencies: bool = True,
     ) -> UUID:
         """Install a blueprint item from the catalog.
 
@@ -611,12 +892,19 @@ class CatalogService:
             user_id: User performing the install.
             build_images: Whether to build Docker images for required images.
             catalog_root: Root path of the catalog source.
+            install_dependencies: Install referenced base images and Dockerfile
+                projects. False when a caller has already installed them.
 
         Returns:
             UUID of the created RangeBlueprint.
+
+        Raises:
+            ValueError: if the catalog declares a path outside itself, for the
+                blueprint or for anything the blueprint requires.
         """
-        # Read blueprint.yaml
-        blueprint_yaml_path = item_path / "blueprint.yaml"
+        # Read blueprint.yaml. Resolved rather than joined because the file
+        # inside the item directory may be a symlink out of the catalog.
+        blueprint_yaml_path = self._file_in(item_path, "blueprint.yaml")
         if not blueprint_yaml_path.exists():
             raise FileNotFoundError(f"blueprint.yaml not found in {item_path}")
 
@@ -626,56 +914,79 @@ class CatalogService:
         if not blueprint_data:
             raise ValueError("Empty blueprint.yaml")
 
-        # Install required images from catalog
-        requires_images = detail.requires_images or []
-        for image_name in requires_images:
-            image_src_dir = catalog_root / "images" / image_name
-            if image_src_dir.exists() and (image_src_dir / "Dockerfile").exists():
-                self._install_image_from_path(image_src_dir, image_name, build_images)
-            else:
-                logger.warning(
-                    f"Required image '{image_name}' not found in catalog at " f"{image_src_dir}"
-                )
+        # Before anything is written, and before the dependency loop below copies image projects
+        # onto disk for a blueprint this install could never deploy.
+        self._refuse_blueprint_from_the_other_era(blueprint_data, detail)
 
-        # Install required base images from catalog
-        requires_base_images = detail.requires_base_images or []
-        if requires_base_images:
-            # Load the catalog index.json to find base_image items
-            index_path = catalog_root / "index.json"
-            base_image_items: Dict[str, dict] = {}
-            if index_path.exists():
-                with open(index_path, "r", encoding="utf-8") as idx_f:
-                    index_data = json.load(idx_f)
-                base_image_items = {
-                    item.get("id"): item
-                    for item in (index_data.get("items") or [])
-                    if item.get("type") == "base_image"
-                }
-            for bi_name in requires_base_images:
-                bi_item = base_image_items.get(bi_name)
-                if bi_item:
-                    bi_path = catalog_root / bi_item.get("path", "")
-                    try:
-                        bi_detail = CatalogItemDetail(
-                            id=bi_item.get("id", ""),
-                            type=CatalogItemType.BASE_IMAGE,
-                            name=bi_item.get("name", ""),
-                            description=bi_item.get("description", ""),
-                            path=bi_item.get("path", ""),
-                        )
-                        self._install_base_image(bi_path, bi_detail)
-                        logger.info(f"Auto-installed base image '{bi_name}' for blueprint")
-                    except Exception as e:
-                        logger.warning(f"Could not auto-install base image '{bi_name}': {e}")
+        # Base images and Dockerfile projects are installed here only when
+        # nobody upstream has taken responsibility for them. The one-click
+        # installer (PG-149) resolves and installs them itself so each one is
+        # a named, reportable step, and passes install_dependencies=False.
+        if install_dependencies:
+            # Install required images from catalog
+            requires_images = detail.requires_images or []
+            for image_name in requires_images:
+                # The name is index data like any other path segment, so it is
+                # resolved rather than joined.
+                image_src_dir = resolve_declared_path(
+                    catalog_root,
+                    f"images/{image_name}",
+                    what=f"required image '{image_name}'",
+                )
+                if image_src_dir.exists() and (image_src_dir / "Dockerfile").exists():
+                    self._install_image_from_path(image_src_dir, image_name, build_images)
                 else:
-                    logger.warning(f"Required base image '{bi_name}' not found in catalog index")
+                    logger.warning(
+                        f"Required image '{image_name}' not found in catalog at " f"{image_src_dir}"
+                    )
+
+            # Install required base images from catalog
+            requires_base_images = detail.requires_base_images or []
+            if requires_base_images:
+                # Load the catalog index.json to find base_image items
+                index_path = catalog_root / "index.json"
+                base_image_items: Dict[str, dict] = {}
+                if index_path.exists():
+                    with open(index_path, "r", encoding="utf-8") as idx_f:
+                        index_data = json.load(idx_f)
+                    base_image_items = {
+                        item.get("id"): item
+                        for item in (index_data.get("items") or [])
+                        if item.get("type") == "base_image"
+                    }
+                for bi_name in requires_base_images:
+                    bi_item = base_image_items.get(bi_name)
+                    if bi_item:
+                        # Outside the try below: a path leaving the catalog is a
+                        # hostile index, not a base image that failed to install.
+                        bi_path = resolve_declared_path(
+                            catalog_root,
+                            bi_item.get("path", ""),
+                            what=f"base image '{bi_name}' path",
+                        )
+                        try:
+                            bi_detail = CatalogItemDetail(
+                                id=bi_item.get("id", ""),
+                                type=CatalogItemType.BASE_IMAGE,
+                                name=bi_item.get("name", ""),
+                                description=bi_item.get("description", ""),
+                                path=bi_item.get("path", ""),
+                            )
+                            self._install_base_image(bi_path, bi_detail)
+                            logger.info(f"Auto-installed base image '{bi_name}' for blueprint")
+                        except Exception as e:
+                            logger.warning(f"Could not auto-install base image '{bi_name}': {e}")
+                    else:
+                        logger.warning(
+                            f"Required base image '{bi_name}' not found in catalog index"
+                        )
 
         # Extract walkthrough -> create Content model if present
         content_id: Optional[UUID] = None
         walkthrough = blueprint_data.get("walkthrough")
 
         # Check for standalone content.json first (preferred for rich content)
-        content_json_path = item_path / "content.json"
+        content_json_path = self._file_in(item_path, "content.json")
         if content_json_path.exists():
             try:
                 with open(content_json_path, "r", encoding="utf-8") as f:
@@ -714,7 +1025,7 @@ class CatalogService:
         msel_content: Optional[str] = None
 
         # Check for standalone msel.md first
-        msel_md_path = item_path / "msel.md"
+        msel_md_path = self._file_in(item_path, "msel.md")
         if msel_md_path.exists():
             try:
                 msel_content = msel_md_path.read_text(encoding="utf-8")
@@ -727,7 +1038,7 @@ class CatalogService:
             msel_content = self._build_msel_from_events(events)
 
         # Build the blueprint config from YAML structure
-        config = build_config_from_yaml(blueprint_data)
+        config = build_config_from_yaml(blueprint_data, item_name=detail.name)
 
         # If we built MSEL content, make sure it's in the config
         if msel_content and config.get("msel"):
@@ -790,6 +1101,29 @@ class CatalogService:
 
         logger.info(f"Created blueprint '{blueprint.name}' (id={blueprint.id})")
         return blueprint.id
+
+    def _refuse_blueprint_from_the_other_era(
+        self,
+        blueprint_data: dict,
+        detail: CatalogItemDetail,
+    ) -> None:
+        """Refuse a blueprint written for the other substrate, at install and not at deploy.
+
+        One catalog serves both eras and an item is written for one of them. Installed on the
+        wrong one it becomes a RangeBlueprint that lists, opens and offers a Deploy button like
+        any other, and the refusal arrives later from a worker, after a range row already exists
+        for the user to clean up. The message names the era so the answer is "this item is for the
+        other substrate" rather than "deployment failed".
+
+        Raises:
+            ValueError: naming the item and the era. The install route turns it into a 400.
+        """
+        version = declared_schema_version(blueprint_data)
+        substrate = self.settings.range_substrate
+        if substrate == SUBSTRATE_KUBERNETES and version == SCHEMA_VERSION_LEGACY:
+            raise ValueError(f"'{detail.name}' cannot be installed here. {ERA_A_ON_KUBERNETES}")
+        if substrate == SUBSTRATE_DOCKER and version == SCHEMA_VERSION_K8S:
+            raise ValueError(f"'{detail.name}' cannot be installed here. {ERA_B_ON_DOCKER}")
 
     def _create_content_from_walkthrough(
         self,
@@ -944,6 +1278,10 @@ class CatalogService:
         Args:
             item_path: Path to the scenario YAML file.
             detail: The catalog item detail.
+
+        Raises:
+            ValueError: if the item id would name a file outside the scenario
+                directory, or the file to copy lies outside the catalog.
         """
         from proving_ground.services.scenario_filesystem import get_scenarios_dir
 
@@ -955,12 +1293,12 @@ class CatalogService:
             src_file = item_path
         elif item_path.is_dir():
             # Look for a YAML file with the item name
-            src_file = item_path / f"{detail.id}.yaml"
+            src_file = self._file_in(item_path, f"{detail.id}.yaml")
             if not src_file.exists():
                 # Try any YAML file in the directory
                 yaml_files = list(item_path.glob("*.yaml"))
                 if yaml_files:
-                    src_file = yaml_files[0]
+                    src_file = self._file_in(item_path, yaml_files[0].name)
                 else:
                     raise FileNotFoundError(f"No YAML scenario file found in {item_path}")
         else:
@@ -969,8 +1307,14 @@ class CatalogService:
         if not src_file.exists():
             raise FileNotFoundError(f"Scenario file not found: {src_file}")
 
-        # Copy to scenarios directory
-        dest_file = scenarios_dir / f"{detail.id}.yaml"
+        # Copy to scenarios directory. The destination is resolved because the
+        # item id comes from the catalog's index and becomes the filename.
+        dest_file = resolve_declared_path(
+            scenarios_dir,
+            f"{detail.id}.yaml",
+            what=f"scenario file for '{detail.id}'",
+            root_label="the scenario directory",
+        )
         shutil.copy2(str(src_file), str(dest_file))
 
         logger.info(f"Installed scenario '{detail.name}' to {dest_file}")
@@ -1012,10 +1356,23 @@ class CatalogService:
             src_dir: Source directory containing the Dockerfile and related files.
             project_name: The project name (used as directory name and image tag).
             build_images: Whether to build the Docker image.
+
+        Raises:
+            ValueError: if the project name would write outside the image library.
         """
         images_dir = Path(IMAGES_DIR)
         images_dir.mkdir(parents=True, exist_ok=True)
-        dest_dir = images_dir / project_name
+        # The project name reaches here from the catalog index, either as an item
+        # id or as an entry in a blueprint's requires_images, so it is resolved
+        # rather than joined.
+        dest_dir = resolve_declared_path(
+            images_dir,
+            project_name,
+            what=f"image project '{project_name}'",
+            root_label="the image library",
+        )
+        if dest_dir == images_dir.resolve():
+            raise ValueError("image project name must not be empty")
 
         # Skip if already exists
         if dest_dir.exists():
@@ -1023,8 +1380,11 @@ class CatalogService:
                 f"Image project '{project_name}' already exists at {dest_dir}, " f"skipping copy"
             )
         else:
-            # Copy the entire project directory
-            shutil.copytree(str(src_dir), str(dest_dir))
+            # Copy the entire project directory. symlinks=True so a link the
+            # catalog committed is copied as a link rather than dereferenced,
+            # which would pull the contents of whatever it points at on this
+            # host into the image library.
+            shutil.copytree(str(src_dir), str(dest_dir), symlinks=True)
             logger.info(f"Copied image project '{project_name}' to {dest_dir}")
 
         # Build the image if requested. Tag under the configured image namespace
@@ -1039,11 +1399,14 @@ class CatalogService:
             self.db.query(BaseImage).filter(BaseImage.image_project_name == project_name).first()
         )
         if not existing_image:
-            # Read description from README.md if present
+            # Read description from README.md if present. Both of these files
+            # arrived with the copied project, so either can be a symlink the
+            # catalog committed; a ValueError here means it points out of the
+            # project and the file is treated as absent.
             description = f"Catalog image: {project_name}"
-            readme_path = dest_dir / "README.md"
-            if readme_path.exists():
-                try:
+            try:
+                readme_path = self._file_in_project(dest_dir, "README.md")
+                if readme_path.exists():
                     readme_text = readme_path.read_text(encoding="utf-8")
                     # Use first paragraph as description
                     for line in readme_text.strip().split("\n"):
@@ -1051,14 +1414,14 @@ class CatalogService:
                         if line:
                             description = line[:200]
                             break
-                except (IOError, UnicodeDecodeError):
-                    pass
+            except (IOError, UnicodeDecodeError, ValueError):
+                pass
 
             # Read container_config from image.yaml if present
             container_config = None
-            image_yaml_path = dest_dir / "image.yaml"
-            if image_yaml_path.exists():
-                try:
+            try:
+                image_yaml_path = self._file_in_project(dest_dir, "image.yaml")
+                if image_yaml_path.exists():
                     with open(image_yaml_path) as f:
                         image_meta = yaml.safe_load(f) or {}
                     if image_meta.get("container_config"):
@@ -1067,8 +1430,8 @@ class CatalogService:
                             f"Image '{project_name}': loaded container_config "
                             f"from image.yaml: {container_config}"
                         )
-                except (IOError, yaml.YAMLError) as exc:
-                    logger.warning(f"Failed to read image.yaml for '{project_name}': {exc}")
+            except (IOError, yaml.YAMLError, ValueError) as exc:
+                logger.warning(f"Failed to read image.yaml for '{project_name}': {exc}")
 
             base_image = BaseImage(
                 name=project_name,
@@ -1190,11 +1553,11 @@ class CatalogService:
         if item_path.is_file() and item_path.suffix in (".yaml", ".yml"):
             yaml_path = item_path
         elif item_path.is_dir():
-            yaml_path = item_path / f"{detail.id}.yaml"
+            yaml_path = self._file_in(item_path, f"{detail.id}.yaml")
             if not yaml_path.exists():
                 yaml_files = list(item_path.glob("*.yaml"))
                 if yaml_files:
-                    yaml_path = yaml_files[0]
+                    yaml_path = self._file_in(item_path, yaml_files[0].name)
                 else:
                     raise FileNotFoundError(f"No YAML base image file found in {item_path}")
         else:
@@ -1287,7 +1650,7 @@ class CatalogService:
         elif item_path.is_dir():
             # Try common content filenames
             for filename in ("content.md", "README.md", "guide.md"):
-                content_file = item_path / filename
+                content_file = self._file_in(item_path, filename)
                 if content_file.exists():
                     content_text = content_file.read_text(encoding="utf-8")
                     break
@@ -1377,4 +1740,93 @@ class CatalogService:
 
         logger.info(
             f"Uninstalled catalog item '{installed_item.item_name}' " f"(type={item_type.value})"
+        )
+
+    def resolve_blueprint_origin(self, blueprint_id: UUID) -> Optional["CatalogOrigin"]:
+        """Find the catalog item a blueprint was installed from, and read its YAML.
+
+        Returns None when the blueprint was authored locally, when its catalog
+        source has been removed, or when the source is no longer synced -- all
+        of which mean there is nothing to contribute back to.
+
+        Raises:
+            ValueError: if the catalog still lists the item but its
+                blueprint.yaml is missing or unparseable, which is a broken
+                catalog rather than an absent one.
+        """
+        installed = (
+            self.db.query(CatalogInstalledItem)
+            .filter(
+                CatalogInstalledItem.local_resource_id == blueprint_id,
+                CatalogInstalledItem.item_type == CatalogItemType.BLUEPRINT,
+            )
+            .first()
+        )
+        if not installed:
+            return None
+
+        source = (
+            self.db.query(CatalogSource)
+            .filter(CatalogSource.id == installed.catalog_source_id)
+            .first()
+        )
+        if not source:
+            return None
+
+        catalog_root = self._get_catalog_root(source)
+        if not catalog_root.exists():
+            return None
+
+        try:
+            index = self._load_index(source)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+        item_data = next(
+            (i for i in index.get("items", []) if i.get("id") == installed.catalog_item_id),
+            None,
+        )
+        if not item_data:
+            return None
+
+        item_dir = item_data.get("path", "")
+        # index.json is catalog-supplied content, so its paths are not trusted:
+        # a '../..' would read outside the catalog root.
+        item_root = resolve_declared_path(
+            catalog_root,
+            item_dir,
+            what=f"catalog item '{installed.catalog_item_id}' path",
+        )
+        yaml_path = self._file_in(item_root, "blueprint.yaml")
+        if not yaml_path.exists():
+            raise ValueError(
+                f"catalog item '{installed.catalog_item_id}' is indexed but its "
+                f"blueprint.yaml is missing at {yaml_path}"
+            )
+
+        text = yaml_path.read_text(encoding="utf-8")
+        try:
+            document = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise ValueError(
+                f"catalog item '{installed.catalog_item_id}' has an unparseable "
+                f"blueprint.yaml: {exc}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise ValueError(
+                f"catalog item '{installed.catalog_item_id}' blueprint.yaml is not a mapping"
+            )
+
+        return CatalogOrigin(
+            source_id=source.id,
+            source_name=source.name,
+            source_url=source.url,
+            source_branch=source.branch,
+            item_id=installed.catalog_item_id,
+            item_name=installed.item_name,
+            installed_version=installed.installed_version,
+            item_path=str(Path(item_dir) / "blueprint.yaml"),
+            yaml_path=yaml_path,
+            document=document,
+            text=text,
         )

@@ -2,20 +2,41 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuthStore } from '../stores/authStore'
-import { rangesApi } from '../services/api'
+import { api, rangesApi } from '../services/api'
 import type { Range } from '../types'
 import { Network, Plus, Loader2 } from 'lucide-react'
+import { useFeature } from '../stores/capabilitiesStore'
+
+/**
+ * On the Kubernetes substrate a range has no VM rows, so summing `range.vms` reported "0" beside
+ * a range whose machine was plainly running. The backend answers this one in a single cluster
+ * call; `null` means "count the Docker way".
+ */
+interface MachineSummary {
+  substrate: 'dind' | 'kubernetes'
+  running: number | null
+  total: number | null
+}
 
 export default function Dashboard() {
   const { user } = useAuthStore()
+  // Composing a range from networks and virtual machines is the Docker path. Where it is not
+  // offered, this card said "Create New Range" and led to a list -- the right destination with
+  // the wrong promise on it.
+  const canCompose = useFeature('range_composition')
   const [ranges, setRanges] = useState<Range[]>([])
+  const [machines, setMachines] = useState<MachineSummary | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const rangesRes = await rangesApi.list()
+        const [rangesRes, machinesRes] = await Promise.all([
+          rangesApi.list(),
+          api.get<MachineSummary>('/range-machines/summary').catch(() => null),
+        ])
         setRanges(rangesRes.data)
+        if (machinesRes) setMachines(machinesRes.data)
       } catch (error) {
         console.error('Failed to fetch dashboard data:', error)
       } finally {
@@ -25,9 +46,12 @@ export default function Dashboard() {
     fetchData()
   }, [])
 
-  const runningVMs = ranges.reduce((count, range) => {
-    return count + (range.vms?.filter(vm => vm.status === 'running').length || 0)
-  }, 0)
+  const runningMachines =
+    machines?.running ??
+    ranges.reduce((count, range) => {
+      return count + (range.vms?.filter(vm => vm.status === 'running').length || 0)
+    }, 0)
+  const machineLabel = machines?.substrate === 'kubernetes' ? 'Running machines' : 'Running VMs'
 
   if (loading) {
     return (
@@ -76,8 +100,8 @@ export default function Dashboard() {
               </div>
               <div className="ml-5 w-0 flex-1">
                 <dl>
-                  <dt className="text-sm font-medium text-gray-500 truncate">Running VMs</dt>
-                  <dd className="text-2xl font-semibold text-gray-900">{runningVMs}</dd>
+                  <dt className="text-sm font-medium text-gray-500 truncate">{machineLabel}</dt>
+                  <dd className="text-2xl font-semibold text-gray-900">{runningMachines}</dd>
                 </dl>
               </div>
             </div>
@@ -90,7 +114,7 @@ export default function Dashboard() {
         <h2 className="text-lg font-medium text-gray-900">Quick Actions</h2>
         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <Link
-            to="/ranges"
+            to={canCompose ? '/ranges' : '/blueprints'}
             className="relative rounded-lg border border-gray-300 bg-white px-6 py-5 shadow-sm flex items-center space-x-3 hover:border-gray-400 focus-within:ring-2 focus-within:ring-offset-2 focus-within:ring-primary-500"
           >
             <div className="flex-shrink-0">
@@ -100,8 +124,14 @@ export default function Dashboard() {
             </div>
             <div className="flex-1 min-w-0">
               <span className="absolute inset-0" aria-hidden="true" />
-              <p className="text-sm font-medium text-gray-900">Create New Range</p>
-              <p className="text-sm text-gray-500">Set up a new cyber training environment</p>
+              <p className="text-sm font-medium text-gray-900">
+                {canCompose ? 'Create New Range' : 'Deploy a range'}
+              </p>
+              <p className="text-sm text-gray-500">
+                {canCompose
+                  ? 'Set up a new cyber training environment'
+                  : 'Choose a blueprint and deploy an instance of it'}
+              </p>
             </div>
           </Link>
         </div>

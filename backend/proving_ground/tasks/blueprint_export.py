@@ -24,6 +24,10 @@ from proving_ground.config import get_settings
 from proving_ground.database import get_session_local
 from proving_ground.models.blueprint import RangeBlueprint
 from proving_ground.schemas.blueprint import BlueprintConfig
+from proving_ground.schemas.blueprint_export import (
+    PACKAGE_FORMAT_KUBERNETES,
+    PACKAGE_FORMAT_LEGACY,
+)
 from proving_ground.schemas.blueprint_export import BlueprintExportOptions
 from proving_ground.services.blueprint_export_service import get_blueprint_export_service
 
@@ -171,7 +175,11 @@ def export_blueprint_async(
             update_job_status(job_id, "failed", "Blueprint not found", error="Blueprint not found")
             return
 
-        config = BlueprintConfig.model_validate(blueprint.config)
+        # The stored document, whichever era wrote it. Validating through the v1 model raised
+        # for every Kubernetes blueprint, so the only blueprint such an install has could not be
+        # exported at all -- and the raised message carried the config back to the caller.
+        config = dict(blueprint.config or {})
+        is_kubernetes_blueprint = int(config.get("schemaVersion") or 1) >= 2
 
         # Create export directory in shared location (accessible by both api and worker)
         export_base = Path(settings.global_shared_dir) / "exports"
@@ -230,8 +238,9 @@ def export_blueprint_async(
         artifacts_data = []
         if options.include_artifacts:
             artifact_ids = []
-            if hasattr(config, "artifact_ids") and config.artifact_ids:
-                artifact_ids = config.artifact_ids
+            declared = config.get("artifact_ids")
+            if isinstance(declared, list):
+                artifact_ids = declared
             if artifact_ids:
                 artifacts_data, _ = export_service._collect_artifacts(artifact_ids, temp_dir, db)
 
@@ -240,8 +249,13 @@ def export_blueprint_async(
 
         # Step 5: Export Docker images (the slow part)
         exported_images = []
-        if options.include_docker_images:
-            image_tags = export_service._collect_image_tags_from_config(config, db)
+        # A Kubernetes blueprint names no Docker images: its machines are disk images the
+        # cluster pulls and its capabilities are Helm charts (ADR-0007 -- by digest, no runtime
+        # pull). Collecting tags from it would mean reading `vms`, which it does not have.
+        if options.include_docker_images and not is_kubernetes_blueprint:
+            image_tags = export_service._collect_image_tags_from_config(
+                BlueprintConfig.model_validate(config), db
+            )
             if image_tags:
                 exported_images = _export_docker_images_with_progress(job_id, image_tags, temp_dir)
 
@@ -260,10 +274,8 @@ def export_blueprint_async(
 
         # Handle MSEL option
         export_config = config
-        if hasattr(config, "msel") and config.msel and not options.include_msel:
-            config_dict = config.model_dump()
-            config_dict["msel"] = None
-            export_config = BlueprintConfig.model_validate(config_dict)
+        if config.get("msel") and not options.include_msel:
+            export_config = {**config, "msel": None}
 
         blueprint_data = BlueprintExportData(
             name=blueprint.name,
@@ -287,11 +299,11 @@ def export_blueprint_async(
 
         # Build manifest
         manifest = BlueprintExportManifest(
-            version="4.0",
+            version=PACKAGE_FORMAT_KUBERNETES if is_kubernetes_blueprint else PACKAGE_FORMAT_LEGACY,
             created_at=datetime.utcnow(),
             proving_ground_version=proving_ground_version,
             blueprint_name=blueprint.name,
-            msel_included=bool(hasattr(config, "msel") and config.msel and options.include_msel),
+            msel_included=bool(config.get("msel") and options.include_msel),
             dockerfile_count=len(dockerfiles) if dockerfiles else 0,
             content_included=bool(content_data),
             artifact_count=len(artifacts_data) if artifacts_data else 0,

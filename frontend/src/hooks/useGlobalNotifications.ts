@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useAuthStore } from '../stores/authStore'
 import { useNotificationStore } from '../stores/notificationStore'
+import { requestWebSocketTicket } from './useRealtimeRange'
 import { RealtimeEvent } from '../types'
 
 const WS_BASE_URL = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_WS_URL || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
@@ -45,7 +46,12 @@ export function useGlobalNotifications(
     onNotificationRef.current = onNotification
   }, [onNotification])
 
-  const connect = useCallback(() => {
+  // A scheduled retry has to call the *current* `connect`, and `connect`
+  // cannot name itself inside its own initializer. The ref is that
+  // indirection, kept in step by the effect below.
+  const connectRef = useRef<() => Promise<void>>(() => Promise.resolve())
+
+  const connect: () => Promise<void> = useCallback(async () => {
     if (!token || !enabled) return
 
     // Prevent rapid reconnection - wait for previous close to complete
@@ -62,8 +68,38 @@ export function useGlobalNotifications(
 
     setConnectionState('connecting')
 
+    // The credential is a cookie the API sets, not a query parameter -- see
+    // requestWebSocketTicket. Minted on every attempt because it is short-lived.
+    try {
+      await requestWebSocketTicket('events')
+    } catch (err) {
+      console.error('[GlobalNotifications] Ticket refused:', err)
+      if (!mountedRef.current) return
+      setConnectionState('error')
+      // Treated as a failed connection rather than a dead end: a refused mint
+      // is usually a blip or an expired session, and the notification bell
+      // going quiet for the rest of the session is not an acceptable answer.
+      if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS && enabled) {
+        const baseDelay = Math.min(
+          INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttemptsRef.current),
+          30000
+        )
+        const delay = Math.round(baseDelay + Math.random() * 0.25 * baseDelay)
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (mountedRef.current) {
+            reconnectAttemptsRef.current++
+            void connectRef.current()
+          }
+        }, delay)
+      }
+      return
+    }
+
+    // The hook was unmounted while the ticket was in flight.
+    if (!mountedRef.current) return
+
     // Connect without range_id to get all global events
-    const wsUrl = `${WS_BASE_URL}/api/v1/ws/events?token=${encodeURIComponent(token)}`
+    const wsUrl = `${WS_BASE_URL}/api/v1/ws/events`
 
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
@@ -139,12 +175,16 @@ export function useGlobalNotifications(
         reconnectTimeoutRef.current = setTimeout(() => {
           if (mountedRef.current) {
             reconnectAttemptsRef.current++
-            connect()
+            void connectRef.current()
           }
         }, delay)
       }
     }
   }, [token, enabled, addNotification])
+
+  useEffect(() => {
+    connectRef.current = connect
+  }, [connect])
 
   // Connect on mount and when dependencies change
   useEffect(() => {
@@ -156,7 +196,7 @@ export function useGlobalNotifications(
       // This ensures the first mount/unmount cycle completes before we connect
       connectTimeout = setTimeout(() => {
         if (mountedRef.current) {
-          connect()
+          void connect()
         }
       }, 100)
     }

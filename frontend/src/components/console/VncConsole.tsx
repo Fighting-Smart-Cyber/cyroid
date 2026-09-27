@@ -115,6 +115,21 @@ export function VncConsole({ vmId, vmHostname, token, onClose }: VncConsoleProps
           throw new Error(data.detail || 'Failed to get VNC info')
         }
 
+        // The iframe below cannot present this token: a browser navigation
+        // carries no Authorization header, and the JWT lives in localStorage.
+        // Exchange it for a short-lived cookie scoped to /vnc/{vmId}, which the
+        // iframe's own requests -- websocket and assets included -- then send
+        // automatically. Traefik refuses the route without it.
+        const ticketRes = await fetch(`/api/v1/vms/${vmId}/console-ticket`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          credentials: 'same-origin',
+        })
+        if (!ticketRes.ok) {
+          const t = await ticketRes.json().catch(() => ({}))
+          throw new Error(t.detail || 'Not authorised to open this console')
+        }
+
         const data = await response.json()
         const origin = window.location.origin
 

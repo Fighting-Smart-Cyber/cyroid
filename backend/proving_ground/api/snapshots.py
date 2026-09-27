@@ -4,6 +4,12 @@
 Implements the three-tier Image Library logic:
 - First snapshot of a VM → creates GoldenImage (with lineage to BaseImage)
 - Follow-on snapshots → creates Snapshot (fork, with lineage to GoldenImage)
+
+Taking a snapshot reads a VM's disk; restoring one replaces it. Both are
+changes to somebody's range, so both answer to the range's control rule rather
+than to "any authenticated user", which is all these routes required until now
+-- restore in particular stopped and force-removed the target container and
+rebuilt it, on nothing more than a valid login.
 """
 import asyncio
 from typing import List, Union
@@ -11,12 +17,13 @@ from uuid import UUID
 import logging
 
 from fastapi import APIRouter, HTTPException, status
+from sqlalchemy.orm import Session
 
-from proving_ground.api.deps import DBSession, CurrentUser
+from proving_ground.api.deps import DBSession, CurrentUser, check_range_control
 from proving_ground.models.snapshot import Snapshot
 from proving_ground.models.golden_image import GoldenImage
+from proving_ground.models.user import User
 from proving_ground.models.vm import VM, VMStatus
-from proving_ground.models.range import Range
 from proving_ground.schemas.snapshot import SnapshotCreate, SnapshotResponse
 from proving_ground.schemas.golden_image import GoldenImageResponse
 
@@ -30,6 +37,32 @@ def get_docker_service():
     from proving_ground.services.docker_service import get_docker_service as _get_docker
 
     return _get_docker()
+
+
+def check_snapshot_control(snapshot: Snapshot, current_user: User, db: Session) -> None:
+    """Require control of the range the snapshot's source VM belongs to.
+
+    A snapshot has no owner column, and neither does the VM: it belongs to a
+    range, and whoever controls the range controls it. That is the same rule
+    networks and VMs already answer to.
+
+    vm_id is SET NULL when the VM is deleted, so a snapshot outlives the range
+    it came from. What is left is an entry in the install-wide library with
+    nobody to answer to, and an administrator is the only one who can speak for
+    it -- falling through to "allowed" there would make every orphaned snapshot
+    deletable by anyone, which is the shape of the defect this replaces.
+    """
+    vm = db.query(VM).filter(VM.id == snapshot.vm_id).first() if snapshot.vm_id else None
+    if vm is not None:
+        check_range_control(vm.range_id, current_user, db)
+    elif not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This snapshot's source VM no longer exists, so it belongs to the shared "
+                "image library; only an administrator can remove it"
+            ),
+        )
 
 
 @router.post(
@@ -57,6 +90,8 @@ def create_snapshot(
             detail="VM not found",
         )
 
+    range_obj = check_range_control(vm.range_id, current_user, db)
+
     if not vm.container_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -66,8 +101,7 @@ def create_snapshot(
     docker = get_docker_service()
 
     # Check for DinD mode
-    range_obj = db.query(Range).filter(Range.id == vm.range_id).first()
-    use_dind = bool(range_obj and range_obj.dind_docker_url)
+    use_dind = bool(range_obj.dind_docker_url)
 
     # Check if this VM already has a GoldenImage
     existing_golden = db.query(GoldenImage).filter(GoldenImage.source_vm_id == vm.id).first()
@@ -223,17 +257,21 @@ def restore_snapshot(
             detail="Snapshot not found",
         )
 
-    if not snapshot.docker_image_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Snapshot has no associated Docker image",
-        )
-
     vm = db.query(VM).filter(VM.id == snapshot.vm_id).first()
     if not vm:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="VM not found",
+        )
+
+    # Before anything is torn down: a restore rolls a running machine back to
+    # an earlier disk and discards whatever was on it.
+    check_range_control(vm.range_id, current_user, db)
+
+    if not snapshot.docker_image_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Snapshot has no associated Docker image",
         )
 
     docker = get_docker_service()
@@ -311,6 +349,8 @@ def delete_snapshot(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Snapshot not found",
         )
+
+    check_snapshot_control(snapshot, current_user, db)
 
     # Delete Docker image if exists
     if snapshot.docker_image_id:

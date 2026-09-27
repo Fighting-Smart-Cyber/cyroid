@@ -74,6 +74,10 @@ class RangeResponse(RangeBase):
     stopped_at: Optional[datetime] = None
     network_count: int = 0
     vm_count: int = 0
+    # Which substrate produced the two counts above, so the client can name the unit the way that
+    # substrate does -- "machines" on Kubernetes, "VMs" on Docker. The counts themselves come from
+    # different places on each, and a client that cannot tell them apart labels one of them wrong.
+    substrate: str = "dind"
     # Training content link
     student_guide_id: Optional[UUID] = None
 
@@ -86,8 +90,22 @@ class RangeResponse(RangeBase):
         return status.value.lower()
 
     @classmethod
-    def from_orm_with_counts(cls, range_obj):
-        """Create response with network and VM counts."""
+    def from_orm_with_counts(cls, range_obj, counts=None, substrate: str = "dind"):
+        """Create response with network and machine counts.
+
+        `counts` is `(networks, machines)` for a range whose composition does not live in the
+        Network and VM rows -- a Kubernetes range creates neither, so counting the rows reported
+        "0 networks / 0 VMs" for a range with machines running. Without it the rows are still
+        the answer, which is correct on Docker and for a range that has never been deployed.
+        """
+        networks, machines = (
+            counts
+            if counts is not None
+            else (
+                len(range_obj.networks) if range_obj.networks else 0,
+                len(range_obj.vms) if range_obj.vms else 0,
+            )
+        )
         return cls(
             id=range_obj.id,
             name=range_obj.name,
@@ -100,8 +118,9 @@ class RangeResponse(RangeBase):
             deployed_at=range_obj.deployed_at,
             started_at=range_obj.started_at,
             stopped_at=range_obj.stopped_at,
-            network_count=len(range_obj.networks) if range_obj.networks else 0,
-            vm_count=len(range_obj.vms) if range_obj.vms else 0,
+            network_count=networks,
+            vm_count=machines,
+            substrate=substrate,
             student_guide_id=range_obj.student_guide_id,
         )
 

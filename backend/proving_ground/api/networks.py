@@ -5,7 +5,13 @@ import logging
 
 from fastapi import APIRouter, HTTPException, status
 
-from proving_ground.api.deps import DBSession, CurrentUser
+from proving_ground.api import kubernetes_ranges
+from proving_ground.api.deps import (
+    DBSession,
+    CurrentUser,
+    check_range_access,
+    check_range_control,
+)
 from proving_ground.models.network import Network
 from proving_ground.models.range import Range
 from proving_ground.schemas.network import NetworkCreate, NetworkUpdate, NetworkResponse
@@ -25,13 +31,9 @@ def get_docker_service():
 @router.get("", response_model=List[NetworkResponse])
 def list_networks(range_id: UUID, db: DBSession, current_user: CurrentUser):
     """List all networks in a range"""
-    # Verify range exists and user has access
-    range_obj = db.query(Range).filter(Range.id == range_id).first()
-    if not range_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Range not found",
-        )
+    # The comment here used to promise "and user has access" while only
+    # checking existence. Now it does both.
+    check_range_access(range_id, current_user, db)
 
     networks = db.query(Network).filter(Network.range_id == range_id).all()
     return networks
@@ -39,12 +41,23 @@ def list_networks(range_id: UUID, db: DBSession, current_user: CurrentUser):
 
 @router.post("", response_model=NetworkResponse, status_code=status.HTTP_201_CREATED)
 def create_network(network_data: NetworkCreate, db: DBSession, current_user: CurrentUser):
-    # Verify range exists
-    range_obj = db.query(Range).filter(Range.id == network_data.range_id).first()
-    if not range_obj:
+    # Adding a network to someone else's range is changing their range.
+    check_range_control(network_data.range_id, current_user, db)
+
+    if kubernetes_ranges.is_kubernetes():
+        # This endpoint only writes a row. On the DinD path a later provision
+        # turns that row into a Docker network; on the cluster nothing
+        # reconciles it, so the row is counted by the range page and exists
+        # nowhere else -- an instructor adds a network to a running exercise and
+        # builds on something that was never created.
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Range not found",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This install runs on the Kubernetes substrate, where a range's networks "
+                "are declared in its blueprint and created on the cluster when the range "
+                "deploys. Edit the blueprint and redeploy; a network added here would "
+                "exist only in the database."
+            ),
         )
 
     # Check for duplicate subnet in the same range
@@ -74,6 +87,9 @@ def get_network(network_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Network not found",
         )
+
+    check_range_access(network.range_id, current_user, db)
+
     return network
 
 
@@ -90,6 +106,8 @@ def update_network(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Network not found",
         )
+
+    check_range_control(network.range_id, current_user, db)
 
     update_data = network_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -108,6 +126,8 @@ def delete_network(network_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Network not found",
         )
+
+    check_range_control(network.range_id, current_user, db)
 
     # Check if network has VMs attached
     if network.vms:
@@ -137,6 +157,8 @@ def provision_network(network_id: UUID, db: DBSession, current_user: CurrentUser
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Network not found",
         )
+
+    check_range_control(network.range_id, current_user, db)
 
     if network.docker_network_id:
         raise HTTPException(
@@ -195,6 +217,8 @@ def toggle_network_isolation(network_id: UUID, db: DBSession, current_user: Curr
             detail="Network not found",
         )
 
+    check_range_control(network.range_id, current_user, db)
+
     if not network.docker_network_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -243,6 +267,8 @@ def toggle_network_internet(network_id: UUID, db: DBSession, current_user: Curre
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Network not found",
         )
+
+    check_range_control(network.range_id, current_user, db)
 
     new_state = not network.internet_enabled
 
@@ -336,6 +362,8 @@ def toggle_network_dhcp(network_id: UUID, db: DBSession, current_user: CurrentUs
             detail="Network not found",
         )
 
+    check_range_control(network.range_id, current_user, db)
+
     try:
         network.dhcp_enabled = not network.dhcp_enabled
         db.commit()
@@ -362,6 +390,8 @@ def teardown_network(network_id: UUID, db: DBSession, current_user: CurrentUser)
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Network not found",
         )
+
+    check_range_control(network.range_id, current_user, db)
 
     if not network.docker_network_id:
         raise HTTPException(

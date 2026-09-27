@@ -1,0 +1,93 @@
+{{- if .Values.ingress.enabled }}
+{{- if and .Values.ingress.appsHost (not .Values.ingress.host) }}
+{{- fail "ingress.appsHost needs ingress.host as well: a rule with no host answers on every name, so this ingress would serve the platform on the applications host too and the separate origin a range's applications are published on would not be separate" }}
+{{- end }}
+{{- /*
+An Ingress rule's host must be a DNS name: `spec.rules[].host` rejects an IP outright, and the
+API server says so only after helm has begun applying, so the release fails half-installed with a
+message about a field nobody chose directly.
+
+Refused rather than dropped. Dropping the host would leave a rule matching EVERY name -- including
+the applications host -- which is the same-origin problem the guard above exists to prevent, so an
+IP here is not something to quietly work around.
+
+Seen on devtest-az 2026-09-26: `--host 20.88.161.131` (an AKS LoadBalancer address) failed this
+way, and `docs/plans/2026-09-22-preprod-0.52.1-test-plan.md` told an operator to do exactly that
+with pg-preprod's address. Nothing had exercised it: devtest-pve uses `localhost`, which is a
+name, and preprod uses no host at all.
+*/}}
+{{- if regexMatch "^[0-9]+([.][0-9]+){3}$" (.Values.ingress.host | default "") }}
+{{- fail (printf "ingress.host is %q, an IP address. An Ingress rule's host has to be a DNS name -- Kubernetes rejects an IP and the failure arrives mid-install. On a host with no DNS, a wildcard resolver gives you a name for the same address at no cost: --host %s.sslip.io (and --apps-host apps.%s.sslip.io). The certificate still carries the IP in its IP SANs either way." .Values.ingress.host .Values.ingress.host .Values.ingress.host) }}
+{{- end }}
+# Same shape as the Compose stack's Traefik routing: /api and /ws to the API, everything else to
+# the SPA. Nothing here is Traefik-specific beyond the class name.
+#
+# The host below is load-bearing once ingress.appsHost is set: without it this rule matches any
+# name, including a range's applications host, and the SPA and the API would be same-origin with
+# a range's application again.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pg
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - secretName: {{ .Values.ingress.tls.secretName }}
+      {{- with .Values.ingress.host }}
+      hosts: [{{ . | quote }}]
+      {{- end }}
+  {{- end }}
+  rules:
+    - {{ with .Values.ingress.host }}host: {{ . | quote }}
+      {{ end }}http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: pg-api
+                port: {name: http}
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: pg-api
+                port: {name: http}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pg-frontend
+                port: {name: http}
+{{- if include "pg.tlsDefaultStore" . }}
+---
+# What Traefik serves for a name that matches the SANs of no certificate it has loaded. This is
+# not how a range's application gets a certificate: Traefik matches each handshake against those
+# SANs, wildcards included, and reads the `spec.tls[].hosts` list on an Ingress not at all, so
+# the `*.<appsHost>` SAN on the secret above already covers every range. This object exists for
+# the install where that match has been established not to be enough.
+#
+# Two things this does that nothing else in the chart does. It writes into
+# rangeIngress.controllerNamespace, which this release does not own and does not clean up beyond
+# this object. And it replaces the default certificate for EVERY host that controller serves, not
+# only this install's -- Traefik honours one TLSStore named `default`, so a cluster already
+# carrying one has a conflict. Both are why ingress.tls.defaultStore.enabled never turns itself
+# on: an operator asks for this by name, or it does not happen.
+#
+# No `helm.sh/resource-policy: keep` here, unlike the secret it names: an uninstalled release
+# should stop deciding what an ingress controller presents to everybody else.
+apiVersion: {{ .Values.ingress.tls.defaultStore.apiVersion }}
+kind: TLSStore
+metadata:
+  name: default
+  namespace: {{ .Values.rangeIngress.controllerNamespace }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  defaultCertificate:
+    secretName: {{ .Values.ingress.tls.secretName }}
+{{- end }}
+{{- end }}

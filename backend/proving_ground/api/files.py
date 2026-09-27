@@ -4,16 +4,31 @@ import os
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from proving_ground.api.auth import CurrentUser
+from proving_ground.api.deps import require_any_role
+from proving_ground.models.user import User
 from proving_ground.services.scenario_filesystem import get_scenarios_dir
 
 router = APIRouter(prefix="/files", tags=["files"])
+
+# This API writes to the data volume every API and worker pod mounts: the image
+# trees that blueprints build from and the scenario YAML the scenarios API then
+# reads. None of it is a range, so the three range checks in deps.py have
+# nothing to answer with -- there is no owner row to compare a caller against
+# and no range whose visibility could stand in for one. Authorship is the role,
+# so the role is the check.
+#
+# Reads are gated the same as writes, deliberately. The trees hold .env files,
+# build scripts and Dockerfiles, and the only surface that reaches this API is
+# the file browser on the Training Scenarios page, which is already limited to
+# these two roles. A student reading another author's build secrets would be a
+# leak with no compensating use.
+ContentAuthor = Annotated[User, Depends(require_any_role("admin", "engineer"))]
 
 
 def get_allowed_bases() -> dict[str, Path]:
@@ -115,15 +130,27 @@ class LockResponse(BaseModel):
 
 def _resolve_path(path: str) -> tuple[Path, str]:
     """Resolve and validate a file path against allowed bases."""
+    if "\x00" in path:
+        # Path() raises ValueError on an embedded NUL, and an unhandled
+        # ValueError on caller-supplied input is a bare 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Path contains a null byte"
+        )
+
     path = path.strip("/")
     allowed_bases = get_allowed_bases()
 
     # Determine which base this path belongs to
     for base_name, base_path in allowed_bases.items():
         if path.startswith(base_name + "/") or path == base_name:
-            # Security: prevent path traversal
-            full_path = (base_path / path.removeprefix(base_name).lstrip("/")).resolve()
-            if not str(full_path).startswith(str(base_path.resolve())):
+            base_root = base_path.resolve()
+            full_path = (base_root / path.removeprefix(base_name).lstrip("/")).resolve()
+            # is_relative_to, not a string prefix comparison. "images/../images-old/x"
+            # resolves to a sibling whose name merely begins with the base's, which
+            # startswith() accepts and a path comparison refuses. resolve() has
+            # already followed symlinks, so a link planted inside the tree and
+            # pointing out of it is caught here as well.
+            if not full_path.is_relative_to(base_root):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="Path traversal not allowed"
                 )
@@ -197,7 +224,7 @@ def _check_lock(path: str, user_id: str, lock_token: Optional[str] = None) -> Op
 
 
 @router.get("", response_model=FileListResponse)
-def list_files(path: str, current_user: CurrentUser):
+def list_files(path: str, current_user: ContentAuthor):
     """List files in a directory."""
     full_path, base_name = _resolve_path(path)
 
@@ -216,13 +243,22 @@ def list_files(path: str, current_user: CurrentUser):
         item_path = f"{path}/{item.name}".strip("/")
         lock_owner = _check_lock(item_path, str(current_user.id))
 
+        # One entry that cannot be stat'ed -- a dangling symlink, or a file
+        # deleted between the listing and the stat -- must not take the whole
+        # directory down with it. It lists without a size or a date instead.
+        try:
+            stat = item.stat()
+            is_dir = item.is_dir()
+        except OSError:
+            stat, is_dir = None, False
+
         info = FileInfo(
             name=item.name,
             path=item_path,
-            is_dir=item.is_dir(),
-            size=item.stat().st_size if item.is_file() else None,
-            modified=datetime.fromtimestamp(item.stat().st_mtime) if item.exists() else None,
-            is_text=_is_text_file(item) if item.is_file() else True,
+            is_dir=is_dir,
+            size=stat.st_size if stat and not is_dir else None,
+            modified=datetime.fromtimestamp(stat.st_mtime) if stat else None,
+            is_text=_is_text_file(item) if not is_dir else True,
             locked_by=lock_owner,
         )
         files.append(info)
@@ -237,7 +273,7 @@ def list_files(path: str, current_user: CurrentUser):
 
 
 @router.get("/content", response_model=FileContentResponse)
-def read_file(path: str, current_user: CurrentUser):
+def read_file(path: str, current_user: ContentAuthor):
     """Read file content."""
     full_path, _ = _resolve_path(path)
 
@@ -299,7 +335,7 @@ def read_file(path: str, current_user: CurrentUser):
 
 
 @router.post("", response_model=FileContentResponse)
-def create_file(request: CreateFileRequest, current_user: CurrentUser):
+def create_file(request: CreateFileRequest, current_user: ContentAuthor):
     """Create a new file."""
     full_path, _ = _resolve_path(request.path)
 
@@ -333,7 +369,7 @@ def create_file(request: CreateFileRequest, current_user: CurrentUser):
 
 
 @router.put("/content")
-def update_file(request: UpdateFileRequest, current_user: CurrentUser):
+def update_file(request: UpdateFileRequest, current_user: ContentAuthor):
     """Update file content."""
     full_path, _ = _resolve_path(request.path)
 
@@ -360,7 +396,7 @@ def update_file(request: UpdateFileRequest, current_user: CurrentUser):
 
 
 @router.put("/rename")
-def rename_file(request: RenameFileRequest, current_user: CurrentUser):
+def rename_file(request: RenameFileRequest, current_user: ContentAuthor):
     """Rename a file or directory."""
     old_full, _ = _resolve_path(request.old_path)
     new_full, _ = _resolve_path(request.new_path)
@@ -397,7 +433,7 @@ def rename_file(request: RenameFileRequest, current_user: CurrentUser):
 
 
 @router.delete("")
-def delete_file(path: str, current_user: CurrentUser):
+def delete_file(path: str, current_user: ContentAuthor):
     """Delete a file or directory."""
     full_path, _ = _resolve_path(path)
 
@@ -423,7 +459,7 @@ def delete_file(path: str, current_user: CurrentUser):
 
 
 @router.post("/lock", response_model=LockResponse)
-def acquire_lock(path: str, current_user: CurrentUser):
+def acquire_lock(path: str, current_user: ContentAuthor):
     """Acquire a lock on a file."""
     full_path, _ = _resolve_path(path)
 
@@ -457,7 +493,7 @@ def acquire_lock(path: str, current_user: CurrentUser):
 
 
 @router.delete("/lock")
-def release_lock(path: str, current_user: CurrentUser):
+def release_lock(path: str, current_user: ContentAuthor):
     """Release a lock on a file."""
     if path in _file_locks:
         lock = _file_locks[path]
@@ -469,7 +505,7 @@ def release_lock(path: str, current_user: CurrentUser):
 
 
 @router.post("/lock/heartbeat")
-def heartbeat_lock(path: str, lock_token: str, current_user: CurrentUser):
+def heartbeat_lock(path: str, lock_token: str, current_user: ContentAuthor):
     """Keep a lock alive."""
     if path not in _file_locks:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lock not found")
@@ -485,7 +521,7 @@ def heartbeat_lock(path: str, lock_token: str, current_user: CurrentUser):
 
 
 @router.get("/language")
-def get_file_language(path: str, current_user: CurrentUser):
+def get_file_language(path: str, current_user: ContentAuthor):
     """Get the Monaco editor language for a file."""
     full_path, _ = _resolve_path(path)
     return {"language": _get_language(full_path)}

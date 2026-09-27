@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Sparkles, ArrowUpCircle, Bug } from 'lucide-react'
 import Modal, { ModalBody, ModalFooter } from './common/Modal'
-import { CHANGELOG, releasesSince, type Release, type ChangeKind } from '../lib/changelog'
+import { userFacingReleases, releasesSince, type Release, type ChangeKind } from '../lib/changelog'
 
 const SEEN_KEY = 'pg:whatsNewSeen'
 
@@ -76,7 +76,9 @@ export function WhatsNewModal({ version }: WhatsNewModalProps) {
 
   useEffect(() => {
     const onOpen = () => {
-      setReleases(CHANGELOG)
+      // The full history as a reader would want it: releases with nothing in
+      // them for a user are recorded in CHANGELOG.md, not shown here.
+      setReleases(userFacingReleases())
       setOpen(true)
     }
     window.addEventListener(OPEN_WHATS_NEW, onOpen)

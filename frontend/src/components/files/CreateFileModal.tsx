@@ -1,9 +1,21 @@
 // frontend/src/components/files/CreateFileModal.tsx
-import { useState } from 'react';
+/**
+ * Create a file in a content tree from a template.
+ *
+ * The templates are documentation: for most users the "Training Scenario" one is the only
+ * example of a scenario they will ever see. It used to emit fields the scenario parser does not
+ * read -- duration_hours, time_offset, a required_roles list of mappings -- so a file created
+ * from the product's own template was rejected by the product's own API, and until wave 2 of the
+ * audit one such file took the whole scenario list down with it. The template below is the shape
+ * `services/scenario_filesystem.py` actually reads, and a backend test parses this very string.
+ */
+import { useEffect, useMemo, useState } from 'react';
+import { isAxiosError } from 'axios';
 import { FileCode, Loader2 } from 'lucide-react';
 import clsx from 'clsx';
 import { filesApi } from '../../services/api';
 import { toast } from '../../stores/toastStore';
+import { useFeature } from '../../stores/capabilitiesStore';
 import { Modal, ModalBody, ModalFooter } from '../common/Modal';
 
 interface CreateFileModalProps {
@@ -21,6 +33,61 @@ interface FileTemplate {
   defaultName: string;
   content: string;
 }
+
+/** The one template the scenario tree exists for; named so it can be put first there. */
+const SCENARIO_TEMPLATE_LABEL = 'Training Scenario';
+
+// SCENARIO_TEMPLATE_START -- backend/tests/unit/test_scenario_template.py reads the string
+// between these markers and parses it. Keep the markers.
+const SCENARIO_TEMPLATE = `# A training scenario: a timeline of injects, each addressed to a role.
+# Roles are bound to the range's machines at the moment the scenario is applied,
+# so a scenario is written once and reused by any range that can fill its roles.
+
+seed_id: new-scenario
+name: New Training Scenario
+description: What this scenario trains, and what the learner is expected to do.
+
+category: blue-team        # red-team | blue-team | insider-threat
+difficulty: intermediate   # beginner | intermediate | advanced
+duration_minutes: 120
+
+# Role names, as plain text. Every target_role below must appear in this list.
+required_roles:
+  - defender
+  - target
+
+# Each event becomes one inject. sequence orders them; delay_minutes is the
+# offset from the start of the exercise. An event with no actions is a timed
+# instruction the exercise controller reads out and marks off.
+events:
+  - sequence: 1
+    delay_minutes: 0
+    title: Suspicious authentication burst
+    description: >-
+      Failed logons against the target climb sharply. The defender is expected
+      to identify the source and say how they would contain it.
+    target_role: defender
+    actions: []
+
+  - sequence: 2
+    delay_minutes: 30
+    title: Service account used out of hours
+    description: >-
+      A service account authenticates outside its normal window. The defender
+      reports whether this is related to the earlier burst.
+    target_role: defender
+    actions: []
+
+  - sequence: 3
+    delay_minutes: 75
+    title: Data staged for exfiltration
+    description: >-
+      An archive appears in a temporary directory on the target. The exercise
+      ends when the defender has reported it and proposed a containment step.
+    target_role: target
+    actions: []
+`;
+// SCENARIO_TEMPLATE_END
 
 const FILE_TEMPLATES: FileTemplate[] = [
   {
@@ -91,33 +158,9 @@ items:
   },
   {
     type: 'yaml',
-    label: 'Training Scenario',
+    label: SCENARIO_TEMPLATE_LABEL,
     defaultName: 'scenario.yaml',
-    content: `id: new-scenario
-name: "New Training Scenario"
-description: "Brief description of this scenario"
-category: red-team  # red-team, blue-team, purple-team, insider-threat
-difficulty: intermediate  # beginner, intermediate, advanced, expert
-duration_hours: 4
-
-objectives:
-  - "Primary learning objective"
-  - "Secondary learning objective"
-
-required_roles:
-  - role: attacker
-    description: "Kali Linux attack platform"
-  - role: target
-    description: "Target system to compromise"
-
-events:
-  - id: event-1
-    time_offset: "00:00:00"
-    type: INJECT
-    title: "Initial Access"
-    description: "Begin the attack scenario"
-    target_role: attacker
-`,
+    content: SCENARIO_TEMPLATE,
   },
   {
     type: 'json',
@@ -173,19 +216,65 @@ MIT
   },
 ];
 
+/** Whatever the server said went wrong, or a fallback that at least names the operation. */
+function reason(err: unknown, fallback: string): string {
+  if (isAxiosError(err)) {
+    const detail = err.response?.data?.detail;
+    if (typeof detail === 'string' && detail) return detail;
+    if (Array.isArray(detail)) {
+      const messages = detail
+        .map((d) => (d && typeof d === 'object' && typeof d.msg === 'string' ? d.msg : null))
+        .filter((m): m is string => m !== null);
+      if (messages.length) return messages.join('; ');
+    }
+    if (!err.response) return `${fallback} — no answer from the server`;
+  }
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+}
+
 export function CreateFileModal({
   isOpen,
   basePath,
   onClose,
   onCreated,
 }: CreateFileModalProps) {
-  const [selectedTemplate, setSelectedTemplate] = useState<FileTemplate>(FILE_TEMPLATES[0]);
-  const [fileName, setFileName] = useState(FILE_TEMPLATES[0].defaultName);
+  // The image trees, and the build that reads a Dockerfile out of one, are Era A. On a
+  // Kubernetes install nothing in the product builds an image, so offering the template here
+  // would be offering a file with nowhere to go.
+  const buildsImages = useFeature('image_cache');
+  const inScenarioTree = basePath.split('/')[0] === 'scenarios';
+
+  const templates = useMemo(() => {
+    const visible = FILE_TEMPLATES.filter((t) => t.type !== 'dockerfile' || buildsImages);
+    if (!inScenarioTree) return visible;
+    // In the scenario tree the scenario template is the one a user came for.
+    return [
+      ...visible.filter((t) => t.label === SCENARIO_TEMPLATE_LABEL),
+      ...visible.filter((t) => t.label !== SCENARIO_TEMPLATE_LABEL),
+    ];
+  }, [buildsImages, inScenarioTree]);
+
+  const [selectedLabel, setSelectedLabel] = useState(templates[0].label);
+  const [fileName, setFileName] = useState(templates[0].defaultName);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The modal stays mounted between openings, and the list it selects from can change under it
+  // when the install's capabilities arrive. Starting each opening from the first visible
+  // template keeps the selected template and the suggested file name describing each other.
+  useEffect(() => {
+    if (!isOpen) return;
+    setSelectedLabel(templates[0].label);
+    setFileName(templates[0].defaultName);
+    setError(null);
+  }, [isOpen, templates]);
+
+  const selectedTemplate =
+    templates.find((t) => t.label === selectedLabel) ?? templates[0];
+
   const handleTemplateSelect = (template: FileTemplate) => {
-    setSelectedTemplate(template);
+    setSelectedLabel(template.label);
     setFileName(template.defaultName);
     setError(null);
   };
@@ -210,8 +299,8 @@ export function CreateFileModal({
       await filesApi.createFile(fullPath, selectedTemplate.content);
       toast.success(`Created ${fileName}`);
       onCreated(fullPath);
-    } catch (err: any) {
-      const detail = err.response?.data?.detail || 'Failed to create file';
+    } catch (err: unknown) {
+      const detail = reason(err, 'Failed to create file');
       setError(detail);
       toast.error(detail);
     } finally {
@@ -234,13 +323,13 @@ export function CreateFileModal({
             File Template
           </label>
           <div className="grid grid-cols-2 gap-2">
-            {FILE_TEMPLATES.map((template, i) => (
+            {templates.map((template) => (
               <button
-                key={i}
+                key={template.label}
                 onClick={() => handleTemplateSelect(template)}
                 className={clsx(
                   'flex items-center px-3 py-2 text-sm rounded-lg border transition-colors text-left',
-                  selectedTemplate === template
+                  selectedTemplate.label === template.label
                     ? 'border-primary-500 bg-primary-50 text-primary-700'
                     : 'border-gray-200 hover:bg-gray-50 text-gray-700'
                 )}

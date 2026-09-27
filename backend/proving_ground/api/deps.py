@@ -2,10 +2,10 @@
 from typing import Annotated, List, Optional
 from uuid import UUID
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import or_
+from sqlalchemy import or_, and_, select
 
 from proving_ground.database import get_db
 from proving_ground.models.user import User, UserRole
@@ -201,6 +201,13 @@ def filter_by_visibility(query, resource_type: str, current_user: User, db: Sess
             return query.filter(model_class.id == None)
         return query.filter(model_class.id.in_(accessible_ids))
 
+    # Ranges carry an explicit visibility. Everything below this is the older
+    # tag model, which is still right for templates and artifacts but was never
+    # right for ranges: it treats "has no tags" as "public", so every range
+    # anyone created was visible to every non-student account.
+    if resource_type == "range":
+        return _filter_ranges_by_visibility(query, current_user, db, model_class)
+
     # Tag-based visibility for other users/resources
     user_tags = current_user.tags
 
@@ -231,6 +238,48 @@ def filter_by_visibility(query, resource_type: str, current_user: User, db: Sess
             model_class.id.in_(matching_resource_ids),  # Matching tags
         )
     )
+
+
+def _filter_ranges_by_visibility(query, current_user: User, db: Session, model_class):
+    """Ranges a non-admin, non-student user may see.
+
+    Owned, public, or shared with them -- by name or by a tag they hold. A
+    PRIVATE range belonging to someone else is not in the list at all, which is
+    the point: it should not be visible, not merely unopenable.
+    """
+    from proving_ground.models.range import RangeShare, RangeVisibility
+
+    shared_with_me = (
+        db.query(RangeShare.range_id).filter(RangeShare.user_id == current_user.id).subquery()
+    )
+
+    conditions = [
+        model_class.created_by == current_user.id,
+        model_class.visibility == RangeVisibility.PUBLIC,
+        and_(
+            model_class.visibility == RangeVisibility.SHARED,
+            model_class.id.in_(select(shared_with_me.c.range_id)),
+        ),
+    ]
+
+    # A tag grants sight only of a SHARED range. Holding a tag must not surface
+    # something its owner marked private.
+    user_tags = current_user.tags
+    if user_tags:
+        tagged = (
+            db.query(ResourceTag.resource_id)
+            .filter(ResourceTag.resource_type == "range", ResourceTag.tag.in_(user_tags))
+            .distinct()
+            .subquery()
+        )
+        conditions.append(
+            and_(
+                model_class.visibility == RangeVisibility.SHARED,
+                model_class.id.in_(select(tagged.c.resource_id)),
+            )
+        )
+
+    return query.filter(or_(*conditions))
 
 
 def check_resource_access(
@@ -266,6 +315,50 @@ def check_resource_access(
             detail="You are not assigned to this lab",
         )
 
+    # Ranges answer to their own visibility, not to "untagged means public".
+    # Without this the list would hide a private range while a direct GET by id
+    # still returned it -- hidden rather than protected.
+    if resource_type == "range":
+        from proving_ground.models.range import Range as _Range, RangeShare, RangeVisibility
+
+        range_obj = db.query(_Range).filter(_Range.id == resource_id).first()
+        if range_obj is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Range not found",
+            )
+
+        if range_obj.visibility == RangeVisibility.PUBLIC:
+            return True
+
+        if range_obj.visibility == RangeVisibility.SHARED:
+            shared = (
+                db.query(RangeShare)
+                .filter(
+                    RangeShare.range_id == resource_id,
+                    RangeShare.user_id == current_user.id,
+                )
+                .first()
+            )
+            if shared:
+                return True
+            tags = [
+                t.tag
+                for t in db.query(ResourceTag.tag)
+                .filter(
+                    ResourceTag.resource_type == "range",
+                    ResourceTag.resource_id == resource_id,
+                )
+                .all()
+            ]
+            if tags and current_user.has_any_tag(*tags):
+                return True
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have access to this range",
+        )
+
     # Check resource tags (for non-student users or non-range resources)
     resource_tags = (
         db.query(ResourceTag.tag)
@@ -289,58 +382,86 @@ def check_resource_access(
     )
 
 
+def check_resource_control(
+    resource_type: str, resource_id: UUID, current_user: User, db: Session, owner_id: UUID = None
+) -> bool:
+    """Check if a user may CHANGE a resource, not merely see it.
+
+    Deliberately stricter than check_resource_access, and the difference is the
+    point of this function existing.
+
+    That one is a visibility model: it grants access to an untagged resource
+    because "no tags = public", and to anyone holding a matching tag. Both are
+    reasonable answers to "may I look at this". Neither is a reasonable answer
+    to "may I tear this down" -- under it, one engineer could delete another
+    engineer's untagged range, and a tag meant to share a range for viewing
+    would also hand over the power to destroy it.
+
+    Control is therefore owner-or-admin. A student never controls a range: an
+    assignment is permission to use a lab, not to delete it.
+
+    Returns True, or raises 403. Never returns False, so a caller cannot get
+    the check wrong by ignoring the result.
+    """
+    if current_user.is_admin:
+        return True
+
+    if owner_id and owner_id == current_user.id:
+        return True
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"You do not own this {resource_type}",
+    )
+
+
+def _load_range(range_id: UUID, db: Session) -> Range:
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Range not found",
+        )
+    return range_obj
+
+
+def check_range_control(range_id: UUID, current_user: User, db: Session) -> Range:
+    """Require control of the range a resource belongs to. Returns the range.
+
+    Networks and VMs have no owner of their own -- they belong to a range, and
+    whoever controls the range controls them. Deleting someone else's network
+    or tearing down their VM is destroying their range a piece at a time, so it
+    answers to the same rule.
+
+    This exists so the check is one line at each of roughly thirty call sites
+    rather than a repeated fetch-then-check that only some of them remember.
+    """
+    range_obj = _load_range(range_id, db)
+    check_resource_control("range", range_obj.id, current_user, db, range_obj.created_by)
+    return range_obj
+
+
+def check_range_access(range_id: UUID, current_user: User, db: Session) -> Range:
+    """Require read access to the range a resource belongs to.
+
+    The visibility half: a student assigned to a lab can see its networks and
+    VMs, and an untagged range stays readable, exactly as for the range itself.
+    """
+    range_obj = _load_range(range_id, db)
+    check_resource_access("range", range_obj.id, current_user, db, range_obj.created_by)
+    return range_obj
+
+
 # Type aliases for common dependencies
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminUser = Annotated[User, Depends(require_admin())]
 DBSession = Annotated[Session, Depends(get_db)]
 
 
-def get_current_user_from_token_param(
-    request: Request,
-    token: str = None,
-    db: Session = Depends(get_db),
-) -> User:
-    """
-    Extract and validate user from JWT token passed as query parameter OR Authorization header.
-    Used for browser download endpoints where headers can't be set.
-    Falls back to Authorization header for AJAX requests.
-    """
-    # First try query parameter
-    if not token:
-        # Fall back to Authorization header
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header[7:]  # Remove "Bearer " prefix
-
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token required (pass as ?token= query param or Authorization header)",
-        )
-
-    user_id = decode_access_token(token)
-
-    if user_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-        )
-
-    user = db.query(User).options(joinedload(User.attributes)).filter(User.id == user_id).first()
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-        )
-
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is deactivated",
-        )
-
-    return user
-
-
-# For download endpoints that need browser-native downloads
-DownloadUser = Annotated[User, Depends(get_current_user_from_token_param)]
+# Download endpoints used to take the session token in a query string, so a browser could be
+# navigated straight at them. Nothing does that: every caller goes through the app's axios
+# instance, which sets `Authorization: Bearer` on the way out. What the query parameter bought
+# was a full API credential in browser history and in every access log between the browser and
+# here -- the same defect the websocket ticket exists to close, through a different door. A
+# download that genuinely cannot set a header wants a ticket like the console's, not the session.
+DownloadUser = Annotated[User, Depends(get_current_user)]

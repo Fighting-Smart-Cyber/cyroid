@@ -3,8 +3,10 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy.orm import Session
 
-from proving_ground.api.deps import DBSession, CurrentUser
-from proving_ground.models import Range, RangeInstance
+from proving_ground.api import kubernetes_ranges
+from proving_ground.api.deps import DBSession, CurrentUser, check_resource_control
+from proving_ground.capability.blueprint import read_blueprint
+from proving_ground.models import Range, RangeInstance, RangeStatus
 from proving_ground.schemas.blueprint import InstanceResponse, BlueprintConfig
 from proving_ground.services.blueprint_service import create_range_from_blueprint
 from proving_ground.tasks.deployment import deploy_range_task, teardown_range_task
@@ -30,7 +32,17 @@ def reset_instance(instance_id: UUID, db: DBSession, current_user: CurrentUser):
         raise HTTPException(status_code=404, detail="Instance not found")
 
     blueprint = instance.blueprint
-    range_obj = instance.range
+    range_obj = _range_under_control(instance, db, current_user)
+
+    if kubernetes_ranges.is_kubernetes():
+        # Era B: the range's contents are its namespace, not Network and VM rows, so a reset is
+        # a destroy and a fresh deploy of the same blueprint. The destroy is synchronous because
+        # a redeploy landing on top of what is still coming down is how a namespace ends up half
+        # of each.
+        kubernetes_ranges.teardown_on_kubernetes(db, range_obj)
+        deploy_range_task.send(str(range_obj.id))
+        db.refresh(instance)
+        return _instance_to_response(instance, db)
 
     # Teardown current range resources (async task)
     teardown_range_task.send(str(range_obj.id))
@@ -66,7 +78,17 @@ def redeploy_instance(instance_id: UUID, db: DBSession, current_user: CurrentUse
         raise HTTPException(status_code=404, detail="Instance not found")
 
     blueprint = instance.blueprint
-    range_obj = instance.range
+    range_obj = _range_under_control(instance, db, current_user)
+
+    if kubernetes_ranges.is_kubernetes():
+        # Era B: as in reset, but the instance moves to the blueprint's current version, which
+        # is what the next deploy will read anyway.
+        kubernetes_ranges.teardown_on_kubernetes(db, range_obj)
+        instance.blueprint_version = blueprint.version
+        db.commit()
+        deploy_range_task.send(str(range_obj.id))
+        db.refresh(instance)
+        return _instance_to_response(instance, db)
 
     # Teardown first (sync for now to ensure cleanup before recreate)
     teardown_range_task.send(str(range_obj.id))
@@ -107,21 +129,35 @@ def clone_instance(instance_id: UUID, db: DBSession, current_user: CurrentUser):
         raise HTTPException(status_code=404, detail="Instance not found")
 
     blueprint = instance.blueprint
-    config = BlueprintConfig.model_validate(blueprint.config)
+    _range_under_control(instance, db, current_user)
 
     # Get next offset
     offset = blueprint.next_offset
     blueprint.next_offset += 1
 
-    # Create new range
-    new_range = create_range_from_blueprint(
-        db=db,
-        config=config,
-        range_name=f"{instance.name} (Clone)",
-        base_prefix=blueprint.base_subnet_prefix,
-        offset=offset,
-        created_by=current_user.id,
-    )
+    if read_blueprint(blueprint.config).deployable_on_kubernetes:
+        # Era B: networks and workloads are realised on the cluster from the config at deploy
+        # time, so the range row is the clone's handle and nothing more.
+        new_range = Range(
+            name=f"{instance.name} (Clone)",
+            description=f"Instance of blueprint '{blueprint.name}' (Kubernetes substrate)",
+            created_by=current_user.id,
+            status=RangeStatus.DRAFT,
+        )
+        db.add(new_range)
+        db.flush()
+    else:
+        config = BlueprintConfig.model_validate(blueprint.config)
+
+        # Create new range
+        new_range = create_range_from_blueprint(
+            db=db,
+            config=config,
+            range_name=f"{instance.name} (Clone)",
+            base_prefix=blueprint.base_subnet_prefix,
+            offset=offset,
+            created_by=current_user.id,
+        )
 
     # Create new instance record
     new_instance = RangeInstance(
@@ -147,9 +183,22 @@ def delete_instance(instance_id: UUID, db: DBSession, current_user: CurrentUser)
         raise HTTPException(status_code=404, detail="Instance not found")
 
     range_obj = instance.range
+    if range_obj is None:
+        check_resource_control("instance", instance.id, current_user, db, instance.instructor_id)
+        db.delete(instance)
+        db.commit()
+        return
 
-    # Teardown range resources (async task)
-    teardown_range_task.send(str(range_obj.id))
+    check_resource_control("range", range_obj.id, current_user, db, range_obj.created_by)
+
+    if kubernetes_ranges.is_kubernetes():
+        # Destroy before the rows go, and only keep going if it came down clean. Placement is
+        # re-derived from the range row, so a worker handed the id after the row is gone has
+        # nothing left to name the namespace with and it is orphaned for good.
+        kubernetes_ranges.delete_on_kubernetes(db, range_obj)
+    else:
+        # Teardown range resources (async task)
+        teardown_range_task.send(str(range_obj.id))
 
     # Delete range (cascades to VMs, networks)
     db.delete(range_obj)
@@ -160,6 +209,19 @@ def delete_instance(instance_id: UUID, db: DBSession, current_user: CurrentUser)
 
 
 # ============ Helper Functions ============
+
+
+def _range_under_control(instance: RangeInstance, db: Session, current_user) -> Range:
+    """The instance's range, once the caller has been shown to control it.
+
+    Every route here destroys the range and rebuilds it, so control is the rule and not
+    visibility: an assignment is permission to use a lab, not to reset someone else's.
+    """
+    range_obj = instance.range
+    if range_obj is None:
+        raise HTTPException(status_code=404, detail="Instance has no range")
+    check_resource_control("range", range_obj.id, current_user, db, range_obj.created_by)
+    return range_obj
 
 
 def _recreate_range_contents(

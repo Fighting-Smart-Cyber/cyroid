@@ -19,7 +19,7 @@ container, providing complete network namespace isolation. This eliminates
 IP conflicts between concurrent range instances using identical blueprint IPs.
 """
 import docker
-from docker.errors import APIError, NotFound, ImageNotFound
+from docker.errors import APIError, NotFound, ImageNotFound, DockerException
 from typing import Optional, Dict, List, Any, Callable, TYPE_CHECKING
 import logging
 import ipaddress
@@ -34,6 +34,13 @@ if TYPE_CHECKING:
     from proving_ground.services.dind_service import DinDService
 
 logger = logging.getLogger(__name__)
+
+# The root of the Docker SDK's exception tree, named here so the HTTP layer can
+# turn "this install has no daemon" into a legible refusal without importing the
+# SDK into a module that holds no client -- CLAUDE.md rule 1, and the app factory
+# has no business holding one. Everything the SDK raises descends from this,
+# including APIError, so one handler registered against it covers the tree.
+DOCKER_SDK_ERROR: type[Exception] = DockerException
 
 # A Windows disk is mostly holes: 64 GiB apparent, ~9 GiB allocated. Neither
 # tar nor shutil.copy2 knows that -- Docker's archive endpoint reads holes as
@@ -237,13 +244,19 @@ class DockerService:
         return result
 
     def _verify_connection(self) -> None:
-        """Verify connection to Docker daemon."""
+        """Verify connection to Docker daemon.
+
+        Raises the SDK's own exception rather than a RuntimeError so that a host
+        whose socket answers but whose daemon does not ping lands in the same
+        app-level refusal as a host with no socket at all. A RuntimeError here
+        reached the browser as a bare 500 with nothing in the body.
+        """
         try:
             self.client.ping()
             logger.info("Connected to Docker daemon")
         except Exception as e:
             logger.error(f"Failed to connect to Docker daemon: {e}")
-            raise RuntimeError("Cannot connect to Docker daemon") from e
+            raise DockerException("Cannot connect to Docker daemon") from e
 
     # Network Operations
 

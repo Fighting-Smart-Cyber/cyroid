@@ -1,5 +1,5 @@
 // frontend/src/pages/Admin.tsx
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { adminApi, usersApi, type CleanupResult, type CleanupMode, type DockerStatusResponse, type User, type RoleInfo, type UserAttribute, type AdminCreateUser } from '../services/api'
 import { useAuthStore } from '../stores/authStore'
 import {
@@ -25,21 +25,259 @@ import {
   Monitor,
   Store
 } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import clsx from 'clsx'
 import { InfrastructureTab, CatalogSourcesTab, RegistryTab } from '../components/admin'
+import { useFeature, useSubstrate } from '../stores/capabilitiesStore'
 import { BRANDING } from '../lib/branding'
+import { apiErrorDetail } from '../lib/apiError'
+import { generatePassword } from '../lib/generatedPassword'
+import { nextTabIndex, tabId, tabPanelId } from '../lib/tabs'
 
-type TabType = 'system' | 'users' | 'infrastructure' | 'catalog' | 'registry'
+export type TabType = 'system' | 'users' | 'infrastructure' | 'catalog' | 'registry'
+
+const TAB_LABELS: Record<TabType, string> = {
+  system: 'System',
+  users: 'Users',
+  infrastructure: 'Infrastructure',
+  catalog: 'Catalog',
+  registry: 'Registry',
+}
+
+const TAB_ICONS: Record<TabType, LucideIcon> = {
+  system: Activity,
+  users: Users,
+  infrastructure: Monitor,
+  catalog: Store,
+  registry: Container,
+}
+
+/**
+ * A range the cleanup could not tear down, as POST /admin/cleanup-all reports it. Its row is
+ * deliberately kept: the range record is the only thing that still names the namespace, so
+ * dropping it after an unproven teardown strands everything inside it for good.
+ */
+export interface RangeTeardownFailure {
+  range_id: string
+  range_name: string
+  reason: string
+}
+
+/**
+ * The cleanup response with the fields the Kubernetes path adds. Both are optional here because
+ * an install running an API older than the Kubernetes teardown answers without them.
+ */
+export type SubstrateCleanupResult = CleanupResult & {
+  namespaces_removed?: number
+  residue?: RangeTeardownFailure[]
+}
+
+/**
+ * The tabs this install can actually serve. A tab whose every surface can only reach a Docker
+ * daemon is not rendered at all rather than rendered disabled: a disabled control still invites
+ * the click, and the click lands on an endpoint that answers 500 with no body to explain itself.
+ *
+ * Infrastructure is deliberately not one of those. Its name says Docker but its contents do not:
+ * the platform update resolves a chart version in the cluster on the Kubernetes path, and the
+ * resource metrics read the host, the database and the task queue on either substrate. Its
+ * Docker-only panels name the substrate in place. Hiding the tab would take the only in-product
+ * way to update the platform away from exactly the operator it was built for, one with a browser
+ * and no shell.
+ */
+export function visibleAdminTabs(features: { dockerRegistry: boolean }): TabType[] {
+  const tabs: TabType[] = ['system', 'users', 'infrastructure', 'catalog']
+  if (features.dockerRegistry) tabs.push('registry')
+  return tabs
+}
+
+/**
+ * The tab to render. Capabilities arrive after the first paint, so the selected tab can be
+ * gated away under the user; falling back to the first surviving tab keeps the page from
+ * rendering an empty panel.
+ */
+export function selectedAdminTab(active: TabType, visible: TabType[]): TabType {
+  return visible.includes(active) ? active : (visible[0] ?? 'users')
+}
+
+/** What the cleanup left behind, tolerating a response that does not carry the field at all. */
+export function cleanupResidue(result: SubstrateCleanupResult | null): RangeTeardownFailure[] {
+  if (!result || !Array.isArray(result.residue)) return []
+  return result.residue
+}
+
+/**
+ * The errors the residue list does not already tell. A range the cluster would not release is
+ * reported twice, once as residue and once as an error, and printing both makes a destructive
+ * report read as twice the trouble it is.
+ *
+ * A blank reason is not matched against. The endpoint builds a reason out of str(exception), and
+ * an exception raised with no message yields the empty string, which every error ends with --
+ * suppressing the whole list, including the ones that have nothing to do with a range.
+ */
+export function otherCleanupErrors(result: SubstrateCleanupResult | null): string[] {
+  const reasons = cleanupResidue(result)
+    .map((r) => r.reason)
+    .filter((reason) => reason.trim() !== '')
+  return (result?.errors ?? []).filter((error) => !reasons.some((r) => error.endsWith(r)))
+}
+
+/**
+ * Why a range was left behind, for a reason built from an exception that carried no message.
+ * The range name alone reads as a truncated sentence, and an operator cannot tell it apart from
+ * a render that dropped the rest.
+ */
+export function residueReason(failure: RangeTeardownFailure): string {
+  return failure.reason.trim() === '' ? 'the teardown failed without reporting a reason' : failure.reason
+}
+
+function plural(count: number, one: string, many: string): string {
+  return count === 1 ? one : many
+}
+
+/**
+ * Whether the cleanup actually did what it was asked. Residue means ranges are still running in
+ * the cluster with their rows kept; that is a failure, and reporting it as a green success is
+ * how orphaned compute goes unnoticed until somebody runs kubectl.
+ */
+export function cleanupOutcome(
+  result: SubstrateCleanupResult,
+  mode: CleanupMode
+): { ok: boolean; message: string } {
+  const action = mode === 'purge_ranges' ? 'Purge' : 'Reset'
+  const residue = cleanupResidue(result)
+  if (residue.length > 0) {
+    const named = residue.map((r) => r.range_name).join(', ')
+    return {
+      ok: false,
+      message:
+        `${action} incomplete: ${residue.length} ${plural(residue.length, 'range', 'ranges')} ` +
+        `could not be torn down and ${plural(residue.length, 'was', 'were')} kept: ${named}. ` +
+        `They are still running and still consuming resources.`,
+    }
+  }
+  const errors = result.errors ?? []
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      message: `${action} finished with ${errors.length} ${plural(errors.length, 'error', 'errors')}. See the results below.`,
+    }
+  }
+  const count = result.ranges_cleaned
+  return {
+    ok: true,
+    message:
+      mode === 'purge_ranges'
+        ? `Purged ${count} ${plural(count, 'range', 'ranges')}.`
+        : `Reset ${count} ${plural(count, 'range', 'ranges')} to draft.`,
+  }
+}
+
+/**
+ * What each mode destroys, in the terms of the substrate the install actually runs on. On
+ * Kubernetes a range is a namespace holding virtual machines and their disks; telling an
+ * operator they are about to stop container-in-container ranges describes a machine they do
+ * not have, and they cannot judge what they are about to lose.
+ */
+export function cleanupModeCopy(
+  mode: CleanupMode,
+  isKubernetes: boolean
+): { title: string; subtitle: string; summary: string; bullets: string[]; preserved: string } {
+  if (mode === 'purge_ranges') {
+    return isKubernetes
+      ? {
+          title: 'Purge All Ranges',
+          subtitle: 'This will permanently delete every range namespace and all range data.',
+          summary:
+            'Delete every range namespace, including the virtual machines and their disks, and delete all ranges from the database.',
+          bullets: [
+            'Delete every range namespace, and the virtual machines and disks inside it',
+            'Delete all ranges from the database',
+            'Delete the deployment records that go with them',
+          ],
+          preserved: 'Blueprints, content, and images are preserved.',
+        }
+      : {
+          title: 'Purge All Ranges',
+          subtitle: 'This will permanently delete all range data.',
+          summary:
+            'Stop all DinD containers AND delete all ranges from the database. Templates, ISOs, and storage are preserved.',
+          bullets: [
+            'Stop and remove all DinD range containers',
+            'Delete all ranges from the database',
+            'Delete all VMs and networks from the database',
+          ],
+          preserved: 'Templates, ISOs, blueprints, and storage will be preserved.',
+        }
+  }
+  return isKubernetes
+    ? {
+        title: 'Reset to Draft',
+        subtitle:
+          'This will destroy every deployed range namespace, with the virtual machines and disks inside it.',
+        summary:
+          'Delete every range namespace, including the virtual machines and their disks, and return the ranges to draft. The range definitions stay and can be deployed again.',
+        bullets: [
+          'Delete every range namespace, and the virtual machines and disks inside it',
+          'Reset all ranges to draft state',
+          'Clear where each range was deployed',
+        ],
+        preserved: 'Range definitions will be preserved and can be redeployed.',
+      }
+    : {
+        title: 'Reset to Draft',
+        subtitle: 'This will stop all running ranges.',
+        summary:
+          'Stop all DinD containers and reset ranges to draft state. Range definitions, VMs, and networks are preserved in the database and can be redeployed.',
+        bullets: [
+          'Stop and remove all DinD range containers',
+          'Reset all ranges to draft state',
+          'Clear deployment info (container IDs, IPs)',
+        ],
+        preserved: 'Range definitions will be preserved and can be redeployed.',
+      }
+}
+
+/** The counters worth showing for the substrate that produced them. */
+export function cleanupCounters(
+  result: SubstrateCleanupResult,
+  isKubernetes: boolean
+): { label: string; value: number }[] {
+  if (isKubernetes) {
+    const counters = [{ label: 'Ranges', value: result.ranges_cleaned }]
+    if (typeof result.namespaces_removed === 'number') {
+      counters.push({ label: 'Namespaces removed', value: result.namespaces_removed })
+    }
+    counters.push({ label: 'DB updated', value: result.database_records_updated })
+    counters.push({ label: 'DB deleted', value: result.database_records_deleted })
+    return counters
+  }
+  return [
+    { label: 'Ranges', value: result.ranges_cleaned },
+    { label: 'DinD containers', value: result.dind_containers_removed },
+    { label: 'Legacy containers', value: result.containers_removed },
+    { label: 'Networks', value: result.networks_removed },
+    { label: 'DB updated', value: result.database_records_updated },
+    { label: 'DB deleted', value: result.database_records_deleted },
+    { label: 'Orphaned', value: result.orphaned_resources_cleaned },
+  ]
+}
 
 export default function Admin() {
   const { user: currentUser } = useAuthStore()
   const [activeTab, setActiveTab] = useState<TabType>('system')
+  // Arrow keys move the selection between tabs, and the tab they move to has to take focus with
+  // it -- a roving tabindex leaves the old tab unreachable by Tab, so focus left behind on it
+  // would strand a keyboard user outside the tab bar they were just using.
+  const tabRefs = useRef<Partial<Record<TabType, HTMLButtonElement | null>>>({})
+  const hasDockerStatus = useFeature('docker_status')
+  const hasDockerRegistry = useFeature('docker_registry')
+  const { label: substrateLabel, isKubernetes } = useSubstrate()
 
   // System tab state
   const [dockerStatus, setDockerStatus] = useState<DockerStatusResponse | null>(null)
   const [dockerLoading, setDockerLoading] = useState(false)
   const [cleanupLoading, setCleanupLoading] = useState(false)
-  const [cleanupResult, setCleanupResult] = useState<CleanupResult | null>(null)
+  const [cleanupResult, setCleanupResult] = useState<SubstrateCleanupResult | null>(null)
   const [showCleanupConfirm, setShowCleanupConfirm] = useState(false)
   const [cleanupMode, setCleanupMode] = useState<CleanupMode>('reset_to_draft')
 
@@ -73,12 +311,20 @@ export default function Admin() {
 
   const isAdmin = currentUser?.roles?.includes('admin') ?? false
 
+  // Docker status is fetched only where there is a daemon to answer: on Kubernetes that endpoint
+  // raises, and the failure lands in the page-wide error banner over an Admin page that is
+  // otherwise working. The flag is a dependency because it arrives after the first render.
   useEffect(() => {
     if (isAdmin) {
-      fetchDockerStatus()
       fetchUsersData()
     }
   }, [isAdmin])
+
+  useEffect(() => {
+    if (isAdmin && hasDockerStatus) {
+      fetchDockerStatus()
+    }
+  }, [isAdmin, hasDockerStatus])
 
   // System functions
   const fetchDockerStatus = async () => {
@@ -86,8 +332,8 @@ export default function Admin() {
       setDockerLoading(true)
       const res = await adminApi.getDockerStatus()
       setDockerStatus(res.data)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load Docker status')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'Docker status could not be read. The daemon may not be reachable from the API container.'))
     } finally {
       setDockerLoading(false)
     }
@@ -97,14 +343,24 @@ export default function Admin() {
     try {
       setCleanupLoading(true)
       setCleanupResult(null)
+      setError(null)
+      setSuccessMessage(null)
       const res = await adminApi.cleanupAll({ mode: cleanupMode })
-      setCleanupResult(res.data)
+      const result = res.data as SubstrateCleanupResult
+      setCleanupResult(result)
       setShowCleanupConfirm(false)
-      setSuccessMessage(`Cleanup completed successfully (${cleanupMode === 'reset_to_draft' ? 'reset to draft' : 'purged'})`)
-      // Refresh Docker status
-      fetchDockerStatus()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Cleanup failed')
+      // A cleanup that left ranges running is not a success, however many rows it touched.
+      const outcome = cleanupOutcome(result, cleanupMode)
+      if (outcome.ok) {
+        setSuccessMessage(outcome.message)
+      } else {
+        setError(outcome.message)
+      }
+      if (hasDockerStatus) {
+        fetchDockerStatus()
+      }
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The cleanup could not be completed. Check the ranges list before running it again.'))
     } finally {
       setCleanupLoading(false)
     }
@@ -124,8 +380,8 @@ export default function Admin() {
       setPendingUsers(pendingRes.data)
       setRoles(rolesRes.data)
       setAllTags(tagsRes.data)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load users')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The user list could not be loaded.'))
     } finally {
       setUsersLoading(false)
     }
@@ -137,8 +393,8 @@ export default function Admin() {
       const res = await usersApi.getAttributes(userId)
       setUserAttributes(res.data)
       setEditingUserId(userId)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load user attributes')
+    } catch (err) {
+      setError(apiErrorDetail(err, "This user's roles and tags could not be loaded."))
     } finally {
       setAttributeLoading(false)
     }
@@ -154,8 +410,8 @@ export default function Admin() {
       ])
       setUsers(usersRes.data.filter(u => u.is_approved))
       setUserAttributes(attrsRes.data)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to add role')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The role could not be added.'))
     } finally {
       setAttributeLoading(false)
     }
@@ -171,8 +427,8 @@ export default function Admin() {
       ])
       setUsers(usersRes.data.filter(u => u.is_approved))
       setUserAttributes(attrsRes.data)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to remove attribute')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'That role or tag could not be removed.'))
     } finally {
       setAttributeLoading(false)
     }
@@ -192,8 +448,8 @@ export default function Admin() {
       setUsers(usersRes.data.filter(u => u.is_approved))
       setUserAttributes(attrsRes.data)
       setAllTags(tagsRes.data)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to add tag')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The tag could not be added.'))
     } finally {
       setAttributeLoading(false)
     }
@@ -203,8 +459,8 @@ export default function Admin() {
     try {
       await usersApi.update(userId, { is_active: isActive })
       setUsers(users.map(u => u.id === userId ? { ...u, is_active: isActive } : u))
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to update user status')
+    } catch (err) {
+      setError(apiErrorDetail(err, "The user's status could not be changed."))
     }
   }
 
@@ -213,8 +469,8 @@ export default function Admin() {
       await usersApi.delete(userId)
       setUsers(users.filter(u => u.id !== userId))
       setDeleteConfirmId(null)
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to delete user')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The user could not be deleted.'))
     }
   }
 
@@ -223,8 +479,8 @@ export default function Admin() {
       await usersApi.approve(userId)
       setSuccessMessage('User approved successfully')
       fetchUsersData()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to approve user')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The registration could not be approved.'))
     }
   }
 
@@ -233,8 +489,8 @@ export default function Admin() {
       await usersApi.deny(userId)
       setSuccessMessage('User registration denied')
       setPendingUsers(pendingUsers.filter(u => u.id !== userId))
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to deny user')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The registration could not be denied.'))
     }
   }
 
@@ -243,8 +499,8 @@ export default function Admin() {
       await usersApi.resetPassword(userId)
       setSuccessMessage('Password reset flag set. User will be prompted to change password on next login.')
       fetchUsersData()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to reset password')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The password reset could not be requested.'))
     }
   }
 
@@ -263,20 +519,27 @@ export default function Admin() {
         is_approved: true
       })
       fetchUsersData()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to create user')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The user could not be created.'))
     } finally {
       setCreateLoading(false)
     }
   }
 
   const generateRandomPassword = () => {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*'
-    let password = ''
-    for (let i = 0; i < 16; i++) {
-      password += chars.charAt(Math.floor(Math.random() * chars.length))
+    // The generator lives in lib/ so it can be tested: this page cannot be rendered in a test
+    // here, and the property that matters -- that the credential comes from the CSPRNG and is
+    // drawn without bias -- is only checkable on a pure function. See lib/generatedPassword.ts
+    // for why the browser's ordinary, predictable RNG was not adequate for an account password.
+    try {
+      setCreateForm({ ...createForm, password: generatePassword() })
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'No password could be generated safely. Type one into the field instead.'
+      )
     }
-    setCreateForm({ ...createForm, password })
   }
 
   const getRoleBadgeColor = (role: string) => {
@@ -306,6 +569,26 @@ export default function Admin() {
   const userTagAttrs = userAttributes.filter(a => a.attribute_type === 'tag')
   const availableRolesToAdd = roles.filter(r => !userRoleAttrs.some(a => a.attribute_value === r.value))
 
+  const tabs = visibleAdminTabs({ dockerRegistry: hasDockerRegistry })
+  const currentTab = selectedAdminTab(activeTab, tabs)
+
+  // Selection follows focus, which is the tab pattern's default and the behaviour a mouse user
+  // already gets from clicking along the bar. Only the keys the tab bar owns are swallowed;
+  // everything else, Tab included, has to keep working or the bar becomes a trap.
+  const handleTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const target = nextTabIndex(event.key, tabs.indexOf(currentTab), tabs.length)
+    if (target === null) return
+    event.preventDefault()
+    const next = tabs[target]
+    setActiveTab(next)
+    tabRefs.current[next]?.focus()
+  }
+  const resetCopy = cleanupModeCopy('reset_to_draft', isKubernetes)
+  const purgeCopy = cleanupModeCopy('purge_ranges', isKubernetes)
+  const confirmCopy = cleanupMode === 'purge_ranges' ? purgeCopy : resetCopy
+  const cleanupErrors = otherCleanupErrors(cleanupResult)
+  const residue = cleanupResidue(cleanupResult)
+
   return (
     <div>
       <div className="sm:flex sm:items-center">
@@ -320,178 +603,178 @@ export default function Admin() {
         </div>
       </div>
 
-      {/* Error/Success Messages */}
+      {/* Error/Success Messages. Announced, because most of what sets them is a button press
+          somewhere else on the page and a screen-reader user gets no other sign it happened. */}
       {error && (
-        <div className="mt-4 rounded-md bg-red-50 p-4">
+        <div role="alert" className="mt-4 rounded-md bg-red-50 p-4">
           <div className="flex">
-            <X className="h-5 w-5 text-red-400" />
-            <p className="ml-3 text-sm text-red-700">{error}</p>
-            <button onClick={() => setError(null)} className="ml-auto text-red-500 hover:text-red-700">
-              <X className="h-5 w-5" />
+            <X className="h-5 w-5 text-red-400" aria-hidden="true" />
+            <p className="ml-3 text-sm text-red-700 whitespace-pre-line">{error}</p>
+            <button
+              onClick={() => setError(null)}
+              aria-label="Dismiss this error"
+              className="ml-auto text-red-500 hover:text-red-700"
+            >
+              <X className="h-5 w-5" aria-hidden="true" />
             </button>
           </div>
         </div>
       )}
 
       {successMessage && (
-        <div className="mt-4 rounded-md bg-green-50 p-4">
+        <div role="status" className="mt-4 rounded-md bg-green-50 p-4">
           <div className="flex">
-            <Check className="h-5 w-5 text-green-400" />
+            <Check className="h-5 w-5 text-green-400" aria-hidden="true" />
             <p className="ml-3 text-sm text-green-700">{successMessage}</p>
-            <button onClick={() => setSuccessMessage(null)} className="ml-auto text-green-500 hover:text-green-700">
-              <X className="h-5 w-5" />
+            <button
+              onClick={() => setSuccessMessage(null)}
+              aria-label="Dismiss this message"
+              className="ml-auto text-green-500 hover:text-green-700"
+            >
+              <X className="h-5 w-5" aria-hidden="true" />
             </button>
           </div>
         </div>
       )}
 
-      {/* Tabs */}
+      {/* Tabs. A row of buttons in a div is what this was, and a screen reader read it as five
+          unrelated buttons over a region that changed for no stated reason. */}
       <div className="mt-6 border-b border-gray-200">
-        <nav className="-mb-px flex space-x-8">
-          <button
-            onClick={() => setActiveTab('system')}
-            className={clsx(
-              'flex items-center gap-2 py-4 px-1 border-b-2 font-medium text-sm',
-              activeTab === 'system'
-                ? 'border-primary-500 text-primary-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            )}
-          >
-            <Activity className="h-5 w-5" />
-            System
-          </button>
-          <button
-            onClick={() => setActiveTab('users')}
-            className={clsx(
-              'flex items-center gap-2 py-4 px-1 border-b-2 font-medium text-sm',
-              activeTab === 'users'
-                ? 'border-primary-500 text-primary-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            )}
-          >
-            <Users className="h-5 w-5" />
-            Users
-            {pendingUsers.length > 0 && (
-              <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
-                {pendingUsers.length}
-              </span>
-            )}
-          </button>
-          <button
-            onClick={() => setActiveTab('infrastructure')}
-            className={clsx(
-              'flex items-center gap-2 py-4 px-1 border-b-2 font-medium text-sm',
-              activeTab === 'infrastructure'
-                ? 'border-primary-500 text-primary-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            )}
-          >
-            <Monitor className="h-5 w-5" />
-            Infrastructure
-          </button>
-          <button
-            onClick={() => setActiveTab('catalog')}
-            className={clsx(
-              'flex items-center gap-2 py-4 px-1 border-b-2 font-medium text-sm',
-              activeTab === 'catalog'
-                ? 'border-primary-500 text-primary-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            )}
-          >
-            <Store className="h-5 w-5" />
-            Catalog
-          </button>
-          <button
-            onClick={() => setActiveTab('registry')}
-            className={clsx(
-              'flex items-center gap-2 py-4 px-1 border-b-2 font-medium text-sm',
-              activeTab === 'registry'
-                ? 'border-primary-500 text-primary-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            )}
-          >
-            <Container className="h-5 w-5" />
-            Registry
-          </button>
-        </nav>
+        <div role="tablist" aria-label="Administration sections" className="-mb-px flex space-x-8">
+          {tabs.map((tab) => {
+            const Icon = TAB_ICONS[tab]
+            const selected = currentTab === tab
+            return (
+              <button
+                key={tab}
+                id={tabId('admin', tab)}
+                ref={(node) => { tabRefs.current[tab] = node }}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                aria-controls={tabPanelId('admin', tab)}
+                tabIndex={selected ? 0 : -1}
+                onClick={() => setActiveTab(tab)}
+                onKeyDown={handleTabKeyDown}
+                className={clsx(
+                  'flex items-center gap-2 py-4 px-1 border-b-2 font-medium text-sm',
+                  selected
+                    ? 'border-primary-500 text-primary-600'
+                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                )}
+              >
+                <Icon className="h-5 w-5" aria-hidden="true" />
+                {TAB_LABELS[tab]}
+                {tab === 'users' && pendingUsers.length > 0 && (
+                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
+                    {pendingUsers.length}
+                    <span className="sr-only"> awaiting approval</span>
+                  </span>
+                )}
+              </button>
+            )
+          })}
+        </div>
       </div>
 
       {/* Tab Content */}
       <div className="mt-6">
-        {activeTab === 'system' && (
-          <div className="space-y-6">
+        {currentTab === 'system' && (
+          <div
+            id={tabPanelId('admin', 'system')}
+            role="tabpanel"
+            aria-labelledby={tabId('admin', 'system')}
+            className="space-y-6"
+          >
+            {/* Why the Docker surfaces are absent. Without it the missing tab and the missing
+                card read as a broken install rather than as a substrate that never had them.
+                substrateLabel is null until the capabilities answer arrives, which is what keeps
+                this from claiming anything about an install it has not yet asked about. */}
+            {!hasDockerStatus && substrateLabel && (
+              <div className="bg-white shadow rounded-lg px-4 py-3 flex items-center gap-2 text-sm text-gray-600">
+                <Server className="h-4 w-4 text-gray-400" />
+                <span>
+                  This install runs ranges on {substrateLabel}. Docker daemon status and the
+                  image registry are not part of it, and the panels under Infrastructure that
+                  read the daemon say so where they stand.
+                </span>
+              </div>
+            )}
+
             {/* Docker Status */}
-            <div className="bg-white shadow rounded-lg">
-              <div className="px-4 py-5 sm:px-6 border-b border-gray-200">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-lg font-medium text-gray-900 flex items-center gap-2">
-                    <Container className="h-5 w-5" />
-                    Docker Status
-                  </h3>
-                  <button
-                    onClick={fetchDockerStatus}
-                    disabled={dockerLoading}
-                    className="inline-flex items-center px-3 py-1.5 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50"
-                  >
-                    <RefreshCw className={clsx('h-4 w-4 mr-2', dockerLoading && 'animate-spin')} />
-                    Refresh
-                  </button>
+            {hasDockerStatus && (
+              <div className="bg-white shadow rounded-lg">
+                <div className="px-4 py-5 sm:px-6 border-b border-gray-200">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-medium text-gray-900 flex items-center gap-2">
+                      <Container className="h-5 w-5" />
+                      Docker Status
+                    </h3>
+                    <button
+                      onClick={fetchDockerStatus}
+                      disabled={dockerLoading}
+                      className="inline-flex items-center px-3 py-1.5 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      <RefreshCw className={clsx('h-4 w-4 mr-2', dockerLoading && 'animate-spin')} />
+                      Refresh
+                    </button>
+                  </div>
+                </div>
+                <div className="px-4 py-5 sm:p-6">
+                  {dockerLoading && !dockerStatus ? (
+                    <div className="flex items-center justify-center py-8">
+                      <Loader2 className="h-8 w-8 animate-spin text-primary-600" />
+                    </div>
+                  ) : dockerStatus ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      {/* Containers */}
+                      <div>
+                        <h4 className="text-sm font-medium text-gray-700 mb-3 flex items-center gap-2">
+                          <Server className="h-4 w-4" />
+                          {BRANDING.productName} Containers ({dockerStatus.container_count})
+                        </h4>
+                        {dockerStatus.containers.length > 0 ? (
+                          <ul className="space-y-2 max-h-64 overflow-y-auto">
+                            {dockerStatus.containers.map((container, idx) => (
+                              <li key={idx} className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-md text-sm">
+                                <span className="font-mono text-xs truncate">{container.name}</span>
+                                <span className={clsx(
+                                  'px-2 py-0.5 rounded-full text-xs',
+                                  container.status === 'running' ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'
+                                )}>
+                                  {container.status}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="text-sm text-gray-500">No {BRANDING.productName} containers running</p>
+                        )}
+                      </div>
+                      {/* Networks */}
+                      <div>
+                        <h4 className="text-sm font-medium text-gray-700 mb-3 flex items-center gap-2">
+                          <Network className="h-4 w-4" />
+                          {BRANDING.productName} Networks ({dockerStatus.network_count})
+                        </h4>
+                        {dockerStatus.networks.length > 0 ? (
+                          <ul className="space-y-2 max-h-64 overflow-y-auto">
+                            {dockerStatus.networks.map((network, idx) => (
+                              <li key={idx} className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-md text-sm">
+                                <span className="font-mono text-xs truncate">{network.name}</span>
+                                <span className="text-xs text-gray-500">{network.id}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="text-sm text-gray-500">No {BRANDING.productName} networks</p>
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               </div>
-              <div className="px-4 py-5 sm:p-6">
-                {dockerLoading && !dockerStatus ? (
-                  <div className="flex items-center justify-center py-8">
-                    <Loader2 className="h-8 w-8 animate-spin text-primary-600" />
-                  </div>
-                ) : dockerStatus ? (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    {/* Containers */}
-                    <div>
-                      <h4 className="text-sm font-medium text-gray-700 mb-3 flex items-center gap-2">
-                        <Server className="h-4 w-4" />
-                        {BRANDING.productName} Containers ({dockerStatus.container_count})
-                      </h4>
-                      {dockerStatus.containers.length > 0 ? (
-                        <ul className="space-y-2 max-h-64 overflow-y-auto">
-                          {dockerStatus.containers.map((container, idx) => (
-                            <li key={idx} className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-md text-sm">
-                              <span className="font-mono text-xs truncate">{container.name}</span>
-                              <span className={clsx(
-                                'px-2 py-0.5 rounded-full text-xs',
-                                container.status === 'running' ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'
-                              )}>
-                                {container.status}
-                              </span>
-                            </li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <p className="text-sm text-gray-500">No {BRANDING.productName} containers running</p>
-                      )}
-                    </div>
-                    {/* Networks */}
-                    <div>
-                      <h4 className="text-sm font-medium text-gray-700 mb-3 flex items-center gap-2">
-                        <Network className="h-4 w-4" />
-                        {BRANDING.productName} Networks ({dockerStatus.network_count})
-                      </h4>
-                      {dockerStatus.networks.length > 0 ? (
-                        <ul className="space-y-2 max-h-64 overflow-y-auto">
-                          {dockerStatus.networks.map((network, idx) => (
-                            <li key={idx} className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-md text-sm">
-                              <span className="font-mono text-xs truncate">{network.name}</span>
-                              <span className="text-xs text-gray-500">{network.id}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <p className="text-sm text-gray-500">No {BRANDING.productName} networks</p>
-                      )}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </div>
+            )}
 
             {/* Cleanup Section */}
             <div className="bg-white shadow rounded-lg">
@@ -501,7 +784,9 @@ export default function Admin() {
                   System Cleanup
                 </h3>
                 <p className="mt-1 text-sm text-gray-500">
-                  Stop all running ranges and clean up Docker resources.
+                  {isKubernetes
+                    ? 'Tear down every range in the cluster and reclaim what it is holding.'
+                    : 'Stop all running ranges and clean up Docker resources.'}
                 </p>
               </div>
               <div className="px-4 py-5 sm:p-6">
@@ -509,40 +794,37 @@ export default function Admin() {
                   <div className="mb-6 p-4 bg-gray-50 rounded-lg">
                     <h4 className="text-sm font-medium text-gray-900 mb-2">Cleanup Results</h4>
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                      <div>
-                        <span className="text-gray-500">Ranges:</span>
-                        <span className="ml-2 font-medium">{cleanupResult.ranges_cleaned}</span>
-                      </div>
-                      <div>
-                        <span className="text-gray-500">DinD containers:</span>
-                        <span className="ml-2 font-medium">{cleanupResult.dind_containers_removed}</span>
-                      </div>
-                      <div>
-                        <span className="text-gray-500">Legacy containers:</span>
-                        <span className="ml-2 font-medium">{cleanupResult.containers_removed}</span>
-                      </div>
-                      <div>
-                        <span className="text-gray-500">Networks:</span>
-                        <span className="ml-2 font-medium">{cleanupResult.networks_removed}</span>
-                      </div>
-                      <div>
-                        <span className="text-gray-500">DB updated:</span>
-                        <span className="ml-2 font-medium">{cleanupResult.database_records_updated}</span>
-                      </div>
-                      <div>
-                        <span className="text-gray-500">DB deleted:</span>
-                        <span className="ml-2 font-medium">{cleanupResult.database_records_deleted}</span>
-                      </div>
-                      <div>
-                        <span className="text-gray-500">Orphaned:</span>
-                        <span className="ml-2 font-medium">{cleanupResult.orphaned_resources_cleaned}</span>
-                      </div>
+                      {cleanupCounters(cleanupResult, isKubernetes).map((counter) => (
+                        <div key={counter.label}>
+                          <span className="text-gray-500">{counter.label}:</span>
+                          <span className="ml-2 font-medium">{counter.value}</span>
+                        </div>
+                      ))}
                     </div>
-                    {cleanupResult.errors.length > 0 && (
+                    {residue.length > 0 && (
+                      <div className="mt-4">
+                        <h5 className="text-sm font-medium text-red-700">
+                          Left behind ({residue.length}):
+                        </h5>
+                        <ul className="mt-1 text-sm text-red-600 list-disc list-inside">
+                          {residue.map((r) => (
+                            <li key={r.range_id}>
+                              {r.range_name}: {residueReason(r)}
+                            </li>
+                          ))}
+                        </ul>
+                        <p className="mt-2 text-xs text-gray-600">
+                          These ranges are still running. Their records were kept, because the
+                          record is the only thing that can find them again. Run the cleanup
+                          again, or delete them one at a time from the Ranges page.
+                        </p>
+                      </div>
+                    )}
+                    {cleanupErrors.length > 0 && (
                       <div className="mt-4">
                         <h5 className="text-sm font-medium text-red-700">Errors:</h5>
                         <ul className="mt-1 text-sm text-red-600 list-disc list-inside">
-                          {cleanupResult.errors.map((err, idx) => (
+                          {cleanupErrors.map((err, idx) => (
                             <li key={idx}>{err}</li>
                           ))}
                         </ul>
@@ -568,11 +850,8 @@ export default function Admin() {
                         className="mt-1 text-primary-600 focus:ring-primary-500"
                       />
                       <div>
-                        <div className="font-medium text-gray-900">Reset to Draft</div>
-                        <div className="text-sm text-gray-500 mt-1">
-                          Stop all DinD containers and reset ranges to draft state.
-                          Range definitions, VMs, and networks are preserved in the database and can be redeployed.
-                        </div>
+                        <div className="font-medium text-gray-900">{resetCopy.title}</div>
+                        <div className="text-sm text-gray-500 mt-1">{resetCopy.summary}</div>
                       </div>
                     </label>
                     <label className={clsx(
@@ -589,19 +868,22 @@ export default function Admin() {
                         className="mt-1 text-red-600 focus:ring-red-500"
                       />
                       <div>
-                        <div className="font-medium text-red-700">Purge All Ranges</div>
+                        <div className="font-medium text-red-700">{purgeCopy.title}</div>
                         <div className="text-sm text-gray-500 mt-1">
-                          Stop all DinD containers AND delete all ranges from the database.
-                          Templates, ISOs, and storage are preserved. <span className="text-red-600 font-medium">This cannot be undone.</span>
+                          {purgeCopy.summary}{' '}
+                          <span className="text-red-600 font-medium">This cannot be undone.</span>
                         </div>
                       </div>
                     </label>
                   </div>
 
                   <div className="flex items-center gap-4 pt-4">
+                    {/* Held until the substrate is known. The confirmation's whole job is to say
+                        what is about to be destroyed, and before the capabilities answer lands it
+                        would say containers to an operator whose ranges are namespaces. */}
                     <button
                       onClick={() => setShowCleanupConfirm(true)}
-                      disabled={cleanupLoading}
+                      disabled={cleanupLoading || !substrateLabel}
                       className={clsx(
                         "inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white focus:outline-none focus:ring-2 focus:ring-offset-2 disabled:opacity-50",
                         cleanupMode === 'purge_ranges'
@@ -621,6 +903,11 @@ export default function Admin() {
                         </>
                       )}
                     </button>
+                    {!substrateLabel && (
+                      <span className="text-sm text-gray-500">
+                        Waiting to hear what this install runs ranges on.
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -646,11 +933,7 @@ export default function Admin() {
                         <h3 className="text-lg font-medium text-gray-900">
                           {cleanupMode === 'purge_ranges' ? 'Confirm Purge' : 'Confirm Reset'}
                         </h3>
-                        <p className="text-sm text-gray-500">
-                          {cleanupMode === 'purge_ranges'
-                            ? 'This will permanently delete all range data.'
-                            : 'This will stop all running ranges.'}
-                        </p>
+                        <p className="text-sm text-gray-500">{confirmCopy.subtitle}</p>
                       </div>
                     </div>
 
@@ -660,31 +943,21 @@ export default function Admin() {
                         ? "bg-red-50 border-red-200"
                         : "bg-yellow-50 border-yellow-200"
                     )}>
-                      {cleanupMode === 'purge_ranges' ? (
-                        <>
-                          <p className="text-sm text-red-700 font-medium">This will permanently:</p>
-                          <ul className="mt-2 text-sm text-red-700 list-disc list-inside">
-                            <li>Stop and remove all DinD range containers</li>
-                            <li>Delete all ranges from the database</li>
-                            <li>Delete all VMs and networks from the database</li>
-                          </ul>
-                          <p className="mt-3 text-sm text-gray-600">
-                            Templates, ISOs, blueprints, and storage will be preserved.
-                          </p>
-                        </>
-                      ) : (
-                        <>
-                          <p className="text-sm text-yellow-700 font-medium">This will:</p>
-                          <ul className="mt-2 text-sm text-yellow-700 list-disc list-inside">
-                            <li>Stop and remove all DinD range containers</li>
-                            <li>Reset all ranges to draft state</li>
-                            <li>Clear deployment info (container IDs, IPs)</li>
-                          </ul>
-                          <p className="mt-3 text-sm text-gray-600">
-                            Range definitions will be preserved and can be redeployed.
-                          </p>
-                        </>
-                      )}
+                      <p className={clsx(
+                        "text-sm font-medium",
+                        cleanupMode === 'purge_ranges' ? "text-red-700" : "text-yellow-700"
+                      )}>
+                        {cleanupMode === 'purge_ranges' ? 'This will permanently:' : 'This will:'}
+                      </p>
+                      <ul className={clsx(
+                        "mt-2 text-sm list-disc list-inside",
+                        cleanupMode === 'purge_ranges' ? "text-red-700" : "text-yellow-700"
+                      )}>
+                        {confirmCopy.bullets.map((bullet) => (
+                          <li key={bullet}>{bullet}</li>
+                        ))}
+                      </ul>
+                      <p className="mt-3 text-sm text-gray-600">{confirmCopy.preserved}</p>
                     </div>
 
                     <div className="flex justify-end gap-3">
@@ -714,8 +987,12 @@ export default function Admin() {
           </div>
         )}
 
-        {activeTab === 'users' && (
-          <div>
+        {currentTab === 'users' && (
+          <div
+            id={tabPanelId('admin', 'users')}
+            role="tabpanel"
+            aria-labelledby={tabId('admin', 'users')}
+          >
             {/* Create User Button */}
             <div className="mb-6 flex justify-end">
               <button
@@ -1123,18 +1400,36 @@ export default function Admin() {
         )}
 
         {/* Infrastructure Tab */}
-        {activeTab === 'infrastructure' && (
-          <InfrastructureTab />
+        {currentTab === 'infrastructure' && (
+          <div
+            id={tabPanelId('admin', 'infrastructure')}
+            role="tabpanel"
+            aria-labelledby={tabId('admin', 'infrastructure')}
+          >
+            <InfrastructureTab />
+          </div>
         )}
 
         {/* Catalog Tab */}
-        {activeTab === 'catalog' && (
-          <CatalogSourcesTab />
+        {currentTab === 'catalog' && (
+          <div
+            id={tabPanelId('admin', 'catalog')}
+            role="tabpanel"
+            aria-labelledby={tabId('admin', 'catalog')}
+          >
+            <CatalogSourcesTab />
+          </div>
         )}
 
         {/* Registry Tab */}
-        {activeTab === 'registry' && (
-          <RegistryTab />
+        {currentTab === 'registry' && (
+          <div
+            id={tabPanelId('admin', 'registry')}
+            role="tabpanel"
+            aria-labelledby={tabId('admin', 'registry')}
+          >
+            <RegistryTab />
+          </div>
         )}
       </div>
     </div>

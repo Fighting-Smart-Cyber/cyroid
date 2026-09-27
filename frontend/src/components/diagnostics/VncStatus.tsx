@@ -1,8 +1,19 @@
 // frontend/src/components/diagnostics/VncStatus.tsx
+/**
+ * The health of a Docker range's VNC plumbing: socat proxies, Traefik routes, iptables rules.
+ *
+ * Every one of those is a thing the Docker substrate builds by hand. A KubeVirt machine's
+ * console comes off the API server's vnc subresource with no proxy, no route and no port to
+ * configure, so there is nothing here for that substrate to report -- and it did report
+ * something: a green "0/0 VMs with VNC configured" on a range whose consoles were working. The
+ * panel is absent there rather than reassuring about plumbing that does not exist.
+ */
 import { useState, useEffect } from 'react'
 import { Monitor, CheckCircle, XCircle, AlertTriangle, RefreshCw, Wrench, ExternalLink } from 'lucide-react'
+import clsx from 'clsx'
 import { rangesApi, VncStatusResponse, VncVmStatus } from '../../services/api'
 import { toast } from '../../stores/toastStore'
+import { useCapabilitiesStore } from '../../stores/capabilitiesStore'
 
 interface VncStatusProps {
   rangeId: string
@@ -14,6 +25,11 @@ export function VncStatus({ rangeId, onRefresh }: VncStatusProps) {
   const [loading, setLoading] = useState(false)
   const [repairing, setRepairing] = useState(false)
   const [expanded, setExpanded] = useState(false)
+
+  // Null until /system/capabilities answers; the fetch waits rather than asking an endpoint the
+  // install may not have.
+  const features = useCapabilitiesStore((s) => s.features)
+  const isDockerHost = features?.legacy_range_console === true
 
   const fetchVncStatus = async () => {
     setLoading(true)
@@ -29,8 +45,9 @@ export function VncStatus({ rangeId, onRefresh }: VncStatusProps) {
   }
 
   useEffect(() => {
+    if (!isDockerHost) return
     fetchVncStatus()
-  }, [rangeId])
+  }, [rangeId, isDockerHost])
 
   const handleRepairVnc = async () => {
     setRepairing(true)
@@ -57,6 +74,10 @@ export function VncStatus({ rangeId, onRefresh }: VncStatusProps) {
     return <AlertTriangle className="w-4 h-4 text-yellow-500" />
   }
 
+  if (!isDockerHost) {
+    return null
+  }
+
   if (loading && !vncStatus) {
     return (
       <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
@@ -74,6 +95,9 @@ export function VncStatus({ rangeId, onRefresh }: VncStatusProps) {
 
   const hasIssues = vncStatus.summary.vms_with_issues > 0
   const isDind = vncStatus.is_dind
+  // "0/0 configured" is not health. A range with no VMs in it was reported in green, which reads
+  // as a working console on a range that has nothing to open.
+  const hasVms = vncStatus.summary.total_vms > 0
 
   return (
     <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
@@ -83,12 +107,24 @@ export function VncStatus({ rangeId, onRefresh }: VncStatusProps) {
         onClick={() => setExpanded(!expanded)}
       >
         <div className="flex items-center gap-3">
-          <Monitor className={hasIssues ? 'w-5 h-5 text-yellow-500' : 'w-5 h-5 text-green-500'} />
+          <Monitor
+            className={clsx(
+              'w-5 h-5',
+              hasIssues ? 'text-yellow-500' : hasVms ? 'text-green-500' : 'text-gray-500'
+            )}
+          />
           <div>
             <h3 className="font-medium text-white">VNC Console Status</h3>
             <p className="text-sm text-gray-400">
-              {vncStatus.summary.vms_with_vnc}/{vncStatus.summary.total_vms} VMs with VNC configured
-              {hasIssues && ` (${vncStatus.summary.vms_with_issues} with issues)`}
+              {hasVms ? (
+                <>
+                  {vncStatus.summary.vms_with_vnc}/{vncStatus.summary.total_vms} VMs with VNC
+                  configured
+                  {hasIssues && ` (${vncStatus.summary.vms_with_issues} with issues)`}
+                </>
+              ) : (
+                'No VMs in this range yet'
+              )}
             </p>
           </div>
         </div>

@@ -1,0 +1,204 @@
+# What the control plane may do to the cluster it runs on -- exactly the KubeClient port, no more.
+#
+# Two roles, because "what PROVING GROUND does to a cluster" and "what it does inside one range"
+# are different blast radii. `pg-control-plane` is bound cluster-wide and holds only what has no
+# namespace to be held in: namespaces themselves, the PersistentVolumes and cluster RBAC that
+# `residue()` reads, and the one labelled cluster-wide list the dashboard's machine count needs.
+# `pg-range` holds everything that only ever operates inside a range, and it is bound into each
+# range's namespace by the control plane as it creates that namespace.
+#
+# `rbac.rangePermissions` chooses which of the two actually carries the range verbs:
+#
+#   cluster   (default)  the range verbs are in BOTH roles, which is what every install before
+#                        this had. Nothing changes; the per-namespace binding is redundant.
+#   namespace            the range verbs are removed from the cluster-wide role, so the API's
+#                        token can no longer exec into a pod outside a range namespace.
+#
+# It defaults to the broad grant on purpose. A range created before the narrowing has no binding
+# in its namespace, and narrowing first would 403 every operation on it -- read the value's note
+# in values.yaml before switching it.
+#
+# Why a ClusterRole bound per namespace rather than a Role written per namespace: Kubernetes
+# refuses to let an account grant a permission it does not itself hold (escalation prevention),
+# so a control plane that no longer holds `pods/exec` cluster-wide could not create a Role
+# granting it. The documented way through is the `bind` verb on the specific ClusterRole being
+# referenced, which is why the bind rule below carries `resourceNames`. Replacing this with a
+# Role the control plane writes will fail at range creation, and only once narrowed.
+{{- $scope := (.Values.rbac | default dict).rangePermissions | default "cluster" }}
+{{- if not (has $scope (list "cluster" "namespace")) }}
+{{- fail (printf "rbac.rangePermissions must be \"cluster\" or \"namespace\", not %q" $scope) }}
+{{- end }}
+
+{{- define "pg.rangeRules" -}}
+- apiGroups: [""]
+  resources: [pods, pods/log, events]
+  verbs: [get, list, watch, delete, deletecollection]
+- apiGroups: [""]
+  resources: [pods/exec]
+  verbs: [create]
+- apiGroups: [""]
+  # Only the vcluster chart's exported kubeconfig, by name: reading every secret in every
+  # range namespace is not what running hooks inside a vcluster needs.
+  resources: [secrets]
+  resourceNames: [vc-vcluster]
+  verbs: [get]
+- apiGroups: [batch]
+  resources: [jobs]
+  verbs: [get, list, watch, create, delete, deletecollection]
+- apiGroups: [batch]
+  # read_namespaced_job_status is the status subresource; without this a hook's Job is created
+  # and then cannot be awaited (403 on the first poll). Found on the first in-cluster deploy.
+  resources: [jobs/status]
+  verbs: [get]
+- apiGroups: [apps]
+  resources: [deployments, statefulsets, deployments/scale, statefulsets/scale]
+  verbs: [get, list, watch, patch]
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [get, list, create, update, patch, delete]
+- apiGroups: [networking.k8s.io]
+  # A range's applications on the cluster's ingress (PG-62). The two traefik.io Middlewares that
+  # used to sit beside them are gone: authorisation and prefix-stripping moved into pg-gateway,
+  # so the platform no longer writes a CRD that only one ingress controller defines -- and no
+  # longer needs permission to.
+  resources: [ingresses]
+  verbs: [get, list, create, update, patch, delete]
+- apiGroups: [kubevirt.io]
+  resources: [virtualmachines, virtualmachineinstances]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [subresources.kubevirt.io]
+  # The console: a VM's VNC framebuffer, piped to the browser by the API (PG-61).
+  resources: [virtualmachineinstances/vnc]
+  verbs: [get]
+- apiGroups: [cdi.kubevirt.io]
+  resources: [datavolumes]
+  verbs: [get, list, watch]
+- apiGroups: [k8s.cni.cncf.io]
+  resources: [network-attachment-definitions]
+  verbs: [get, list, create, update, patch, delete]
+- apiGroups: [helm.toolkit.fluxcd.io]
+  resources: [helmreleases]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [source.toolkit.fluxcd.io]
+  resources: [helmrepositories]
+  verbs: [get, list, watch, create, update, patch, delete]
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pg
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pg-control-plane
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+rules:
+  # A range is a namespace, and a namespace is a cluster-scoped object: creating and deleting one
+  # cannot be delegated to a Role inside the namespace being created. This is the power that
+  # stays however `rangePermissions` is set, and an admission policy limiting it to namespaces
+  # named `pg-*` is the only way to reduce it further.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch, create, patch, delete]
+  # residue(): a Retain volume outlives the namespace whose claim it served, and vcluster's own
+  # RBAC (`vc-<release>-v-<namespace>`) is cluster-scoped by definition. Both are read-only -- the
+  # check reports what a teardown stranded; it does not clean up.
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles, clusterrolebindings]
+    verbs: [get, list]
+  # One labelled list across every namespace answers "how many machines are running" in a single
+  # request however many ranges exist; asking each range's namespace in turn is a request per
+  # range on a page that loads for every user. Cluster-scoped because the call is.
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachineinstances]
+    verbs: [list]
+{{- if eq $scope "cluster" }}
+  # rangePermissions: cluster -- exactly what every install before this had, and nothing else.
+  # The narrow mode's RBAC-write grants are deliberately NOT here: adding them by default would
+  # make an upgrade into this chart strictly more permissive than the install it replaced, which
+  # is the opposite of what the finding asked for. In this mode the control plane writes no
+  # RoleBinding at all -- it already holds these verbs cluster-wide, so there is nothing to bind.
+  {{- include "pg.rangeRules" . | nindent 2 }}
+{{- else }}
+  # rangePermissions: namespace -- the range verbs are gone from this role, and the control plane
+  # binds `pg-range` into each range's namespace as it creates it.
+  #
+  # `create` on rolebindings cannot be restricted by name or by namespace in RBAC, so this does
+  # leave the control plane able to bind `pg-range` into a namespace that is not a range's, and
+  # to bind it to a subject other than itself. That is strictly less than the cluster-wide exec
+  # it replaces, and unlike it, every use leaves a RoleBinding object behind to be found -- but
+  # it is not nothing, and an admission policy restricting these to `pg-range-*` namespaces is
+  # what would close the gap.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [create]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    resourceNames: [pg-range]
+    verbs: [bind]
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  # Never bound cluster-wide. The control plane binds it into each range's namespace, and the
+  # chart binds it nowhere -- a ClusterRoleBinding to this role would undo the whole point.
+  name: pg-range
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+rules:
+  {{- include "pg.rangeRules" . | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pg-control-plane
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pg-control-plane
+subjects:
+  - kind: ServiceAccount
+    name: pg
+    namespace: {{ .Release.Namespace }}
+---
+# The platform's own namespace. The in-UI update reads and rewrites this install's HelmRelease,
+# which lives here rather than in any range -- with the range verbs narrowed, that is the one
+# thing the control plane still does to itself, and without this it stops working with a 403 that
+# says nothing about updates.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pg-self
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [helm.toolkit.fluxcd.io]
+    resources: [helmreleases]
+    verbs: [get, list, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pg-self
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pg-self
+subjects:
+  - kind: ServiceAccount
+    name: pg
+    namespace: {{ .Release.Namespace }}

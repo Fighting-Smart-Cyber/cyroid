@@ -7,20 +7,21 @@ from uuid import UUID
 import logging
 import os
 
-from fastapi import APIRouter, HTTPException, status, Query, Depends
+from fastapi import APIRouter, HTTPException, status, Query
 from pydantic import BaseModel
 
 from proving_ground.config import get_settings
+from proving_ground.api import kubernetes_console, kubernetes_ranges
 
 from proving_ground.api.deps import (
     DBSession,
     CurrentUser,
     filter_by_visibility,
     check_resource_access,
+    check_resource_control,
     get_student_accessible_range_ids,
 )
-from proving_ground.database import get_db
-from proving_ground.models.range import Range, RangeStatus
+from proving_ground.models.range import Range, RangeStatus, RangeVisibility, RangeShare
 from proving_ground.models.network import Network
 from proving_ground.models.vm import VM, VMStatus
 from proving_ground.models.resource_tag import ResourceTag
@@ -52,7 +53,7 @@ from proving_ground.schemas.deployment_status import (
     VMStatus as VMStatusSchema,
 )
 from proving_ground.schemas.scenario import ApplyScenarioRequest, ApplyScenarioResponse
-from sqlalchemy.orm import joinedload, Session
+from sqlalchemy.orm import joinedload
 from proving_ground.schemas.user import ResourceTagCreate, ResourceTagsResponse
 
 logger = logging.getLogger(__name__)
@@ -90,8 +91,175 @@ def get_traefik_route_service():
     return _get_traefik_route_service()
 
 
-def compute_deployment_status(range_obj, events: list) -> DeploymentStatusResponse:
-    """Compute per-resource deployment status from events."""
+def _era_b_blueprint(db, range_obj):
+    """The blueprint an Era B range is made of, or None when the Era A view is the right one.
+
+    An Era A blueprint sitting on a Kubernetes host gets None deliberately: it cannot deploy
+    here, and drawing it as a set of cluster resources would describe something that will never
+    exist.
+    """
+    if not kubernetes_ranges.is_kubernetes():
+        return None
+    from proving_ground.capability.blueprint import read_blueprint
+
+    instance = db.query(RangeInstance).filter(RangeInstance.range_id == range_obj.id).first()
+    config = instance.blueprint.config if instance and instance.blueprint else {}
+    try:
+        spec = read_blueprint(config or {})
+    except ValueError:
+        return None
+    return spec if spec.deployable_on_kubernetes else None
+
+
+def _era_b_event_fields(event) -> dict:
+    """What an Era B event carries instead of a row id.
+
+    This substrate creates no Network or VM rows, so an event has nothing to put in `network_id`
+    or `vm_id`; it names its resource, its operation and its stage in `extra_data` instead.
+    """
+    if not event.extra_data:
+        return {}
+    try:
+        data = json.loads(event.extra_data)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _kubernetes_deployment_status(range_obj, events: list, spec) -> DeploymentStatusResponse:
+    """The deployment panel's view of a range on the Kubernetes substrate.
+
+    The Era A view is a DinD container plus the range's Network and VM rows, and Era B creates
+    none of those -- so the panel showed a single Docker-in-Docker container pending at 0%,
+    Networks 0/0 and VMs 0/0 for the whole of a successful deploy. It read as a hung deployment
+    and named a technology the install does not have.
+
+    The rows come from the blueprint, which is what an Era B range is made of, and they move on
+    the events the deploy worker writes as it watches the namespace fill. There is no router row:
+    routing between a range's networks is not a container here, and an always-pending row for one
+    is what pinned the bar at 0%.
+
+    Start and stop are shown through the same panel, because they are the same question -- what
+    is the cluster doing with my range right now -- and the range has one transitional status for
+    all three. Which operation is in flight comes from the events, not from the status.
+    """
+    from datetime import timezone
+
+    networks = {
+        n.name: NetworkStatus(id=n.attachment_name, name=n.name, subnet=n.subnet, status="pending")
+        for n in spec.networks
+    }
+    machines = {
+        w.name: VMStatusSchema(
+            id=w.name,
+            name=w.name,
+            hostname=w.name,
+            ip=w.primary_interface.ip_address,
+            status="pending",
+        )
+        for w in spec.workloads
+    }
+
+    # Only the operation in flight is drawn. Without this the rows would still carry the last
+    # deploy's outcome while a stop was running, and the panel would open at 100%.
+    start_index = 0
+    operation = "deploy"
+    for index, event in enumerate(events):
+        fields = _era_b_event_fields(event)
+        begins = event.event_type == EventType.DEPLOYMENT_STARTED or (
+            event.event_type == EventType.DEPLOYMENT_STEP and fields.get("stage") == 1
+        )
+        if begins:
+            start_index = index
+            operation = fields.get("operation") or "deploy"
+
+    scoped = events[start_index:] if events else []
+    started_at = scoped[0].created_at if scoped else None
+    current_step = None
+    current_stage = None
+    total_stages = None
+    stage_name = None
+    failure = None
+
+    for event in scoped:
+        fields = _era_b_event_fields(event)
+        name = fields.get("resource")
+        event_type = event.event_type
+        if event_type == EventType.DEPLOYMENT_STEP:
+            current_step = event.message
+            current_stage = fields.get("stage") or current_stage
+            total_stages = fields.get("total_stages") or total_stages
+            stage_name = fields.get("stage_name") or stage_name
+        elif event_type == EventType.NETWORK_CREATING and name in networks:
+            networks[name].status = "creating"
+            networks[name].status_detail = "Applying attachment"
+        elif event_type == EventType.NETWORK_CREATED and name in networks:
+            networks[name].status = "created"
+            networks[name].status_detail = "Created"
+        elif event_type == EventType.VM_CREATING and name in machines:
+            machines[name].status = "creating"
+            machines[name].status_detail = event.message
+        elif event_type == EventType.VM_STARTED and name in machines:
+            machines[name].status = "running"
+            machines[name].status_detail = "Running"
+        elif event_type == EventType.VM_STOPPED and name in machines:
+            machines[name].status = "stopped"
+            machines[name].status_detail = "Stopped"
+        elif event_type == EventType.VM_ERROR and name in machines:
+            machines[name].status = "failed"
+            machines[name].status_detail = event.message
+        elif event_type == EventType.DEPLOYMENT_FAILED:
+            failure = event.message
+
+    network_rows = list(networks.values()) if operation == "deploy" else []
+    rows = network_rows + list(machines.values())
+    # Stopping is finished when a machine is down, not when it is up; counting "running" as
+    # complete during a stop would show the bar full at the moment nothing had happened yet.
+    done = {"stopped"} if operation == "stop" else {"running", "created"}
+    if failure:
+        # The reason has to land on a row: the panel reads its error text off a failed resource.
+        for row in rows:
+            if row.status not in done:
+                row.status = "failed"
+                row.status_detail = failure
+
+    summary = DeploymentSummary(
+        total=len(rows),
+        completed=sum(1 for r in rows if r.status in done),
+        in_progress=sum(1 for r in rows if r.status in ("creating", "starting")),
+        failed=sum(1 for r in rows if r.status == "failed"),
+        pending=sum(1 for r in rows if r.status == "pending"),
+    )
+
+    elapsed_seconds = 0
+    if started_at:
+        now = datetime.now(timezone.utc) if started_at.tzinfo else datetime.utcnow()
+        elapsed_seconds = int((now - started_at).total_seconds())
+
+    return DeploymentStatusResponse(
+        status=range_obj.status.value if hasattr(range_obj.status, "value") else range_obj.status,
+        elapsed_seconds=elapsed_seconds,
+        started_at=started_at.isoformat() if started_at else None,
+        current_step=current_step,
+        current_stage=current_stage,
+        total_stages=total_stages,
+        stage_name=stage_name,
+        summary=summary,
+        router=None,
+        networks=network_rows,
+        vms=list(machines.values()),
+    )
+
+
+def compute_deployment_status(range_obj, events: list, spec=None) -> DeploymentStatusResponse:
+    """Compute per-resource deployment status from events.
+
+    `spec` is the range's Era B blueprint when it has one; see `_kubernetes_deployment_status`.
+    Everything below it is the Era A plan and stays that way.
+    """
+    if spec is not None:
+        return _kubernetes_deployment_status(range_obj, events, spec)
+
     import re
     from datetime import timezone
 
@@ -232,6 +400,23 @@ def compute_deployment_status(range_obj, events: list) -> DeploymentStatusRespon
     )
 
 
+def _range_list_response(ranges, db) -> List[RangeResponse]:
+    """Turn range rows into cards that say what is actually in them.
+
+    On Kubernetes a range has no Network or VM rows -- its composition is its blueprint -- so the
+    row counts read "0 networks / 0 VMs" beside a range with three machines up, which on a card
+    whose status says Running reads as a failed deploy. The counts come from one blueprint query
+    for the whole page; a cluster call per range would not survive a list of fifty.
+    """
+    if not kubernetes_ranges.is_kubernetes():
+        return [RangeResponse.from_orm_with_counts(r) for r in ranges]
+    counts = kubernetes_console.range_machine_counts(db, [r.id for r in ranges])
+    return [
+        RangeResponse.from_orm_with_counts(r, counts=counts.get(r.id), substrate="kubernetes")
+        for r in ranges
+    ]
+
+
 @router.get("", response_model=List[RangeResponse])
 def list_ranges(db: DBSession, current_user: CurrentUser):
     """
@@ -239,9 +424,18 @@ def list_ranges(db: DBSession, current_user: CurrentUser):
 
     Visibility rules:
     - Admins see ALL ranges
-    - Users see ranges they own
-    - Users see ranges with matching tags (if they have tags)
-    - Users see untagged ranges (public)
+    - Students see only ranges assigned to them
+    - Everyone else sees ranges they own, ranges marked PUBLIC, and ranges marked
+      SHARED with them by name or by a tag they hold
+
+    A range carries an explicit `visibility`, and PRIVATE is the default. This docstring
+    used to say "users see untagged ranges (public)", which was the older tag model and
+    was never right for ranges: it made every range anyone created visible to every
+    non-student account, because having no tags was read as being public. The code was
+    fixed; this description was not, which left the wrong rule written down next to the
+    right one in a security-sensitive place.
+
+    See `_filter_ranges_by_visibility`, which is what actually decides.
     """
     # Start with user's own ranges - eager load networks and vms for counts
     base_options = [joinedload(Range.networks), joinedload(Range.vms)]
@@ -268,7 +462,7 @@ def list_ranges(db: DBSession, current_user: CurrentUser):
         )
 
     ranges = query.all()
-    return [RangeResponse.from_orm_with_counts(r) for r in ranges]
+    return _range_list_response(ranges, db)
 
 
 @router.post("", response_model=RangeResponse, status_code=status.HTTP_201_CREATED)
@@ -307,7 +501,7 @@ def get_my_ranges(
         .all()
     )
 
-    return [RangeResponse.from_orm_with_counts(r) for r in ranges]
+    return _range_list_response(ranges, db)
 
 
 @router.get("/{range_id}", response_model=RangeDetailResponse)
@@ -328,6 +522,8 @@ def get_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="Range not found",
         )
 
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+
     # Check if this range was deployed from a blueprint
     blueprint_instance = None
     instance = (
@@ -345,6 +541,23 @@ def get_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             current_blueprint_version=instance.blueprint.version,
         )
 
+    # The same counts the list shows, for the same reason: the rows below are empty on Kubernetes
+    # and the blueprint is what the range is made of there.
+    substrate = "kubernetes" if kubernetes_ranges.is_kubernetes() else "dind"
+    counts = (
+        kubernetes_console.range_machine_counts(db, [range_id]).get(range_id)
+        if substrate == "kubernetes"
+        else None
+    )
+    network_count, vm_count = (
+        counts
+        if counts is not None
+        else (
+            len(range_obj.networks) if range_obj.networks else 0,
+            len(range_obj.vms) if range_obj.vms else 0,
+        )
+    )
+
     return RangeDetailResponse(
         id=range_obj.id,
         name=range_obj.name,
@@ -357,8 +570,9 @@ def get_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
         deployed_at=range_obj.deployed_at,
         started_at=range_obj.started_at,
         stopped_at=range_obj.stopped_at,
-        network_count=len(range_obj.networks) if range_obj.networks else 0,
-        vm_count=len(range_obj.vms) if range_obj.vms else 0,
+        network_count=network_count,
+        vm_count=vm_count,
+        substrate=substrate,
         student_guide_id=range_obj.student_guide_id,
         networks=range_obj.networks,
         vms=range_obj.vms,
@@ -380,6 +594,8 @@ def update_range(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Range not found",
         )
+
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
 
     update_data = range_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -411,6 +627,16 @@ def delete_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Range not found",
         )
+
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
+    if kubernetes_ranges.is_kubernetes():
+        # Era B: destroy on the cluster, and only then drop the row -- see the helper.
+        kubernetes_ranges.delete_on_kubernetes(db, range_obj)
+        db.query(RangeInstance).filter(RangeInstance.range_id == range_id).delete()
+        db.delete(range_obj)
+        db.commit()
+        return
 
     # Cleanup Docker resources before deleting
     try:
@@ -475,6 +701,8 @@ def get_deployment_status(range_id: UUID, db: DBSession, current_user: CurrentUs
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
 
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+
     # Get deployment events from last hour
     events = (
         db.query(EventLog)
@@ -486,7 +714,7 @@ def get_deployment_status(range_id: UUID, db: DBSession, current_user: CurrentUs
         .all()
     )
 
-    return compute_deployment_status(range_obj, events)
+    return compute_deployment_status(range_obj, events, _era_b_blueprint(db, range_obj))
 
 
 @router.get("/{range_id}/validate")
@@ -558,28 +786,35 @@ def deploy_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="Range not found",
         )
 
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
     if range_obj.status not in [RangeStatus.DRAFT, RangeStatus.STOPPED, RangeStatus.ERROR]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot deploy range in {range_obj.status} status",
         )
 
-    # Enforce strict image validation before deployment
-    # All container images must be pre-cached, QEMU VMs must have boot_source configured
-    docker = get_docker_service()
-    validator = DeploymentValidator(db, docker)
-    validation_result = asyncio.run(validator.validate_range(range_id))
+    if kubernetes_ranges.is_kubernetes():
+        # Era B: the image cache is a DinD concern. What can be refused up front here is the
+        # blueprint's era and the range's placement.
+        kubernetes_ranges.validate_for_deploy(db, range_id)
+    else:
+        # Enforce strict image validation before deployment
+        # All container images must be pre-cached, QEMU VMs must have boot_source configured
+        docker = get_docker_service()
+        validator = DeploymentValidator(db, docker)
+        validation_result = asyncio.run(validator.validate_range(range_id))
 
-    if not validation_result.valid:
-        error_messages = [e.message for e in validation_result.errors]
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "message": "Deployment validation failed. All images must be cached before deployment.",
-                "errors": error_messages,
-                "hint": "Use the Image Cache page to pre-pull container images or configure golden images for QEMU VMs.",
-            },
-        )
+        if not validation_result.valid:
+            error_messages = [e.message for e in validation_result.errors]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Deployment validation failed. All images must be cached before deployment.",
+                    "errors": error_messages,
+                    "hint": "Use the Image Cache page to pre-pull container images or configure golden images for QEMU VMs.",
+                },
+            )
 
     # Set status to DEPLOYING immediately
     range_obj.status = RangeStatus.DEPLOYING
@@ -621,6 +856,8 @@ def sync_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Range not found",
         )
+
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
 
     # Sync only works on RUNNING ranges with DinD containers
     if range_obj.status != RangeStatus.RUNNING:
@@ -736,6 +973,8 @@ def repair_range_dind(range_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="Range not found",
         )
 
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
     # Check if DinD info is already populated
     if range_obj.dind_container_id and range_obj.dind_docker_url:
         return {
@@ -810,6 +1049,8 @@ def get_vnc_status(range_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Range not found",
         )
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
 
     # Get VNC mappings from database
     vnc_mappings = range_obj.vnc_proxy_mappings or {}
@@ -983,6 +1224,8 @@ def repair_vnc_for_range(range_id: UUID, db: DBSession, current_user: CurrentUse
             detail="Range not found",
         )
 
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
     if not range_obj.dind_container_id or not range_obj.dind_docker_url:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1086,6 +1329,10 @@ def repair_vnc_for_range(range_id: UUID, db: DBSession, current_user: CurrentUse
 def start_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
     """Start all VMs and router in a stopped range.
 
+    On Kubernetes this records the intent and returns; the deploy worker drives the cluster and
+    the range's status is what the UI follows. Waiting for the machines here held the request for
+    up to ten minutes.
+
     For DinD-based deployments:
     - Ensures the DinD container itself is running (starts it if stopped)
     - Waits for Docker daemon inside DinD to be ready
@@ -1101,11 +1348,16 @@ def start_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="Range not found",
         )
 
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
     if range_obj.status != RangeStatus.STOPPED:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot start range in {range_obj.status} status",
         )
+
+    if kubernetes_ranges.is_kubernetes():
+        return kubernetes_ranges.start_on_kubernetes(db, range_obj, current_user.id)
 
     try:
         docker = get_docker_service()
@@ -1235,6 +1487,8 @@ def stop_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
     This stops all containers but preserves networks for quick restart.
     Use teardown to fully clean up resources.
 
+    On Kubernetes this records the intent and returns, as start does; see `start_range`.
+
     For DinD-based deployments:
     - Gets Docker client connected to inner Docker daemon
     - Stops all VM containers inside the DinD container
@@ -1249,11 +1503,16 @@ def stop_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="Range not found",
         )
 
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
     if range_obj.status != RangeStatus.RUNNING:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot stop range in {range_obj.status} status",
         )
+
+    if kubernetes_ranges.is_kubernetes():
+        return kubernetes_ranges.stop_on_kubernetes(db, range_obj, current_user.id)
 
     try:
         docker = get_docker_service()
@@ -1358,11 +1617,16 @@ def teardown_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             detail="Range not found",
         )
 
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
     if range_obj.status == RangeStatus.DEPLOYING:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot teardown range while deploying",
         )
+
+    if kubernetes_ranges.is_kubernetes():
+        return kubernetes_ranges.teardown_on_kubernetes(db, range_obj, current_user.id)
 
     try:
         docker = get_docker_service()
@@ -1471,6 +1735,8 @@ def export_range(range_id: UUID, db: DBSession, current_user: CurrentUser):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Range not found",
         )
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
 
     # Get networks
     networks = db.query(Network).filter(Network.range_id == range_id).all()
@@ -1684,6 +1950,21 @@ def apply_scenario(
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
 
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
+    if kubernetes_ranges.is_kubernetes():
+        # A scenario maps roles onto VM rows, and a Kubernetes range has none: its machines are
+        # workloads declared in its blueprint. Refusing here beats writing an MSEL whose every
+        # inject targets nothing.
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "Applying a scenario maps roles onto virtual-machine records, which a range on "
+                "the Kubernetes substrate does not have. Declare the exercise in the range's "
+                "blueprint instead."
+            ),
+        )
+
     # Get scenario from filesystem
     scenario = get_scenario(str(request.scenario_id))
     if not scenario:
@@ -1715,9 +1996,13 @@ def apply_scenario(
     # Create MSEL content from scenario
     msel_content = f"# {scenario.name}\n\n{scenario.description}\n\n"
     msel_content += "## Events\n\n"
+    # `scenario.events` holds ScenarioEvent dataclasses (services/scenario_filesystem), not
+    # dicts: subscripting them raised TypeError and `.get` raised AttributeError, so this
+    # endpoint answered a bare 500 for every scenario that had any events at all. Only a
+    # scenario with no events ever reached the end of this function.
     for event in scenario.events:
-        msel_content += f"### T+{event['delay_minutes']}min: {event['title']}\n"
-        msel_content += f"{event.get('description', '')}\n\n"
+        msel_content += f"### T+{event.delay_minutes}min: {event.title}\n"
+        msel_content += f"{event.description or ''}\n\n"
 
     # Create MSEL
     msel = MSEL(
@@ -1732,17 +2017,16 @@ def apply_scenario(
     inject_count = 0
     for event in scenario.events:
         # Map target_role to actual VM ID
-        target_role = event.get("target_role", "")
-        target_vm_id = request.role_mapping.get(target_role)
+        target_vm_id = request.role_mapping.get(event.target_role or "")
 
         inject = Inject(
             msel_id=msel.id,
-            sequence_number=event["sequence"],
-            inject_time_minutes=event["delay_minutes"],
-            title=event["title"],
-            description=event.get("description"),
+            sequence_number=event.sequence,
+            inject_time_minutes=event.delay_minutes,
+            title=event.title,
+            description=event.description,
             target_vm_ids=[target_vm_id] if target_vm_id else [],
-            actions=event.get("actions", []),
+            actions=list(event.actions or []),
             status=InjectStatus.PENDING,
         )
         db.add(inject)
@@ -1938,67 +2222,6 @@ def get_export_job_status(job_id: str, current_user: CurrentUser):
     return ExportJobStatus.model_validate_json(job_data)
 
 
-@router.get("/export/jobs/{job_id}/download", deprecated=True)
-def download_export(
-    job_id: str,
-    token: str = None,
-    db: Session = Depends(get_db),
-):
-    """
-    Download a completed export archive.
-
-    DEPRECATED: Range export endpoints are deprecated. Use blueprint export instead.
-
-    Uses query param token for direct browser downloads of large files.
-    This avoids loading multi-GB files into memory as blobs.
-    """
-    from proving_ground.utils.security import decode_access_token
-    from proving_ground.models.user import User
-
-    if not token:
-        raise HTTPException(status_code=401, detail="Token required for download")
-
-    user_id = decode_access_token(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    current_user = db.query(User).filter(User.id == user_id).first()
-    if not current_user:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    redis_client = get_redis_client()
-
-    # Check job status
-    job_data = redis_client.get(f"export_job:{job_id}")
-    if not job_data:
-        raise HTTPException(status_code=404, detail="Export job not found")
-
-    job_status = ExportJobStatus.model_validate_json(job_data)
-    if job_status.status != "completed":
-        raise HTTPException(
-            status_code=400, detail=f"Export not ready. Status: {job_status.status}"
-        )
-
-    # Get archive path
-    archive_path = redis_client.get(f"export_job:{job_id}:path")
-    filename = redis_client.get(f"export_job:{job_id}:filename")
-
-    if not archive_path or not filename:
-        raise HTTPException(status_code=404, detail="Export file not found")
-
-    archive_path = archive_path.decode() if isinstance(archive_path, bytes) else archive_path
-    filename = filename.decode() if isinstance(filename, bytes) else filename
-
-    if not os.path.exists(archive_path):
-        raise HTTPException(status_code=404, detail="Export file has been deleted")
-
-    return FileResponse(
-        path=archive_path,
-        filename=filename,
-        media_type="application/gzip",
-    )
-
-
 @router.post("/import/validate", response_model=ImportValidationResult, deprecated=True)
 async def validate_import(
     file: UploadFile = File(...),
@@ -2141,6 +2364,101 @@ async def load_docker_images(
 # ============================================================================
 
 
+class RangeVisibilityUpdate(BaseModel):
+    visibility: str
+    # Replaces the share list wholesale when given. Omit to leave it alone, so
+    # flipping private -> shared does not silently drop existing grants.
+    shared_with: Optional[List[UUID]] = None
+
+
+class RangeShareEntry(BaseModel):
+    user_id: UUID
+    username: Optional[str] = None
+
+
+class RangeVisibilityResponse(BaseModel):
+    visibility: str
+    shared_with: List[RangeShareEntry]
+
+
+def _visibility_payload(range_obj, db) -> RangeVisibilityResponse:
+    rows = (
+        db.query(RangeShare, User.username)
+        .outerjoin(User, User.id == RangeShare.user_id)
+        .filter(RangeShare.range_id == range_obj.id)
+        .all()
+    )
+    return RangeVisibilityResponse(
+        visibility=(
+            range_obj.visibility.value
+            if hasattr(range_obj.visibility, "value")
+            else str(range_obj.visibility)
+        ),
+        shared_with=[RangeShareEntry(user_id=r.user_id, username=n) for r, n in rows],
+    )
+
+
+@router.get("/{range_id}/visibility", response_model=RangeVisibilityResponse)
+def get_range_visibility(range_id: UUID, db: DBSession, current_user: CurrentUser):
+    """Who can see this range."""
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Range not found")
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+    return _visibility_payload(range_obj, db)
+
+
+@router.put("/{range_id}/visibility", response_model=RangeVisibilityResponse)
+def set_range_visibility(
+    range_id: UUID, data: RangeVisibilityUpdate, db: DBSession, current_user: CurrentUser
+):
+    """Change who can see this range.
+
+    Control, not access: deciding who may see a range is the owner's to make,
+    so someone the range was merely shared with cannot widen it further.
+    """
+    range_obj = db.query(Range).filter(Range.id == range_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Range not found")
+
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
+
+    try:
+        visibility = RangeVisibility(data.visibility)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown visibility {data.visibility!r}. Expected one of: "
+                f"{', '.join(v.value for v in RangeVisibility)}"
+            ),
+        ) from None
+
+    range_obj.visibility = visibility
+
+    if data.shared_with is not None:
+        existing = {
+            s.user_id: s for s in db.query(RangeShare).filter(RangeShare.range_id == range_id)
+        }
+        wanted = set(data.shared_with)
+
+        for user_id in wanted - set(existing):
+            if not db.query(User).filter(User.id == user_id).first():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"No such user: {user_id}",
+                )
+            db.add(RangeShare(range_id=range_id, user_id=user_id, granted_by=current_user.id))
+
+        for user_id in set(existing) - wanted:
+            db.delete(existing[user_id])
+
+    db.commit()
+    db.refresh(range_obj)
+    return _visibility_payload(range_obj, db)
+
+
 @router.get("/{range_id}/tags", response_model=ResourceTagsResponse)
 def get_range_tags(range_id: UUID, db: DBSession, current_user: CurrentUser):
     """Get visibility tags for a range."""
@@ -2173,6 +2491,8 @@ def add_range_tag(
     range_obj = db.query(Range).filter(Range.id == range_id).first()
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
 
     # Only owner or admin can add tags
     if range_obj.created_by != current_user.id and not current_user.is_admin:
@@ -2207,6 +2527,8 @@ def remove_range_tag(range_id: UUID, tag: str, db: DBSession, current_user: Curr
     range_obj = db.query(Range).filter(Range.id == range_id).first()
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
 
     # Only owner or admin can remove tags
     if range_obj.created_by != current_user.id and not current_user.is_admin:
@@ -2273,6 +2595,8 @@ def get_range_containers(range_id: UUID, db: DBSession, current_user: CurrentUse
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
 
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+
     if not range_obj.dind_container_id or not range_obj.dind_docker_url:
         raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
 
@@ -2307,6 +2631,8 @@ def get_range_networks(range_id: UUID, db: DBSession, current_user: CurrentUser)
     range_obj = db.query(Range).filter(Range.id == range_id).first()
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
 
     if not range_obj.dind_container_id or not range_obj.dind_docker_url:
         raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
@@ -2348,6 +2674,8 @@ def get_container_logs(
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
 
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+
     if not range_obj.dind_container_id or not range_obj.dind_docker_url:
         raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
 
@@ -2373,6 +2701,8 @@ def get_range_stats(range_id: UUID, db: DBSession, current_user: CurrentUser):
     range_obj = db.query(Range).filter(Range.id == range_id).first()
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
 
     if not range_obj.dind_container_id or not range_obj.dind_docker_url:
         raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
@@ -2403,6 +2733,8 @@ def get_range_iptables(range_id: UUID, db: DBSession, current_user: CurrentUser)
     range_obj = db.query(Range).filter(Range.id == range_id).first()
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
 
     if not range_obj.dind_container_id:
         raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
@@ -2499,6 +2831,8 @@ def get_range_port_forwarding(range_id: UUID, db: DBSession, current_user: Curre
     range_obj = db.query(Range).filter(Range.id == range_id).first()
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
 
     if not range_obj.dind_container_id:
         raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
@@ -2631,6 +2965,8 @@ def get_range_routes(range_id: UUID, db: DBSession, current_user: CurrentUser):
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
 
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
+
     if not range_obj.dind_container_id:
         raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
 
@@ -2666,6 +3002,8 @@ def exec_in_dind(
     range_obj = db.query(Range).filter(Range.id == range_id).first()
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
 
     if not range_obj.dind_container_id:
         raise HTTPException(status_code=400, detail="Range is not a DinD deployment")
@@ -2777,31 +3115,65 @@ def set_student_guide(
     )
 
 
-# ============ VM Console Visibility Control ============
+# ============ Machine Console Visibility Control ============
+#
+# Which machines the assigned learner may open a console for. The record is one column,
+# `Range.hidden_vm_ids`, holding whatever key the substrate identifies a machine by: a VM row's
+# id on Docker, a workload's DNS label on Kubernetes. Enforcement of both lives in
+# `kubernetes_console.hidden_machines_for` and `vms.can_access_vm_console`.
 
 
 class RangeVMVisibilityVM(BaseModel):
-    """VM info for visibility control."""
+    """One machine the instructor can show or hide."""
 
-    id: UUID
+    id: str
     hostname: str
     status: str
     is_hidden: bool = False
 
 
 class RangeVMVisibilityResponse(BaseModel):
-    """VM visibility settings for a range."""
+    """Machine visibility settings for a range."""
 
     range_id: UUID
     range_name: str
-    hidden_vm_ids: List[UUID] = []
+    hidden_vm_ids: List[str] = []
     vms: List[RangeVMVisibilityVM] = []
 
 
 class RangeVMVisibilityUpdate(BaseModel):
-    """Update VM visibility for a range."""
+    """Update machine visibility for a range."""
 
-    hidden_vm_ids: List[UUID]
+    hidden_vm_ids: List[str]
+
+
+def _machine_visibility(range_obj, db, hidden: set) -> List[RangeVMVisibilityVM]:
+    """This range's machines, marked hidden or not, whichever substrate holds them.
+
+    On Kubernetes the machines are the blueprint's workloads: there are no VM rows, which is why
+    the panel used to come back empty on every Kubernetes range and the instructor concluded
+    there was nothing to hide.
+    """
+    machines = kubernetes_console.machine_visibility_view(db, range_obj)
+    if machines is not None:
+        return [
+            RangeVMVisibilityVM(
+                id=m["id"],
+                hostname=m["hostname"],
+                status=m["status"],
+                is_hidden=m["id"] in hidden,
+            )
+            for m in machines
+        ]
+    return [
+        RangeVMVisibilityVM(
+            id=str(vm.id),
+            hostname=vm.hostname,
+            status=vm.status.value if hasattr(vm.status, "value") else str(vm.status),
+            is_hidden=str(vm.id) in hidden,
+        )
+        for vm in range_obj.vms
+    ]
 
 
 @router.get("/{range_id}/vm-visibility", response_model=RangeVMVisibilityResponse)
@@ -2810,14 +3182,13 @@ def get_range_vm_visibility(
     db: DBSession,
     current_user: CurrentUser,
 ):
-    """Get VM visibility settings for a range.
-
-    This controls which VMs the assigned user can see and access via console.
-    """
+    """Which machines the assigned learner can see and open a console for."""
     range_obj = db.query(Range).options(joinedload(Range.vms)).filter(Range.id == range_id).first()
 
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
+
+    check_resource_access("range", range_id, current_user, db, range_obj.created_by)
 
     # Check permission (owner, admin, or assigned user viewing their own)
     is_owner = range_obj.created_by == current_user.id
@@ -2830,23 +3201,13 @@ def get_range_vm_visibility(
         if not is_assigned:
             raise HTTPException(status_code=403, detail="Not authorized")
 
-    hidden_ids = set(str(vm_id) for vm_id in (range_obj.hidden_vm_ids or []))
-
-    vms = [
-        RangeVMVisibilityVM(
-            id=vm.id,
-            hostname=vm.hostname,
-            status=vm.status.value if hasattr(vm.status, "value") else str(vm.status),
-            is_hidden=str(vm.id) in hidden_ids,
-        )
-        for vm in range_obj.vms
-    ]
+    hidden = set(str(key) for key in (range_obj.hidden_vm_ids or []))
 
     return RangeVMVisibilityResponse(
         range_id=range_obj.id,
         range_name=range_obj.name,
-        hidden_vm_ids=range_obj.hidden_vm_ids or [],
-        vms=vms,
+        hidden_vm_ids=sorted(hidden),
+        vms=_machine_visibility(range_obj, db, hidden),
     )
 
 
@@ -2857,53 +3218,50 @@ def update_range_vm_visibility(
     db: DBSession,
     current_user: CurrentUser,
 ):
-    """Update which VMs are hidden from the assigned user.
-
-    This controls which VMs the assigned user can see and access via console.
-    """
+    """Hide machines from the assigned learner, or show them again."""
     range_obj = db.query(Range).options(joinedload(Range.vms)).filter(Range.id == range_id).first()
 
     if not range_obj:
         raise HTTPException(status_code=404, detail="Range not found")
 
-    # Check permission (owner, admin, or evaluator/engineer)
-    is_owner = range_obj.created_by == current_user.id
-    is_admin = current_user.role == "admin"
-    has_role = current_user.has_any_role("engineer", "evaluator")
+    # Owner or admin, like every other change to a range.
+    #
+    # This used to admit any engineer or evaluator, which meant holding one of
+    # those roles let you change what a learner sees in ANY range, including
+    # ranges belonging to a colleague running a different exercise. Hiding a VM
+    # mid-exercise from someone else's learner is a change to their range.
+    #
+    # If an evaluator legitimately needs this on ranges they do not own, the
+    # answer is to give them access to those ranges rather than to every range;
+    # reverting is a one-line change back to has_any_role.
+    check_resource_control("range", range_id, current_user, db, range_obj.created_by)
 
-    if not (is_owner or is_admin or has_role):
-        raise HTTPException(status_code=403, detail="Not authorized to modify visibility")
+    # Every key must name a machine of this range. Storing one that does not is how the control
+    # comes to report success while hiding nothing -- nothing downstream would ever match it.
+    machine_keys = kubernetes_console.machine_keys_of(db, range_obj)
+    known = {str(vm.id) for vm in range_obj.vms} if machine_keys is None else set(machine_keys)
+    noun = "machine" if kubernetes_ranges.is_kubernetes() else "VM"
+    unknown = [key for key in data.hidden_vm_ids if key not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{noun} {unknown[0]} does not belong to this range",
+        )
 
-    # Validate that all VM IDs belong to this range
-    range_vm_ids = {str(vm.id) for vm in range_obj.vms}
-    for vm_id in data.hidden_vm_ids:
-        if str(vm_id) not in range_vm_ids:
-            raise HTTPException(status_code=400, detail=f"VM {vm_id} does not belong to this range")
-
-    range_obj.hidden_vm_ids = [str(vm_id) for vm_id in data.hidden_vm_ids]
+    range_obj.hidden_vm_ids = list(dict.fromkeys(data.hidden_vm_ids))
     db.commit()
     db.refresh(range_obj)
 
     logger.info(
-        f"Range {range_id} VM visibility updated by {current_user.username}: "
-        f"{len(data.hidden_vm_ids)} VMs hidden"
+        f"Range {range_id} machine visibility updated by {current_user.username}: "
+        f"{len(range_obj.hidden_vm_ids)} hidden"
     )
 
-    hidden_ids = set(str(vm_id) for vm_id in (range_obj.hidden_vm_ids or []))
-
-    vms = [
-        RangeVMVisibilityVM(
-            id=vm.id,
-            hostname=vm.hostname,
-            status=vm.status.value if hasattr(vm.status, "value") else str(vm.status),
-            is_hidden=str(vm.id) in hidden_ids,
-        )
-        for vm in range_obj.vms
-    ]
+    hidden = set(str(key) for key in (range_obj.hidden_vm_ids or []))
 
     return RangeVMVisibilityResponse(
         range_id=range_obj.id,
         range_name=range_obj.name,
-        hidden_vm_ids=range_obj.hidden_vm_ids or [],
-        vms=vms,
+        hidden_vm_ids=sorted(hidden),
+        vms=_machine_visibility(range_obj, db, hidden),
     )

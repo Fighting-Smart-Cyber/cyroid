@@ -9,6 +9,15 @@ import {
 } from '../services/api'
 import { useAuthStore } from '../stores/authStore'
 import { toast } from '../stores/toastStore'
+import { catalogInstallApi } from '../services/catalogInstall'
+import { InstallProgressModal } from '../components/catalog'
+import { useFeature, useSubstrate } from '../stores/capabilitiesStore'
+import { apiErrorDetail } from '../lib/blueprints'
+import {
+  catalogItemSupport,
+  unsupportedListingNotice,
+  type CatalogSupport,
+} from '../lib/catalogSupport'
 import {
   Loader2,
   Search,
@@ -24,6 +33,8 @@ import {
   ArrowUpCircle,
   X,
   AlertCircle,
+  AlertTriangle,
+  Ban,
   ChevronDown,
   Tag,
   HardDrive,
@@ -31,6 +42,14 @@ import {
 import clsx from 'clsx'
 
 type FilterTab = 'all' | CatalogItemType
+
+/**
+ * The listing type plus the schema version the backend reports when it knows one. Declared here
+ * rather than in the generated client because `schema_version` is not on the API's item schema
+ * yet; an item that omits it is Era A by the platform's own definition, which is the answer the
+ * verdict needs either way.
+ */
+type CatalogItem = CatalogItemSummary & { schema_version?: unknown }
 
 const TYPE_TABS: { key: FilterTab; label: string; icon: React.ElementType }[] = [
   { key: 'all', label: 'All', icon: Package },
@@ -52,9 +71,11 @@ const TYPE_BADGE_COLORS: Record<CatalogItemType, string> = {
 export default function CatalogBrowser() {
   const { user } = useAuthStore()
   const isAdmin = user?.roles?.includes('admin') ?? false
+  const { substrate, isKubernetes } = useSubstrate()
+  const hasImageLibrary = useFeature('image_library')
 
   // Data
-  const [items, setItems] = useState<CatalogItemSummary[]>([])
+  const [items, setItems] = useState<CatalogItem[]>([])
   const [sources, setSources] = useState<CatalogSource[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -66,6 +87,9 @@ export default function CatalogBrowser() {
 
   // Installing state
   const [installingItemId, setInstallingItemId] = useState<string | null>(null)
+  const [installJob, setInstallJob] = useState<{ jobId: string; itemName: string } | null>(
+    null
+  )
 
   // Collect all unique tags from items
   const allTags = Array.from(new Set(items.flatMap((item) => item.tags))).sort()
@@ -90,8 +114,8 @@ export default function CatalogBrowser() {
 
       const res = await catalogApi.listItems(params)
       setItems(res.data)
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to load catalog items')
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to load catalog items'))
     } finally {
       setLoading(false)
     }
@@ -113,7 +137,22 @@ export default function CatalogBrowser() {
     return () => clearTimeout(timer)
   }, [searchQuery])
 
-  const handleInstall = async (item: CatalogItemSummary) => {
+  /** Whether this install can run the item, or null while the substrate is still unknown. */
+  const supportFor = (item: CatalogItem): CatalogSupport | null =>
+    catalogItemSupport(item, { substrate, isKubernetes, hasImageLibrary })
+
+  const unsupportedCount = items.filter((item) => supportFor(item)?.supported === false).length
+
+  const handleInstall = async (item: CatalogItem) => {
+    // The second line of defence, not the only one: the card offers no Install button for an
+    // item this install cannot run, and this catches the path where a verdict arrived after the
+    // click. Installing anyway leaves a row the user will meet again at deploy, as a failure.
+    const support = supportFor(item)
+    if (support && !support.supported) {
+      toast.error(support.reason)
+      return
+    }
+
     // Find which source this item belongs to
     const sourceId = sources.length === 1
       ? sources[0].id
@@ -126,6 +165,14 @@ export default function CatalogBrowser() {
 
     setInstallingItemId(item.id)
     try {
+      // Blueprints go through the one-click installer, which resolves their
+      // base images, Dockerfile projects and content first and reports each
+      // step. Everything else has no dependency graph, so it installs directly.
+      if (item.type === 'blueprint') {
+        const job = await catalogInstallApi.start(item.id, sourceId, true)
+        setInstallJob({ jobId: job.job_id, itemName: item.name })
+        return
+      }
       await catalogApi.installItem(item.id, {
         source_id: sourceId,
         build_images: true,
@@ -133,8 +180,10 @@ export default function CatalogBrowser() {
       toast.success(`Installed "${item.name}" successfully`)
       // Refresh items to update install status
       fetchItems()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || `Failed to install "${item.name}"`)
+    } catch (err: unknown) {
+      // The server's own detail, which names the file, the step or the policy that refused. The
+      // generic message it replaced sent the user to the job log to find out what happened.
+      toast.error(apiErrorDetail(err, `Failed to install "${item.name}"`))
     } finally {
       setInstallingItemId(null)
     }
@@ -146,7 +195,7 @@ export default function CatalogBrowser() {
     )
   }
 
-  const getStatusBadge = (item: CatalogItemSummary) => {
+  const getStatusBadge = (item: CatalogItem) => {
     if (item.update_available) {
       return (
         <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
@@ -166,13 +215,27 @@ export default function CatalogBrowser() {
     return null
   }
 
-  const getActionButton = (item: CatalogItemSummary) => {
+  const getActionButton = (item: CatalogItem, support: CatalogSupport | null) => {
     if (installingItemId === item.id) {
       return (
         <button disabled className="inline-flex items-center px-3 py-1.5 text-sm font-medium rounded-md text-white bg-primary-400 cursor-not-allowed">
           <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
           Installing...
         </button>
+      )
+    }
+
+    // Before Installed and before Update: an install this substrate cannot deploy is the more
+    // important fact, and the status badge above already reports whether it is installed.
+    if (support && !support.supported) {
+      return (
+        <span
+          title={support.reason}
+          className="inline-flex items-center px-3 py-1.5 text-sm font-medium rounded-md text-gray-600 bg-gray-100 border border-gray-300"
+        >
+          <Ban className="h-4 w-4 mr-1.5 text-gray-400" />
+          {support.badge}
+        </span>
       )
     }
 
@@ -339,6 +402,17 @@ export default function CatalogBrowser() {
         </div>
       </div>
 
+      {/* Marked rather than filtered out. The catalog is worth browsing on either substrate, and
+          a list that silently dropped most of a source would leave the emptiness inexplicable. */}
+      {!loading && unsupportedCount > 0 && (
+        <div className="mt-6 flex items-start p-4 rounded-lg bg-amber-50 border border-amber-200">
+          <AlertTriangle className="h-5 w-5 mr-3 flex-shrink-0 text-amber-500" />
+          <p className="text-sm text-amber-800">
+            {unsupportedListingNotice(unsupportedCount, isKubernetes)}
+          </p>
+        </div>
+      )}
+
       {/* Content */}
       {loading ? (
         <div className="flex items-center justify-center h-64">
@@ -378,62 +452,82 @@ export default function CatalogBrowser() {
         </div>
       ) : (
         <div className="mt-8 grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
-          {items.map((item) => (
-            <Link
-              key={item.id}
-              to={`/catalog/${getItemSourceId()}/${encodeURIComponent(item.id)}`}
-              className="block bg-white overflow-hidden shadow rounded-lg hover:shadow-md transition-shadow"
-            >
-              <div className="p-5">
-                {/* Header: type badge + status */}
-                <div className="flex items-center justify-between mb-3">
-                  <span className={clsx(
-                    'inline-flex items-center px-2 py-0.5 rounded text-xs font-medium capitalize',
-                    TYPE_BADGE_COLORS[item.type]
-                  )}>
-                    {item.type}
-                  </span>
-                  {getStatusBadge(item)}
-                </div>
-
-                {/* Name + Description */}
-                <h3 className="text-lg font-medium text-gray-900">{item.name}</h3>
-                {item.description && (
-                  <p className="mt-1 text-sm text-gray-600 line-clamp-2">{item.description}</p>
-                )}
-
-                {/* Tags */}
-                {item.tags.length > 0 && (
-                  <div className="mt-3 flex flex-wrap gap-1">
-                    {item.tags.map((tag) => (
-                      <span
-                        key={tag}
-                        className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700"
-                      >
-                        {tag}
-                      </span>
-                    ))}
+          {items.map((item) => {
+            const support = supportFor(item)
+            const unsupported = support !== null && !support.supported
+            return (
+              <Link
+                key={item.id}
+                to={`/catalog/${getItemSourceId()}/${encodeURIComponent(item.id)}`}
+                className="block bg-white overflow-hidden shadow rounded-lg hover:shadow-md transition-shadow"
+              >
+                <div className="p-5">
+                  {/* Header: type badge + status */}
+                  <div className="flex items-center justify-between mb-3">
+                    <span className={clsx(
+                      'inline-flex items-center px-2 py-0.5 rounded text-xs font-medium capitalize',
+                      TYPE_BADGE_COLORS[item.type]
+                    )}>
+                      {item.type}
+                    </span>
+                    {getStatusBadge(item)}
                   </div>
-                )}
 
-                {/* Metadata row */}
-                <div className="mt-3 flex items-center gap-4 text-xs text-gray-500">
-                  <span>v{item.version}</span>
-                  {(item.requires_images.length + (item.requires_base_images?.length || 0)) > 0 && (
-                    <span>{item.requires_images.length + (item.requires_base_images?.length || 0)} image{(item.requires_images.length + (item.requires_base_images?.length || 0)) !== 1 && 's'}</span>
+                  {/* Name + Description */}
+                  <h3 className="text-lg font-medium text-gray-900">{item.name}</h3>
+                  {item.description && (
+                    <p className="mt-1 text-sm text-gray-600 line-clamp-2">{item.description}</p>
                   )}
-                  {item.includes_msel && <span>MSEL</span>}
-                  {item.includes_content && <span>Walkthrough</span>}
-                </div>
-              </div>
 
-              {/* Action footer */}
-              <div className="bg-gray-50 px-5 py-3 flex justify-end">
-                {getActionButton(item)}
-              </div>
-            </Link>
-          ))}
+                  {unsupported && (
+                    <div className="mt-3 flex items-start rounded-md bg-amber-50 border border-amber-200 p-2.5">
+                      <AlertTriangle className="h-4 w-4 mr-2 flex-shrink-0 text-amber-500" />
+                      <p className="text-xs text-amber-800">{support.reason}</p>
+                    </div>
+                  )}
+
+                  {/* Tags */}
+                  {item.tags.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-1">
+                      {item.tags.map((tag) => (
+                        <span
+                          key={tag}
+                          className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700"
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Metadata row */}
+                  <div className="mt-3 flex items-center gap-4 text-xs text-gray-500">
+                    <span>v{item.version}</span>
+                    {(item.requires_images.length + (item.requires_base_images?.length || 0)) > 0 && (
+                      <span>{item.requires_images.length + (item.requires_base_images?.length || 0)} image{(item.requires_images.length + (item.requires_base_images?.length || 0)) !== 1 && 's'}</span>
+                    )}
+                    {item.includes_msel && <span>MSEL</span>}
+                    {item.includes_content && <span>Walkthrough</span>}
+                  </div>
+                </div>
+
+                {/* Action footer */}
+                <div className="bg-gray-50 px-5 py-3 flex justify-end">
+                  {getActionButton(item, support)}
+                </div>
+              </Link>
+            )
+          })}
         </div>
+      )}
+
+      {installJob && (
+        <InstallProgressModal
+          jobId={installJob.jobId}
+          itemName={installJob.itemName}
+          onFinished={() => fetchItems()}
+          onClose={() => setInstallJob(null)}
+        />
       )}
     </div>
   )

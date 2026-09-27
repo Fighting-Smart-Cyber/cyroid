@@ -1,8 +1,17 @@
 // frontend/src/components/blueprints/SaveBlueprintModal.tsx
-// Unified modal for saving a range as a blueprint with export options (Issue #131)
-import { useState, useEffect } from 'react';
+/**
+ * Saving a range as a reusable blueprint, and optionally exporting it in one go.
+ *
+ * Era A only, and deliberately so: saving reads the range's Network and VM rows, which a range on
+ * the Kubernetes substrate does not have. The button that opens this is behind the
+ * `range_composition` feature for that reason, and the create endpoint refuses a Kubernetes range
+ * outright rather than writing an empty blueprint. So the Docker wording below is the right
+ * wording for the only place it appears.
+ */
+import { useState } from 'react';
 import { blueprintsApi, BlueprintCreate, BlueprintExportOptions, BlueprintExportSizeEstimate } from '../../services/api';
-import { LayoutTemplate, Loader2, Download, FileCode, Package, BookOpen, FileArchive, HardDrive, AlertCircle } from 'lucide-react';
+import { apiErrorDetail } from '../../lib/blueprints';
+import { LayoutTemplate, Loader2, Download, FileCode, BookOpen, FileArchive, HardDrive, AlertCircle } from 'lucide-react';
 import { toast } from '../../stores/toastStore';
 import { Modal, ModalBody, ModalFooter } from '../common/Modal';
 
@@ -25,11 +34,12 @@ export default function SaveBlueprintModal({
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState<string>('');
 
-  // Size estimation
+  // The size the images actually came to, filled in during Save & Export. There is no estimate
+  // to show before that: the endpoint takes a blueprint id and the blueprint does not exist yet.
   const [sizeEstimate, setSizeEstimate] = useState<BlueprintExportSizeEstimate | null>(null);
-  const [loadingSize, setLoadingSize] = useState(false);
 
-  // Export options
+  // Export options. Artifacts are absent on purpose: they are collected from the blueprint
+  // config's `artifact_ids`, and a blueprint being created from a range declares none.
   const [exportOptions, setExportOptions] = useState<BlueprintExportOptions>({
     include_msel: true,
     include_dockerfiles: true,
@@ -37,30 +47,6 @@ export default function SaveBlueprintModal({
     include_content: true,
     include_artifacts: false,
   });
-
-  // Fetch size estimate when Docker images option changes
-  useEffect(() => {
-    if (exportOptions.include_docker_images) {
-      fetchSizeEstimate();
-    } else {
-      setSizeEstimate(null);
-    }
-  }, [exportOptions.include_docker_images]);
-
-  const fetchSizeEstimate = async () => {
-    setLoadingSize(true);
-    try {
-      // First we need to save the blueprint to get an ID, or use a different approach
-      // For now, we'll create a temporary blueprint to get the estimate
-      // Actually, we need a range-based endpoint instead
-      // Let's skip this for now and show a generic message
-      setSizeEstimate(null);
-    } catch (err) {
-      console.error('Failed to fetch size estimate:', err);
-    } finally {
-      setLoadingSize(false);
-    }
-  };
 
   const toggleOption = (key: keyof BlueprintExportOptions) => {
     setExportOptions((prev) => ({
@@ -83,8 +69,8 @@ export default function SaveBlueprintModal({
       toast.success('Blueprint saved successfully');
       onSuccess();
       onClose();
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to save blueprint');
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to save blueprint'));
     } finally {
       setSubmitting(false);
     }
@@ -103,15 +89,15 @@ export default function SaveBlueprintModal({
       };
       const blueprint = await blueprintsApi.create(data);
 
-      // If Docker images are included, fetch size estimate for progress display
+      // If images are included, fetch size estimate for progress display
       if (exportOptions.include_docker_images) {
         setExportProgress('Calculating export size...');
         try {
           const estimate = await blueprintsApi.getExportSize(blueprint.data.id, true);
           setSizeEstimate(estimate);
-          setExportProgress(`Exporting ${estimate.docker_images.length} Docker images (${estimate.docker_images_total_human})...`);
-        } catch (err) {
-          setExportProgress('Exporting Docker images...');
+          setExportProgress(`Exporting ${estimate.docker_images.length} image(s) (${estimate.docker_images_total_human})...`);
+        } catch {
+          setExportProgress('Exporting images...');
         }
       } else {
         setExportProgress('Generating export package...');
@@ -133,8 +119,8 @@ export default function SaveBlueprintModal({
       toast.success('Blueprint saved and exported successfully');
       onSuccess();
       onClose();
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to save and export blueprint');
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to save and export blueprint'));
     } finally {
       setExporting(false);
       setExportProgress('');
@@ -253,23 +239,7 @@ export default function SaveBlueprintModal({
                 </div>
               </label>
 
-              {/* Artifacts */}
-              <label className="flex items-start p-2 border rounded-lg hover:bg-gray-50 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={exportOptions.include_artifacts}
-                  onChange={() => toggleOption('include_artifacts')}
-                  className="h-4 w-4 mt-0.5 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded"
-                />
-                <div className="ml-3 flex-1">
-                  <div className="flex items-center">
-                    <Package className="h-4 w-4 mr-2 text-gray-400" />
-                    <span className="font-medium text-sm text-gray-900">Artifacts</span>
-                  </div>
-                </div>
-              </label>
-
-              {/* Docker Images (with warning) */}
+              {/* Image tarballs (with warning) */}
               <label className="flex items-start p-2 border rounded-lg hover:bg-gray-50 cursor-pointer">
                 <input
                   type="checkbox"
@@ -280,7 +250,7 @@ export default function SaveBlueprintModal({
                 <div className="ml-3 flex-1">
                   <div className="flex items-center">
                     <HardDrive className="h-4 w-4 mr-2 text-gray-400" />
-                    <span className="font-medium text-sm text-gray-900">Docker Image Tarballs</span>
+                    <span className="font-medium text-sm text-gray-900">Image tarballs</span>
                   </div>
                   {exportOptions.include_docker_images && (
                     <div className="mt-1 space-y-1">
@@ -290,18 +260,12 @@ export default function SaveBlueprintModal({
                       </div>
                       {sizeEstimate && sizeEstimate.docker_images.length > 0 && (
                         <div className="p-1.5 bg-blue-50 rounded text-xs text-blue-700">
-                          <span className="font-medium">Estimated size: {sizeEstimate.docker_images_total_human}</span>
+                          <span className="font-medium">Total size: {sizeEstimate.docker_images_total_human}</span>
                           <div className="mt-1 text-blue-600">
                             {sizeEstimate.docker_images.map((img, i) => (
                               <div key={i}>• {img.tag}: {img.size_human}</div>
                             ))}
                           </div>
-                        </div>
-                      )}
-                      {loadingSize && (
-                        <div className="flex items-center p-1.5 bg-gray-50 rounded text-xs text-gray-600">
-                          <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
-                          <span>Calculating size...</span>
                         </div>
                       )}
                     </div>

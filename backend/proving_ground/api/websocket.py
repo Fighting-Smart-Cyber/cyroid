@@ -1,19 +1,64 @@
 # backend/proving_ground/api/websocket.py
-"""WebSocket endpoints for real-time console and status updates."""
+"""WebSocket endpoints for real-time console and status updates.
+
+A websocket carries no Authorization header -- `new WebSocket(url)` takes a URL
+and nothing else -- so every route here used to take the session JWT as
+`?token=`. That put the whole API credential in a URL: the browser's history,
+the access log of every proxy and ingress on the way here, and a Referer if the
+page ever links out. It is the same problem the VNC console ticket exists to
+close, so it is closed the same way. A caller exchanges its session for a
+short-lived ticket naming ONE socket (`POST /ws/ticket`), the ticket arrives as
+a cookie scoped to that socket's path, and the handshake carries it on its own.
+An access token is not accepted here at all; see `utils/security.py`.
+
+Reading a ticket establishes *who* is asking and nothing else; each route still
+has to answer *whether they may*, against the same rule its HTTP equivalent
+uses. For a long time none of them did, and knowing a VM's id was an
+interactive root shell in it. The rule is applied twice on purpose -- once when
+the ticket is minted, once when the socket opens -- so that a ticket minted
+before an entitlement was withdrawn does not outlive the withdrawal.
+
+Which rule belongs where is the distinction `api/deps.py` exists to keep:
+`check_console_access` for the console and VNC routes, because a console is
+interactive control of a running machine; `check_resource_access` for the
+status and event feeds, because those are reads. The event feed needs one more
+thing than a check at subscribe time -- see `_event_entitlement`.
+"""
 import asyncio
 import logging
-from typing import Optional
+import time
+from typing import Any, Dict, Literal, Optional, Tuple
 from uuid import UUID
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from pydantic import BaseModel
 from starlette.websockets import WebSocketState
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 import websockets
 
+from proving_ground.api.deps import CurrentUser, DBSession, check_resource_access
+from proving_ground.api.vms import check_console_access
 from proving_ground.database import get_db
+from proving_ground.models.event import EventParticipant
+from proving_ground.models.user import User
 from proving_ground.models.vm import VM
 from proving_ground.models.range import Range
-from proving_ground.utils.security import decode_access_token
+from proving_ground.utils.security import (
+    WS_TICKET_COOKIE,
+    WS_TICKET_MINUTES,
+    create_ws_ticket,
+    verify_ws_ticket,
+    ws_ticket_cookie_kwargs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +66,28 @@ router = APIRouter(tags=["WebSocket"])
 
 # VNC port for desktop VMs (noVNC websockify)
 VNC_WEBSOCKET_PORT = 8006
+
+# Close codes. 4001/4004 were already in use here and the Era B console uses
+# 4003 for a refusal, so the three stay consistent across both substrates.
+WS_UNAUTHENTICATED = 4001
+WS_FORBIDDEN = 4003
+WS_NOT_FOUND = 4004
+
+# How long a global-feed entitlement decision is reused. See _event_entitlement.
+ENTITLEMENT_TTL_SECONDS = 30
+
+# The five sockets a ticket can be minted for, and the path each one lives at
+# below this router's mount point. The path is built here from the kind and the
+# validated resource id rather than taken from the request, because a path the
+# caller supplies is a path the caller chooses: ask for a ticket scoped to
+# "/ws/" and one ticket would open every socket in the API.
+WsTicketKind = Literal["console", "vnc", "range-console", "status", "events"]
+
+# The mount prefix is recovered by removing this from the minting request's own
+# path, so the cookie is scoped to the path the browser will really dial --
+# "/api/v1/ws/console/<id>" in the app, "/ws/console/<id>" in a test that
+# mounts this router bare.
+TICKET_ROUTE = "/ws/ticket"
 
 
 def get_dind_docker_client(range_obj: Range):
@@ -37,28 +104,339 @@ def get_dind_docker_client(range_obj: Range):
     return dind_service.get_range_client(str(range_obj.id), range_obj.dind_docker_url)
 
 
-async def get_current_user_ws(websocket: WebSocket, token: str, db: Session):
-    """Authenticate WebSocket connection using JWT token."""
-    from proving_ground.models.user import User
+async def get_current_user_ws(
+    websocket: WebSocket, kind: str, resource_id: Optional[str], db: Session
+):
+    """Authenticate a websocket from its ticket cookie. Closes it if it cannot.
 
-    user_id = decode_access_token(token)
+    Authentication only. Every caller must follow it with the authorization
+    check that belongs to what it is about to hand over -- a ticket says who
+    minted it, not that they are still entitled.
+
+    The ticket is read from the cookie and never from the query string, which
+    is the point of the change: a credential in a URL is a credential in the
+    history, the logs and the Referer. An access token is refused outright,
+    because `verify_ws_ticket` accepts only `typ == "ws"`.
+    """
+    user_id = verify_ws_ticket(websocket.cookies.get(WS_TICKET_COOKIE), kind, resource_id)
     if not user_id:
-        await websocket.close(code=4001, reason="Invalid token")
+        # The reason travels to the browser, so it names the fix: the client
+        # mints a ticket immediately before every connect, including every
+        # reconnect, and a refusal here means it did not or the ticket aged out.
+        await websocket.close(
+            code=WS_UNAUTHENTICATED,
+            reason="No valid websocket ticket -- POST /ws/ticket for this socket first",
+        )
         return None
 
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).options(joinedload(User.attributes)).filter(User.id == user_id).first()
     if not user:
-        await websocket.close(code=4001, reason="User not found")
+        await websocket.close(code=WS_UNAUTHENTICATED, reason="User not found")
+        return None
+
+    if not user.is_active:
+        # `get_current_user` refuses a deactivated account with a 403 and this
+        # did not, so deactivating someone closed every HTTP route to them and
+        # left the sockets open: the credential they already hold stays valid
+        # until it expires, and a console is the last thing a revoked account
+        # should keep.
+        await websocket.close(code=WS_FORBIDDEN, reason="User account is deactivated")
         return None
 
     return user
+
+
+class WsTicketRequest(BaseModel):
+    """Which socket the caller wants to open, named by the server's own terms."""
+
+    kind: WsTicketKind
+    resource_id: Optional[UUID] = None
+
+
+def _authorize_ws_ticket(
+    kind: str, resource_id: Optional[UUID], user: User, db: Session
+) -> Tuple[str, Optional[str]]:
+    """Apply the socket's own access rule, and return (path, scoped resource).
+
+    Every branch asks exactly what the socket asks when it opens, so a ticket
+    can never be a way in through a door the handshake would have shut. It
+    raises HTTPException on a refusal, so there is no value a caller could
+    mistake for a pass.
+    """
+    if kind == "events":
+        # The event feed's path names no resource: one socket multiplexes
+        # whatever the caller then subscribes to, and every subscription is
+        # authorised at the moment it is made. So the ticket says only who.
+        return "/ws/events", None
+
+    if resource_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"A '{kind}' ticket must name the resource it opens",
+        )
+
+    if kind in ("console", "vnc"):
+        vm = db.query(VM).filter(VM.id == resource_id).first()
+        if not vm:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VM not found")
+        check_console_access(vm, user, db)
+        return f"/ws/{kind}/{resource_id}", str(resource_id)
+
+    range_obj = db.query(Range).filter(Range.id == resource_id).first()
+    if not range_obj:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Range not found")
+
+    if kind == "range-console":
+        # A privileged exec on the host daemon into the container holding every
+        # range network and machine. Platform-operator, not range-owner; the
+        # socket itself says the same thing.
+        if not user.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Administrator access required"
+            )
+        return f"/ws/range-console/{resource_id}", str(resource_id)
+
+    check_resource_access("range", range_obj.id, user, db, range_obj.created_by)
+    return f"/ws/status/{resource_id}", str(resource_id)
+
+
+@router.post("/ws/ticket")
+def issue_ws_ticket(
+    body: WsTicketRequest,
+    request: Request,
+    response: Response,
+    db: DBSession,
+    current_user: CurrentUser,
+):
+    """Exchange an authenticated session for a ticket that opens one websocket.
+
+    This is the only route here that takes the session, and it takes it in an
+    Authorization header like every other API call. What comes back is a cookie
+    scoped to the one socket path, which the handshake sends by itself -- so
+    the websocket URL carries no credential and the session never reaches a
+    log, a history entry or a Referer.
+    """
+    socket_path, scoped_to = _authorize_ws_ticket(body.kind, body.resource_id, current_user, db)
+
+    # The router is mounted under /api/v1 in the app and bare in tests that
+    # exercise it alone. Deriving the prefix from this request's own path keeps
+    # the cookie's scope right in both without hard-coding either.
+    mount_prefix = (
+        request.url.path[: -len(TICKET_ROUTE)] if request.url.path.endswith(TICKET_ROUTE) else ""
+    )
+
+    ticket = create_ws_ticket(current_user.id, body.kind, scoped_to)
+    response.set_cookie(value=ticket, **ws_ticket_cookie_kwargs(f"{mount_prefix}{socket_path}"))
+    return {"expires_in": WS_TICKET_MINUTES * 60}
+
+
+async def _refuse(websocket: WebSocket, exc: HTTPException) -> None:
+    """Close with the reason the check gave. The protocol caps it at 123 bytes."""
+    await websocket.close(code=WS_FORBIDDEN, reason=str(exc.detail)[:120])
+
+
+async def require_console_access(websocket: WebSocket, vm: VM, user: User, db: Session) -> bool:
+    """May this user open THIS VM's console? Closes the socket if not.
+
+    `/ws/console` opens a shell in the machine and `/ws/vnc` proxies its
+    framebuffer, so both ask exactly what `GET /vms/{id}/console-url` asks and
+    get the same answer: admin, the range's owner, the learner it is assigned
+    to, or a participant in its training event. The read rule is wrong here --
+    it treats an untagged resource as public, and every range on a dev host is
+    untagged, which entitled every non-student account to every console.
+    """
+    try:
+        check_console_access(vm, user, db)
+    except HTTPException as exc:
+        await _refuse(websocket, exc)
+        return False
+    return True
+
+
+async def require_range_read(
+    websocket: WebSocket, range_obj: Range, user: User, db: Session
+) -> bool:
+    """May this user read this range's live state? Closes the socket if not.
+
+    Status and events are a read, so this is the visibility rule the range's
+    own GET applies -- a student assigned to the lab sees it, a stranger does
+    not, and a private range stays private.
+    """
+    try:
+        check_resource_access("range", range_obj.id, user, db, range_obj.created_by)
+    except HTTPException as exc:
+        await _refuse(websocket, exc)
+        return False
+    return True
+
+
+def user_may_read_range(user_id: UUID, range_id: Any) -> bool:
+    """The range read rule, asked with a session of this function's own.
+
+    The event feed answers this long after its endpoint released its session,
+    on the task that routes Redis messages, so it opens and closes one per
+    decision. That cost is why the caller caches the answer.
+    """
+    try:
+        target = UUID(str(range_id))
+    except (TypeError, ValueError):
+        return False
+
+    db = next(get_db())
+    try:
+        user = (
+            db.query(User).options(joinedload(User.attributes)).filter(User.id == user_id).first()
+        )
+        if user is None or not user.is_active:
+            return False
+        range_obj = db.query(Range).filter(Range.id == target).first()
+        if range_obj is None:
+            return False
+        check_resource_access("range", range_obj.id, user, db, range_obj.created_by)
+        return True
+    except HTTPException:
+        return False
+    finally:
+        db.close()
+
+
+def user_may_read_vm(user_id: UUID, vm_id: Any) -> bool:
+    """A VM has no owner of its own; whoever may read its range may read it."""
+    try:
+        target = UUID(str(vm_id))
+    except (TypeError, ValueError):
+        return False
+
+    db = next(get_db())
+    try:
+        vm = db.query(VM).filter(VM.id == target).first()
+        range_id = vm.range_id if vm else None
+    finally:
+        db.close()
+
+    return range_id is not None and user_may_read_range(user_id, range_id)
+
+
+def user_is_addressed_by_resource(user_id: UUID, resource_type: str, resource_id: Any) -> bool:
+    """The resource-scoped half of a notification's audience.
+
+    A notification says who it is for in three ways -- a user, a role, or the
+    resource it concerns -- and `NotificationService._build_user_query` honours
+    all three when it builds the list. The live feed has to answer the same
+    question or the two disagree, which is exactly what happened to
+    `notify_range_users`: the air-gap warning that an image was pulled from the
+    internet reached the bell of the range's owner and never their screen.
+
+    A range reaches whoever may read it; a training event reaches the people in
+    it. Anything else is not resource-addressed.
+    """
+    try:
+        target = UUID(str(resource_id))
+    except (TypeError, ValueError):
+        return False
+
+    if resource_type == "range":
+        return user_may_read_range(user_id, target)
+
+    if resource_type != "event":
+        return False
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None or not user.is_active:
+            return False
+        return (
+            db.query(EventParticipant)
+            .filter(EventParticipant.event_id == target, EventParticipant.user_id == user_id)
+            .first()
+            is not None
+        )
+    finally:
+        db.close()
+
+
+async def _deny_subscription(websocket: WebSocket, channel: str, reason: str) -> None:
+    """Refuse one subscription without tearing the socket down.
+
+    The connection is multiplexed and its other subscriptions were authorised,
+    so a refused `subscribe` is a message, not a close. It is a message rather
+    than silence because the client has no other way to tell a refusal from a
+    range that is simply quiet.
+    """
+    logger.warning("Refused subscription to %s", channel)
+    await websocket.send_json({"type": "subscribe_denied", "channel": channel, "reason": reason})
+
+
+def _event_entitlement(user: User):
+    """Build the per-event rule for one connection's share of the global feed.
+
+    Every event is published to the global channel as well as to its range's
+    own channel, and the connection manager used to deliver that channel to
+    every connected socket. Authorising a subscription therefore decided
+    nothing: a learner who subscribed to their own range still received every
+    other range's deployment messages -- namespaces, addresses, whatever a
+    capability seeded -- plus every notification addressed to someone else.
+
+    An event that names a range answers to the range's read rule. A
+    notification answers to the same three addressees the notification list
+    reads -- a user, a role, or the resource it is about -- so that what a
+    connection is told live and what it finds in the bell afterwards are the
+    same set. An event addressed to nobody is platform-wide and goes to admins.
+
+    Decisions are cached briefly because this runs on the single listener task
+    shared by every connection, and an uncached check would put a synchronous
+    query on that task for every event on every socket. The price is that a
+    grant or a revocation takes up to ENTITLEMENT_TTL_SECONDS to be felt on an
+    already-open feed.
+    """
+    user_id = user.id
+    user_id_str = str(user.id)
+    roles = list(user.roles)
+    is_admin = user.is_admin
+    cache: Dict[Tuple[str, str], Tuple[bool, float]] = {}
+
+    def entitled_to(resource_type: str, resource_id: str) -> bool:
+        key = (resource_type, resource_id)
+        now = time.monotonic()
+        decision = cache.get(key)
+        if decision is None or decision[1] <= now:
+            decision = (
+                user_is_addressed_by_resource(user_id, resource_type, resource_id),
+                now + ENTITLEMENT_TTL_SECONDS,
+            )
+            cache[key] = decision
+        return decision[0]
+
+    def may_receive(event: Dict[str, Any]) -> bool:
+        range_id = event.get("range_id")
+        if range_id:
+            return entitled_to("range", str(range_id))
+
+        data = event.get("data") or {}
+        addressee = data.get("user_id")
+        target_role = data.get("target_role")
+        resource_type = data.get("resource_type")
+        resource_id = data.get("resource_id")
+        scoped = bool(resource_type) and bool(resource_id)
+
+        # Naming an audience this rule cannot resolve is not the same as
+        # naming none: only the second is platform-wide.
+        if not (addressee or target_role or scoped):
+            return is_admin
+        if addressee and addressee == user_id_str:
+            return True
+        if target_role and target_role in roles:
+            return True
+        return scoped and entitled_to(resource_type, str(resource_id))
+
+    return may_receive
 
 
 @router.websocket("/ws/console/{vm_id}")
 async def vm_console(
     websocket: WebSocket,
     vm_id: UUID,
-    token: str = Query(...),
 ):
     """
     WebSocket endpoint for VM console access.
@@ -74,14 +452,17 @@ async def vm_console(
 
     try:
         # Authenticate
-        user = await get_current_user_ws(websocket, token, db)
+        user = await get_current_user_ws(websocket, "console", str(vm_id), db)
         if not user:
             return
 
         # Get VM with range loaded
         vm = db.query(VM).filter(VM.id == vm_id).first()
         if not vm:
-            await websocket.close(code=4004, reason="VM not found")
+            await websocket.close(code=WS_NOT_FOUND, reason="VM not found")
+            return
+
+        if not await require_console_access(websocket, vm, user, db):
             return
 
         if not vm.container_id:
@@ -224,7 +605,6 @@ async def vm_console(
 async def vm_vnc_console(
     websocket: WebSocket,
     vm_id: UUID,
-    token: str = Query(...),
 ):
     """
     WebSocket proxy for VNC console access (noVNC).
@@ -245,14 +625,17 @@ async def vm_vnc_console(
 
     try:
         # Authenticate
-        user = await get_current_user_ws(websocket, token, db)
+        user = await get_current_user_ws(websocket, "vnc", str(vm_id), db)
         if not user:
             return
 
         # Get VM
         vm = db.query(VM).filter(VM.id == vm_id).first()
         if not vm:
-            await websocket.close(code=4004, reason="VM not found")
+            await websocket.close(code=WS_NOT_FOUND, reason="VM not found")
+            return
+
+        if not await require_console_access(websocket, vm, user, db):
             return
 
         if not vm.container_id:
@@ -423,7 +806,6 @@ async def vm_vnc_console(
 async def range_console(
     websocket: WebSocket,
     range_id: UUID,
-    token: str = Query(...),
 ):
     """
     WebSocket endpoint for Range Console - shell access to the DinD container.
@@ -443,19 +825,27 @@ async def range_console(
 
     try:
         # Authenticate
-        user = await get_current_user_ws(websocket, token, db)
+        user = await get_current_user_ws(websocket, "range-console", str(range_id), db)
         if not user:
             return
 
-        # Check user has admin or range_engineer role for console access
-        if user.role not in ["admin", "range_engineer"]:
-            await websocket.close(code=4003, reason="Insufficient permissions")
+        # A privileged exec on the HOST daemon, into the container that holds
+        # every range network and machine -- a platform-operator capability,
+        # not a range-owner one, so it stays admin-only.
+        #
+        # It was gated on `user.role`, the deprecated column, against a role
+        # name ("range_engineer") that is not in UserRole at all: the second
+        # name matched nobody and the first answered from a field the rest of
+        # the authorization surface stopped trusting. `is_admin` reads the ABAC
+        # roles array, which is the one every other check here consults.
+        if not user.is_admin:
+            await websocket.close(code=WS_FORBIDDEN, reason="Administrator access required")
             return
 
         # Get range
         range_obj = db.query(Range).filter(Range.id == range_id).first()
         if not range_obj:
-            await websocket.close(code=4004, reason="Range not found")
+            await websocket.close(code=WS_NOT_FOUND, reason="Range not found")
             return
 
         # Check if range has DinD container
@@ -585,7 +975,6 @@ async def range_console(
 async def range_status(
     websocket: WebSocket,
     range_id: UUID,
-    token: str = Query(...),
 ):
     """
     WebSocket endpoint for range status updates.
@@ -597,7 +986,7 @@ async def range_status(
     connection_id = f"status_{range_id}_{id(websocket)}"
 
     try:
-        user = await get_current_user_ws(websocket, token, db)
+        user = await get_current_user_ws(websocket, "status", str(range_id), db)
         if not user:
             return
 
@@ -606,10 +995,14 @@ async def range_status(
 
         range_obj = db.query(Range).filter(Range.id == range_id).first()
         if not range_obj:
-            await websocket.close(code=4004, reason="Range not found")
+            await websocket.close(code=WS_NOT_FOUND, reason="Range not found")
             return
 
-        # Register with connection manager for real-time events
+        if not await require_range_read(websocket, range_obj, user, db):
+            return
+
+        # Registered without an entitlement rule: this feed is one range, and
+        # the subscription below is the only thing it should ever receive.
         connection_manager = get_connection_manager()
         await connection_manager.connect(connection_id, websocket)
         await connection_manager.subscribe_to_range(connection_id, str(range_id))
@@ -670,7 +1063,6 @@ async def range_status(
 @router.websocket("/ws/events")
 async def system_events(
     websocket: WebSocket,
-    token: str = Query(...),
     range_id: Optional[UUID] = Query(None),
 ):
     """
@@ -694,9 +1086,27 @@ async def system_events(
     connection_id = f"events_{id(websocket)}"
 
     try:
-        user = await get_current_user_ws(websocket, token, db)
+        user = await get_current_user_ws(websocket, "events", None, db)
         if not user:
             return
+
+        # The subscription the URL asks for is settled before the socket joins
+        # the feed at all: a caller refused their range never becomes a
+        # recipient of anything.
+        if range_id:
+            range_obj = db.query(Range).filter(Range.id == range_id).first()
+            if not range_obj:
+                await websocket.close(code=WS_NOT_FOUND, reason="Range not found")
+                return
+            if not await require_range_read(websocket, range_obj, user, db):
+                return
+
+        user_id = user.id
+        # A socket that named a range is that range's feed and takes nothing
+        # from the global channel. A socket that named none is the
+        # notification feed, and gets the share of the global channel its user
+        # is entitled to.
+        may_receive = None if range_id else _event_entitlement(user)
 
         # Release DB session - only needed for auth
         db.close()
@@ -708,7 +1118,7 @@ async def system_events(
         )
 
         connection_manager = get_connection_manager()
-        await connection_manager.connect(connection_id, websocket)
+        await connection_manager.connect(connection_id, websocket, may_receive)
 
         # If range_id specified, subscribe to that range
         if range_id:
@@ -737,10 +1147,18 @@ async def system_events(
                 action = data.get("action")
 
                 if action == "subscribe" and "range_id" in data:
-                    await connection_manager.subscribe_to_range(connection_id, data["range_id"])
-                    await websocket.send_json(
-                        {"type": "subscribed", "channel": f"range:{data['range_id']}"}
-                    )
+                    # Every subscribe is a fresh authorization decision. The
+                    # socket asking is authenticated, which says nothing about
+                    # the range it just named.
+                    if user_may_read_range(user_id, data["range_id"]):
+                        await connection_manager.subscribe_to_range(connection_id, data["range_id"])
+                        await websocket.send_json(
+                            {"type": "subscribed", "channel": f"range:{data['range_id']}"}
+                        )
+                    else:
+                        await _deny_subscription(
+                            websocket, f"range:{data['range_id']}", "You cannot read this range"
+                        )
 
                 elif action == "unsubscribe" and "range_id" in data:
                     channel = f"{RANGE_CHANNEL_PREFIX}{data['range_id']}"
@@ -750,10 +1168,15 @@ async def system_events(
                     )
 
                 elif action == "subscribe_vm" and "vm_id" in data:
-                    await connection_manager.subscribe_to_vm(connection_id, data["vm_id"])
-                    await websocket.send_json(
-                        {"type": "subscribed", "channel": f"vm:{data['vm_id']}"}
-                    )
+                    if user_may_read_vm(user_id, data["vm_id"]):
+                        await connection_manager.subscribe_to_vm(connection_id, data["vm_id"])
+                        await websocket.send_json(
+                            {"type": "subscribed", "channel": f"vm:{data['vm_id']}"}
+                        )
+                    else:
+                        await _deny_subscription(
+                            websocket, f"vm:{data['vm_id']}", "You cannot read this VM's range"
+                        )
 
                 elif action == "ping":
                     await websocket.send_json({"type": "pong"})

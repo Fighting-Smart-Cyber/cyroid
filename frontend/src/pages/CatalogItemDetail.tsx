@@ -9,9 +9,16 @@ import {
 } from '../services/api'
 import { useAuthStore } from '../stores/authStore'
 import { toast } from '../stores/toastStore'
+import { catalogInstallApi } from '../services/catalogInstall'
+import { InstallProgressModal } from '../components/catalog'
+import { useFeature, useSubstrate } from '../stores/capabilitiesStore'
+import { apiErrorDetail } from '../lib/blueprints'
+import { catalogItemSupport } from '../lib/catalogSupport'
 import {
   Loader2,
   ArrowLeft,
+  AlertTriangle,
+  Ban,
   Download,
   Check,
   ArrowUpCircle,
@@ -25,6 +32,13 @@ import {
   HardDrive,
 } from 'lucide-react'
 import clsx from 'clsx'
+
+/**
+ * The detail type plus the schema version the backend reports when it knows one. `schema_version`
+ * is not on the API's item schema yet, and an item that omits it is Era A by the platform's own
+ * definition -- which is the answer the verdict needs either way.
+ */
+type CatalogItem = CatalogItemDetailType & { schema_version?: unknown }
 
 const TYPE_BADGE_COLORS: Record<string, string> = {
   blueprint: 'bg-indigo-100 text-indigo-800',
@@ -46,10 +60,15 @@ export default function CatalogItemDetail() {
   const { sourceId, itemId } = useParams<{ sourceId: string; itemId: string }>()
   const { user } = useAuthStore()
   const isAdmin = user?.roles?.includes('admin') ?? false
+  const { substrate, isKubernetes } = useSubstrate()
+  const hasImageLibrary = useFeature('image_library')
 
-  const [item, setItem] = useState<CatalogItemDetailType | null>(null)
+  const [item, setItem] = useState<CatalogItem | null>(null)
   const [loading, setLoading] = useState(true)
   const [installing, setInstalling] = useState(false)
+  const [installJob, setInstallJob] = useState<{ jobId: string; itemName: string } | null>(
+    null
+  )
 
   useEffect(() => {
     if (!sourceId || !itemId) return
@@ -59,8 +78,8 @@ export default function CatalogItemDetail() {
       try {
         const res = await catalogApi.getItemDetail(sourceId, decodeURIComponent(itemId))
         setItem(res.data)
-      } catch (err: any) {
-        toast.error(err.response?.data?.detail || 'Failed to load item details')
+      } catch (err: unknown) {
+        toast.error(apiErrorDetail(err, 'Failed to load item details'))
       } finally {
         setLoading(false)
       }
@@ -69,10 +88,32 @@ export default function CatalogItemDetail() {
     fetchDetail()
   }, [sourceId, itemId])
 
+  /**
+   * The refusal this install has for the item, or null when it has none -- which is also the
+   * answer while the substrate is still unknown, so a page mid-load offers what it offered before.
+   */
+  const support = item
+    ? catalogItemSupport(item, { substrate, isKubernetes, hasImageLibrary })
+    : null
+  const refusal = support && !support.supported ? support : null
+
   const handleInstall = async () => {
     if (!item || !sourceId) return
+    // The sidebar offers no Install button while this holds; this catches a verdict that arrived
+    // after the click. An item installed here is a row that fails at its first deploy instead.
+    if (refusal) {
+      toast.error(refusal.reason)
+      return
+    }
     setInstalling(true)
     try {
+      // Blueprints resolve their dependencies first and report each step; see
+      // the one-click installer. Other item types install directly.
+      if (item.type === 'blueprint') {
+        const job = await catalogInstallApi.start(item.id, sourceId, true)
+        setInstallJob({ jobId: job.job_id, itemName: item.name })
+        return
+      }
       await catalogApi.installItem(item.id, {
         source_id: sourceId,
         build_images: true,
@@ -81,10 +122,21 @@ export default function CatalogItemDetail() {
       // Refresh detail to update install status
       const res = await catalogApi.getItemDetail(sourceId, decodeURIComponent(itemId!))
       setItem(res.data)
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || `Failed to install "${item.name}"`)
+    } catch (err: unknown) {
+      // The server's own detail, which names the file, the step or the policy that refused.
+      toast.error(apiErrorDetail(err, `Failed to install "${item.name}"`))
     } finally {
       setInstalling(false)
+    }
+  }
+
+  const refreshDetail = async () => {
+    if (!sourceId || !itemId) return
+    try {
+      const res = await catalogApi.getItemDetail(sourceId, decodeURIComponent(itemId))
+      setItem(res.data)
+    } catch {
+      // Non-critical: the install already reported its own outcome.
     }
   }
 
@@ -172,6 +224,20 @@ export default function CatalogItemDetail() {
               </div>
             </div>
 
+            {/* Said before the install, not after it: an item this substrate cannot deploy
+                installs cleanly and then fails at the one moment the user cares about. */}
+            {refusal && (
+              <div className="mt-4 flex items-start p-4 rounded-lg bg-amber-50 border border-amber-200">
+                <AlertTriangle className="h-5 w-5 mr-3 flex-shrink-0 text-amber-500" />
+                <div>
+                  <p className="text-sm font-medium text-amber-900">
+                    Not supported on this install
+                  </p>
+                  <p className="mt-1 text-sm text-amber-800">{refusal.reason}</p>
+                </div>
+              </div>
+            )}
+
             {/* Tags */}
             {item.tags.length > 0 && (
               <div className="mt-4 flex flex-wrap gap-2">
@@ -207,7 +273,22 @@ export default function CatalogItemDetail() {
           <div className="bg-white shadow rounded-lg p-6">
             <h3 className="text-sm font-semibold text-gray-900 uppercase tracking-wide mb-4">Actions</h3>
 
-            {item.installed ? (
+            {refusal ? (
+              /* No Install button at all rather than one that would succeed and leave something
+                 undeployable behind. The reason is already stated in full above this card. */
+              <div className="space-y-3">
+                <div className="flex items-center text-gray-600 bg-gray-100 border border-gray-300 rounded-md p-3 text-sm">
+                  <Ban className="h-5 w-5 mr-2 flex-shrink-0 text-gray-400" />
+                  {refusal.badge}
+                </div>
+                {item.installed && (
+                  <div className="flex items-center text-green-700 bg-green-50 rounded-md p-3 text-sm">
+                    <Check className="h-5 w-5 mr-2 flex-shrink-0" />
+                    Installed {item.installed_version && `(v${item.installed_version})`}
+                  </div>
+                )}
+              </div>
+            ) : item.installed ? (
               item.update_available ? (
                 <div className="space-y-3">
                   <div className="flex items-center text-amber-700 bg-amber-50 rounded-md p-3 text-sm">
@@ -305,6 +386,15 @@ export default function CatalogItemDetail() {
           {(item.requires_images.length > 0 || (item.requires_base_images && item.requires_base_images.length > 0)) && (
             <div className="bg-white shadow rounded-lg p-6">
               <h3 className="text-sm font-semibold text-gray-900 uppercase tracking-wide mb-4">Required Images</h3>
+              {/* Only once the install has said what it is. `useFeature` answers false while
+                  /system/capabilities is still in flight and for good after it fails outright,
+                  so an ungated note tells a Docker operator their image library does not exist. */}
+              {substrate !== null && !hasImageLibrary && (
+                <p className="mb-3 text-xs text-gray-500">
+                  These are Docker images for the image library, which this install does not have.
+                  Nothing below would be installed here.
+                </p>
+              )}
               <ul className="space-y-2">
                 {item.requires_images.map((img) => (
                   <li key={img} className="flex items-center text-sm text-gray-700">
@@ -344,6 +434,15 @@ export default function CatalogItemDetail() {
           )}
         </div>
       </div>
+
+      {installJob && (
+        <InstallProgressModal
+          jobId={installJob.jobId}
+          itemName={installJob.itemName}
+          onFinished={() => refreshDetail()}
+          onClose={() => setInstallJob(null)}
+        />
+      )}
     </div>
   )
 }

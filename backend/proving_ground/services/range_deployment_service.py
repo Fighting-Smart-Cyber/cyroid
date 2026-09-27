@@ -17,6 +17,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from proving_ground.config import get_settings
+from proving_ground.utils.arch import requires_emulation
 from proving_ground.services.registry_service import RegistryService
 from proving_ground.services.image_resolution import resolve_vm_image
 from proving_ground.models import Range, Network, VM, RangeStatus
@@ -58,9 +59,34 @@ settings = get_settings()
 from proving_ground.utils.memory import (  # noqa: E402
     QEMU_OVERHEAD_MB as _QEMU_OVERHEAD_MB,
     vm_container_memory_mb as _vm_container_memory_mb,
+    parse_memory_to_mb as _parse_memory_to_mb,
 )
 
 __all__ = ["_QEMU_OVERHEAD_MB", "_vm_container_memory_mb"]
+
+
+def _install_iso_mb(environment: dict, volumes: Optional[dict]) -> Optional[int]:
+    """Size of the ISO this VM is installing from, in MiB, or None.
+
+    Both container-creation paths signal an ISO boot the same way: the file is
+    bind-mounted and BOOT points at it. A VM booting a disk it already has sets
+    neither, gets None, and is sized exactly as it was before.
+
+    Returns None rather than raising if the file cannot be measured -- the ISO
+    allowance is an optimisation on top of a working budget, so losing it must
+    not fail a deploy.
+    """
+    boot = environment.get("BOOT") if environment else None
+    if not boot or not volumes:
+        return None
+    for host_path, spec in volumes.items():
+        if isinstance(spec, dict) and spec.get("bind") == boot:
+            try:
+                return int(os.path.getsize(host_path) / (1024 * 1024))
+            except OSError as e:
+                logger.warning(f"Could not size install ISO {host_path}: {e}")
+                return None
+    return None
 
 
 def _has_usable_disk(storage_dir: str) -> bool:
@@ -262,6 +288,96 @@ class RangeDeploymentService:
             range_obj.error_message = str(e)[:1000]
             db.commit()
             raise
+
+    async def _kvm_for_range(self, range_id: str, target_arch: "Optional[str]" = None) -> str:
+        """dockur's KVM env value for a guest in this range: "Y" or "N".
+
+        Asks the range's own DinD container, not the host and not this process.
+        The API and worker containers do not have /dev/kvm mapped in, so the
+        obvious os.path.exists("/dev/kvm") answers about the wrong machine and
+        returns False on a host that has it -- which is how the DinD path came
+        to hardcode "N" and cost every KVM-capable host a ~10x slowdown.
+
+        Fails closed. KVM="Y" where KVM is not usable makes QEMU refuse to
+        start; a slow guest beats one that never boots.
+        """
+        setting = get_settings().range_kvm
+
+        if setting == "off":
+            return "N"
+
+        if target_arch and requires_emulation(target_arch):
+            # Cross-architecture guests are emulated whatever the host offers.
+            return "N"
+
+        if setting == "on":
+            return "Y"
+
+        try:
+            exit_code, _ = await self.dind_service.exec_in_container(
+                str(range_id), ["test", "-e", "/dev/kvm"]
+            )
+        except Exception as e:  # noqa: BLE001 - probe failure must not fail a deploy
+            logger.warning(f"KVM probe failed for range {range_id}, assuming none: {e}")
+            return "N"
+
+        if exit_code == 0:
+            logger.info(f"KVM acceleration enabled for range {range_id}")
+            return "Y"
+        logger.info(f"No /dev/kvm in the range container for {range_id}; guests will be emulated")
+        return "N"
+
+    # dockur reads this to decide whether the host is virtualised, and it is the
+    # same signal used here: an Azure VM reports the Hyper-V clocksource.
+    _HYPERV_CLOCKSOURCE = "hyperv_clocksource_tsc_page"
+    _CLOCKSOURCE_PATH = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+
+    async def _host_is_hyperv_guest(self, range_id: str) -> bool:
+        """Is the machine running this range itself a Hyper-V guest?
+
+        Read from inside the range container for the same reason as the KVM
+        probe: this process is not on the machine that runs the guest.
+        """
+        try:
+            exit_code, out = await self.dind_service.exec_in_container(
+                str(range_id), ["cat", self._CLOCKSOURCE_PATH]
+            )
+        except Exception as e:  # noqa: BLE001 - probe failure must not fail a deploy
+            logger.warning(f"Clocksource probe failed for range {range_id}: {e}")
+            return False
+        return exit_code == 0 and self._HYPERV_CLOCKSOURCE in (out or "")
+
+    async def _virt_env_for_range(
+        self, range_id: str, target_arch: "Optional[str]" = None
+    ) -> "dict[str, str]":
+        """KVM and Hyper-V settings for a guest in this range.
+
+        Decided together because HV only means anything when KVM is on. dockur
+        passes Hyper-V enlightenments through by default under KVM, and on a
+        host that is itself a Hyper-V guest that makes a Windows guest shut
+        down seconds after the boot manager starts -- silently, with nothing
+        logged by QEMU or KVM, so it reads as a broken image rather than a
+        broken flag.
+        """
+        kvm = await self._kvm_for_range(range_id, target_arch)
+        env = {"KVM": kvm}
+        if kvm != "Y":
+            return env
+
+        setting = get_settings().range_hyperv
+        if setting == "on":
+            return env
+        if setting == "off":
+            env["HV"] = "false"
+            return env
+
+        if await self._host_is_hyperv_guest(range_id):
+            logger.info(
+                f"Range {range_id}: host is a Hyper-V guest, disabling nested "
+                f"Hyper-V enlightenments"
+            )
+            env["HV"] = "false"
+        return env
 
     async def _deploy_with_dind(
         self,
@@ -757,7 +873,7 @@ class RangeDeploymentService:
                     environment["RAM_SIZE"] = f"{vm.ram_mb or 4096}M"
                     environment["DISK_SIZE"] = f"{vm.disk_gb or 64}G"
 
-                    environment["KVM"] = "N"
+                    environment.update(await self._virt_env_for_range(range_obj.id))
                     privileged = True  # Required for KVM access
                     labels["pg.vm_type"] = "windows"
 
@@ -782,7 +898,11 @@ class RangeDeploymentService:
                     ip_address=primary_ip,
                     cpu_limit=vm.cpu or 2,
                     memory_limit_mb=(
-                        _vm_container_memory_mb(vm.ram_mb or 4096)
+                        _vm_container_memory_mb(
+                            vm.ram_mb or 4096,
+                            install_iso_mb=_install_iso_mb(environment, volumes),
+                            range_cap_mb=_parse_memory_to_mb(memory_limit),
+                        )
                         if privileged
                         else (vm.ram_mb or 2048)
                     ),
@@ -1384,8 +1504,7 @@ class RangeDeploymentService:
                     environment["CPU_CORES"] = str(vm.cpu or 2)
                     environment["RAM_SIZE"] = f"{vm.ram_mb or 4096}M"
                     environment["DISK_SIZE"] = f"{vm.disk_gb or 64}G"
-                    # Disable KVM requirement for Docker Desktop / nested virtualization
-                    environment["KVM"] = "N"
+                    environment.update(await self._virt_env_for_range(range_obj.id))
                     privileged = True
                     labels["pg.vm_type"] = "windows"
 
@@ -1402,8 +1521,7 @@ class RangeDeploymentService:
                     environment["CPU_CORES"] = str(vm.cpu or 2)
                     environment["RAM_SIZE"] = f"{vm.ram_mb or 2048}M"
                     environment["DISK_SIZE"] = f"{vm.disk_gb or 20}G"
-                    # Disable KVM requirement for Docker Desktop / nested virtualization
-                    environment["KVM"] = "N"
+                    environment.update(await self._virt_env_for_range(range_obj.id))
                     privileged = True
                     labels["pg.vm_type"] = "linux"
 
@@ -1417,7 +1535,13 @@ class RangeDeploymentService:
                     ip_address=primary_ip,
                     cpu_limit=vm.cpu or 2,
                     memory_limit_mb=(
-                        _vm_container_memory_mb(vm.ram_mb or 4096)
+                        _vm_container_memory_mb(
+                            vm.ram_mb or 4096,
+                            install_iso_mb=_install_iso_mb(environment, volumes),
+                            range_cap_mb=_parse_memory_to_mb(
+                                getattr(settings, "range_default_memory", None)
+                            ),
+                        )
                         if privileged
                         else (vm.ram_mb or 2048)
                     ),

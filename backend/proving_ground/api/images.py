@@ -5,6 +5,18 @@ The Image Library consists of three tiers:
 - Base Images: Container images and cached ISOs
 - Golden Images: First snapshots or imported VMs
 - Snapshots: Follow-on snapshots (forks)
+
+Reads are open to any authenticated account, because the library is a
+visibility surface: whoever builds a range has to see what there is to pick
+from. Every mutation is admin-only.
+
+The asymmetry is deliberate. A library entry is install-wide shared state with
+no owner -- one record per image, referenced by every blueprint and every range
+built from it -- so a delete has nobody to answer to but an administrator, and
+the image cache that feeds this library already applies exactly that rule.
+Before this, every route stopped at CurrentUser, which is a login and not a
+permission: any authenticated account, a student included, could delete a base
+image out from under every range using it, or import one.
 """
 from typing import List, Optional
 from uuid import UUID
@@ -13,7 +25,7 @@ import logging
 from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form
 from pydantic import BaseModel
 
-from proving_ground.api.deps import DBSession, CurrentUser
+from proving_ground.api.deps import AdminUser, DBSession, CurrentUser
 from proving_ground.models.base_image import BaseImage
 from proving_ground.models.golden_image import GoldenImage
 from proving_ground.models.snapshot import Snapshot
@@ -53,7 +65,7 @@ class SyncResult(BaseModel):
 @router.post("/sync-from-cache", response_model=SyncResult)
 def sync_from_cache(
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AdminUser,
 ):
     """
     Sync cached images to the Image Library.
@@ -330,7 +342,7 @@ def list_base_images(
 def create_base_image(
     image_data: BaseImageCreate,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AdminUser,
 ):
     """Create a new base image record."""
     base_image = BaseImage(
@@ -379,7 +391,7 @@ def update_base_image(
     image_id: UUID,
     update_data: BaseImageUpdate,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AdminUser,
 ):
     """Update a base image."""
     base_image = db.query(BaseImage).filter(BaseImage.id == image_id).first()
@@ -402,7 +414,7 @@ def update_base_image(
 def delete_base_image(
     image_id: UUID,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AdminUser,
 ):
     """Delete a base image."""
     base_image = db.query(BaseImage).filter(BaseImage.id == image_id).first()
@@ -461,7 +473,7 @@ def list_golden_images(
 def create_golden_image(
     image_data: GoldenImageCreate,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AdminUser,
 ):
     """Create a new golden image record (usually done automatically on first snapshot)."""
     golden_image = GoldenImage(
@@ -512,7 +524,7 @@ def update_golden_image(
     image_id: UUID,
     update_data: GoldenImageUpdate,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AdminUser,
 ):
     """Update a golden image."""
     golden_image = db.query(GoldenImage).filter(GoldenImage.id == image_id).first()
@@ -535,7 +547,7 @@ def update_golden_image(
 def delete_golden_image(
     image_id: UUID,
     db: DBSession,
-    current_user: CurrentUser,
+    current_user: AdminUser,
 ):
     """Delete a golden image."""
     golden_image = db.query(GoldenImage).filter(GoldenImage.id == image_id).first()
@@ -581,7 +593,7 @@ async def import_golden_image(
     default_ram_mb: int = Form(4096),
     default_disk_gb: int = Form(40),
     db: DBSession = None,
-    current_user: CurrentUser = None,
+    current_user: AdminUser = None,
 ):
     """Import an OVA/QCOW2/VMDK file as a golden image."""
     from proving_ground.services.image_import_service import ImageImportService
@@ -617,6 +629,17 @@ async def import_golden_image(
             db=db,
         )
         return golden_image
+    except ValueError as e:
+        # A refused archive is the upload being wrong, not the server failing.
+        # The import service raises this for an OVA whose members would write
+        # outside the directory it extracts into and for one carrying no disk
+        # at all; reporting either as a 500 invites the user to retry something
+        # that cannot work, and buries the reason.
+        logger.warning(f"Rejected image import: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
     except Exception as e:
         logger.error(f"Failed to import image: {e}")
         raise HTTPException(

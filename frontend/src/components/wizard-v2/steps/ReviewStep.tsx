@@ -9,11 +9,10 @@ import {
   Edge,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { ChevronDown, ChevronRight, Network, Server, Users, ShieldAlert } from 'lucide-react';
+import { ChevronDown, ChevronRight, Network, Server } from 'lucide-react';
 import { useWizardStore } from '../../../stores/wizardStore';
 import { WizardNetworkNode } from '../nodes/WizardNetworkNode';
 import { WizardVMNode } from '../nodes/WizardVMNode';
-import { VULN_PRESETS } from '../data/vulnPresets';
 
 interface CollapsibleSectionProps {
   title: string;
@@ -49,13 +48,11 @@ function CollapsibleSection({ title, icon: Icon, count, children, defaultOpen = 
 }
 
 export function ReviewStep() {
-  const { environment, services, networks, users, vulnerabilities, rangeName, saveAsBlueprint, setRangeName, setSaveAsBlueprint } = useWizardStore();
+  const { environment, services, networks, rangeName, saveAsBlueprint, setRangeName, setSaveAsBlueprint } = useWizardStore();
 
   // Calculate totals
   const totalVms = networks.vms.length;
   const totalNetworks = networks.segments.length;
-  const totalUsers = users.groups.reduce((sum, g) => sum + g.count, 0);
-  const vulnPreset = VULN_PRESETS[vulnerabilities.preset];
 
   // Read-only React Flow nodes
   const nodes: Node[] = useMemo(() => {
@@ -143,10 +140,7 @@ export function ReviewStep() {
               <div className="text-lg font-semibold text-gray-900">{totalVms}</div>
               <div className="text-xs text-gray-500">VMs</div>
             </div>
-            <div>
-              <div className="text-lg font-semibold text-gray-900">{totalUsers}</div>
-              <div className="text-xs text-gray-500">Users</div>
-            </div>
+
           </div>
         </div>
       </div>
@@ -207,35 +201,6 @@ export function ReviewStep() {
           </table>
         </CollapsibleSection>
 
-        <CollapsibleSection title="Users" icon={Users} count={totalUsers}>
-          {totalUsers === 0 ? (
-            <p className="text-gray-500 text-sm">No users configured</p>
-          ) : (
-            <div className="grid grid-cols-4 gap-4">
-              {users.groups.filter(g => g.count > 0).map((group) => (
-                <div key={group.id} className="text-center p-3 bg-gray-50 rounded-lg">
-                  <div className="text-2xl font-bold text-gray-900">{group.count}</div>
-                  <div className="text-sm text-gray-600">{group.name}</div>
-                </div>
-              ))}
-            </div>
-          )}
-        </CollapsibleSection>
-
-        <CollapsibleSection title="Vulnerabilities" icon={ShieldAlert} count={vulnPreset.vulnIds.length}>
-          <div className="flex items-center gap-4">
-            <div>
-              <span className="font-medium text-gray-900">{vulnPreset.name}</span>
-              <p className="text-sm text-gray-500">{vulnPreset.description}</p>
-            </div>
-          </div>
-          {vulnerabilities.narrative && (
-            <div className="mt-3 p-3 bg-gray-50 rounded-lg">
-              <div className="text-xs font-medium text-gray-500 mb-1">Attack Narrative</div>
-              <p className="text-sm text-gray-700">{vulnerabilities.narrative}</p>
-            </div>
-          )}
-        </CollapsibleSection>
       </div>
 
       {/* Range name and options */}

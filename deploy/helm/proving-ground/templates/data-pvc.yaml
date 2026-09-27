@@ -1,0 +1,55 @@
+{{- /*
+pg-data is mounted by the API and by every worker Deployment. ReadWriteOnce means the volume
+mounts read-write on ONE node, so past a single replica the extra pods are Pending rather than
+serving -- on a multi-node cluster, silently, with nothing in the install output saying why.
+values.yaml has warned about this at api.replicas for a while; a comment is not a guard.
+
+RWX is the "RWX for a named subset" line of ADR-0012's capability contract. On Azure that is
+Azure Files rather than Azure Disk, which is RWO and zonal.
+*/}}
+{{- /*
+Whether ReadWriteOnce is fine here is a question about the CLUSTER, not about the values.
+
+pg-data is mounted by the API and by both workers -- three pods on the stock values. A
+ReadWriteOnce volume attaches to ONE node, but permits many pods on that node, so three pods
+sharing it is correct on a single-node profile and broken the moment a scheduler can spread them:
+
+    FailedAttachVolume: Waiting for detach for volume "pvc-2937d60f..."
+    Volume is already used by pod(s) pg-api-..., pg-worker-deploy-...
+
+Seen on devtest-az (3-node AKS) 2026-09-26 with stock values. Two separate reasons the previous
+guard missed it: it took max() across replica counts rather than the SUM of pods mounting the
+volume, so 1+1+1 read as 1; and it ranged over `.Values.workers`, a key that does not exist --
+templates/workers.yaml builds its two Deployments from `.Values.worker` and `.Values.workerDeploy`.
+
+So the count is now a sum over the real keys, and it is only an error when the cluster actually
+has more than one node. `lookup` returns nothing under `helm template` and `--dry-run`, which is
+why this is written to fail open: a chart that cannot see the cluster must not refuse to render.
+
+RWX is the "RWX for a named subset" line of ADR-0012's capability contract. On Azure that is
+Azure Files (azurefile-csi), not Azure Disk, which is RWO and zonal.
+*/}}
+{{- $mounters := int (.Values.api.replicas | default 1) }}
+{{- range $w := list .Values.worker .Values.workerDeploy }}
+{{-   if kindIs "map" $w }}{{ $mounters = add $mounters (int ($w.replicas | default 1)) }}{{ end }}
+{{- end }}
+{{- $nodes := len ((lookup "v1" "Node" "" "").items | default list) }}
+{{- if and (gt $mounters 1) (gt $nodes 1) (eq .Values.data.accessMode "ReadWriteOnce") }}
+{{-   fail (printf "This cluster has %d nodes and data.accessMode is ReadWriteOnce, but %d pods mount pg-data (the API and both workers). A ReadWriteOnce volume attaches to one node, so whichever pods the scheduler places elsewhere stay in ContainerCreating with FailedAttachVolume -- silently, because the install itself reports success. Set data.accessMode: ReadWriteMany with a class that supports it; on Azure that is azurefile-csi, not the default Azure Disk class, which is RWO and zonal." $nodes $mounters) }}
+{{- end }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-data
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [{{ .Values.data.accessMode }}]
+  {{- with .Values.data.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.data.size }}

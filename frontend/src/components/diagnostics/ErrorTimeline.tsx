@@ -69,7 +69,7 @@ export function ErrorTimeline({ rangeId, vms, onViewLogs }: ErrorTimelineProps) 
             className="text-xs border border-gray-300 rounded px-2 py-1"
           >
             <option value="all">All Errors</option>
-            <option value="vm_error">VM Errors</option>
+            <option value="vm_error">Machine Errors</option>
             <option value="deployment_failed">Deployment</option>
             <option value="inject_failed">Inject Failed</option>
           </select>

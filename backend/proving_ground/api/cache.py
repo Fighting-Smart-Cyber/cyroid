@@ -1,7 +1,9 @@
 # backend/proving_ground/api/cache.py
 """API endpoints for image caching and golden image management."""
+import ipaddress
 import os
 import logging
+import socket
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, HTTPException, status, BackgroundTasks, Query, UploadFile, File, Form
@@ -66,6 +68,280 @@ def get_archive_extension(path_or_url: str) -> Optional[str]:
         if lower.endswith(ext):
             return ext
     return None
+
+
+# --- outbound ISO fetches ---------------------------------------------------
+#
+# SEC-039: every ISO download endpoint in this module takes a URL out of the
+# request body and fetches it from inside the cluster, and nothing checked the
+# scheme or the destination. That made "download this ISO" a request-forgery
+# primitive aimed at the pod's own network -- the link-local instance-metadata
+# service at 169.254.169.254, which hands out credentials on every cloud this
+# deploys to; the Kubernetes API on the service network; this release's own
+# Postgres and MinIO. It was not blind, either: the response body is written
+# into the ISO cache, which the admin UI then lists and serves back.
+#
+# The finding was about the destination. The other three checks are here
+# because a destination check alone does not survive contact with the code it
+# is protecting: file:// and gopher:// never reach the address check at all, a
+# host that passes it can answer 302 to 169.254.169.254 and requests will
+# follow that itself, and a URL that streams forever fills the host disk no
+# matter where it points.
+#
+# What this does NOT close is DNS rebinding. The name is resolved here and
+# resolved again when the socket is opened, and a record with a one-second TTL
+# can differ between the two. Closing it means pinning the address that was
+# checked into the connection, which is a custom transport adapter and a real
+# risk to a download path that works today; the residual window is one
+# authenticated admin plus control of a DNS zone.
+#
+# This is an Era A surface and Era A is frozen. Frozen takes security fixes.
+
+
+class UnsafeDownloadURL(ValueError):
+    """A download URL this platform refuses to fetch.
+
+    Its message is shown to the admin who submitted the URL, so it names both
+    what was refused and the setting that would permit it. A refusal the
+    operator cannot act on reads as a broken button and gets worked around.
+    """
+
+
+# Permits plain HTTP and private/loopback destinations, for an install that
+# mirrors ISOs on its own network -- the normal arrangement in a disconnected
+# enclave, where there is no public host to fetch from. It deliberately does
+# not reach link-local: nothing serves an ISO from 169.254.0.0/16 or fe80::/10,
+# and that range is the whole point of the finding.
+ALLOW_INTERNAL_ISO_SOURCES_ENV = "PROVING_GROUND_ALLOW_INTERNAL_ISO_SOURCES"
+
+# A ceiling on what one download may write, not a statement about ISOs. The
+# largest image any of the catalogues below names is a macOS installer at
+# roughly 16 GB, so this is about double the largest legitimate case. Without
+# it, a URL that never stops sending fills the host's disk and takes every
+# running range down with it.
+MAX_ISO_BYTES_ENV = "PROVING_GROUND_MAX_ISO_BYTES"
+DEFAULT_MAX_ISO_BYTES = 32 * 1024 * 1024 * 1024
+
+# Enough for the redirect chains the public mirrors actually use (archive.org
+# and Microsoft's CDN both bounce at least once); short enough that a redirect
+# loop ends in a refusal rather than a hang.
+MAX_ISO_REDIRECTS = 8
+
+
+def internal_iso_sources_allowed() -> bool:
+    """Whether this install has opted in to plain-HTTP and private ISO sources."""
+    return os.environ.get(ALLOW_INTERNAL_ISO_SOURCES_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def max_iso_bytes() -> int:
+    """The cap on a single download, in bytes. Falls back rather than failing closed on junk."""
+    raw = os.environ.get(MAX_ISO_BYTES_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MAX_ISO_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s is not a whole number of bytes (%r); using the default cap",
+            MAX_ISO_BYTES_ENV,
+            raw,
+        )
+        return DEFAULT_MAX_ISO_BYTES
+    return value if value > 0 else DEFAULT_MAX_ISO_BYTES
+
+
+# RFC 6598 shared address space, which `ipaddress.is_private` does not report.
+# CPython changed that in 3.11.9/3.12.4 -- the range is not private, it is
+# "shared" -- so a check written against `is_private` alone gained a hole on a
+# patch upgrade, with nothing in the diff to show for it. It is not a corner
+# case on this product's deployment targets: the AWS VPC CNI is routinely given
+# a 100.64.0.0/16 secondary CIDR for pod addresses when the VPC runs out of
+# RFC 1918 space, and several managed clusters put the service network there
+# too. Without this, https://100.127.255.254:6443/api/v1/namespaces is a URL
+# this platform will fetch -- the Kubernetes API, which is one of the three
+# destinations the note at the top of this module says are closed.
+SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _refusal_for_address(address) -> Optional[str]:
+    """Why this resolved address may not be fetched from, or None if it may.
+
+    Link-local is checked before the broader private test because
+    ``ipaddress`` counts it as private, and the message matters: an operator
+    who sees "private" reaches for the opt-in, and the opt-in does not cover
+    the metadata service.
+
+    The last test is a catch-all on ``is_global`` rather than another named
+    range. Everything above it is here because leaning on one of these
+    predicates already failed once (see SHARED_ADDRESS_SPACE); a registry
+    change that moves some future range out from under ``is_private`` should
+    close this fetch, not quietly open it, and a range that stops being
+    globally reachable is one nothing serves an ISO from anyway.
+    """
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+
+    if address.is_link_local:
+        return "a link-local address, where cloud instance-metadata services live"
+    if address.is_unspecified or address.is_multicast or address.is_reserved:
+        return "not a routable unicast address"
+    if address.is_loopback:
+        return "a loopback address -- this platform's own listeners"
+    if address.is_private:
+        return "a private address inside this cluster's network"
+    if address.version == 4 and address in SHARED_ADDRESS_SPACE:
+        return (
+            "an address in the shared range 100.64.0.0/10, which cluster networking "
+            "hands to pods and services on this platform's deployment targets"
+        )
+    if not address.is_global:
+        return "not a globally routable address, so it can only be inside this network"
+    return None
+
+
+def address_is_always_refused(address) -> bool:
+    """Link-local, which the internal-sources opt-in deliberately does not reach."""
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return bool(address.is_link_local)
+
+
+def _addresses_for_host(host: str) -> list:
+    """Every address the host resolves to, or a refusal naming the host.
+
+    Every address, not the first: a name that answers with one public record
+    and one private record would otherwise pass the check and then connect to
+    whichever the resolver handed the socket.
+    """
+    try:
+        return [ipaddress.ip_address(host.strip("[]"))]
+    except ValueError:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise UnsafeDownloadURL(
+            f"The host '{host}' could not be resolved ({exc.strerror or exc}). "
+            "Check the URL, or upload the ISO instead if this host has no DNS for it."
+        ) from exc
+
+    addresses = []
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr:
+            try:
+                addresses.append(ipaddress.ip_address(sockaddr[0]))
+            except ValueError:
+                continue
+    if not addresses:
+        raise UnsafeDownloadURL(
+            f"The host '{host}' resolved to no usable address. Upload the ISO instead."
+        )
+    return addresses
+
+
+def ensure_download_url_allowed(url: str) -> None:
+    """Raise UnsafeDownloadURL unless this URL may be fetched from inside the cluster.
+
+    Called once in the request handler, so a bad URL is a 400 the admin sees,
+    and again on every redirect hop, so a permitted host cannot hand the fetch
+    on to one that was refused.
+    """
+    from urllib.parse import urlparse
+
+    allow_internal = internal_iso_sources_allowed()
+
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise UnsafeDownloadURL(f"'{url}' is not a URL this platform can parse.") from exc
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise UnsafeDownloadURL(
+            f"Refusing to download from a '{scheme or 'missing'}' URL. "
+            "ISO sources must be https:// (or http:// on an install that has set "
+            f"{ALLOW_INTERNAL_ISO_SOURCES_ENV}=true for an internal mirror)."
+        )
+    if scheme == "http" and not allow_internal:
+        raise UnsafeDownloadURL(
+            "Refusing to download over plain http, which any host on the path can rewrite. "
+            f"Use an https:// URL, or set {ALLOW_INTERNAL_ISO_SOURCES_ENV}=true if this "
+            "install mirrors ISOs on its own network."
+        )
+
+    host = parsed.hostname
+    if not host:
+        raise UnsafeDownloadURL(f"'{url}' names no host to download from.")
+
+    for address in _addresses_for_host(host):
+        refusal = _refusal_for_address(address)
+        if refusal is None:
+            continue
+        always = address_is_always_refused(address)
+        if allow_internal and not always:
+            continue
+        remedy = (
+            "The internal-sources setting does not cover it."
+            if always
+            else f"Set {ALLOW_INTERNAL_ISO_SOURCES_ENV}=true if this install mirrors ISOs "
+            "on its own network."
+        )
+        raise UnsafeDownloadURL(
+            f"Refusing to download from '{host}': it resolves to {address}, which is "
+            f"{refusal}. {remedy}"
+        )
+
+
+def open_validated_download(url: str, timeout: int):
+    """A streaming response for `url`, having checked every hop it took to get there.
+
+    Redirects are followed here rather than by requests, because requests would
+    follow one into the address space the caller just refused. The returned
+    response has had raise_for_status() applied, so callers that key their
+    mirror fallback off requests.exceptions.HTTPError still see it.
+    """
+    import requests
+    from urllib.parse import urljoin
+
+    current = url
+    for _ in range(MAX_ISO_REDIRECTS + 1):
+        ensure_download_url_allowed(current)
+        response = requests.get(current, stream=True, timeout=timeout, allow_redirects=False)
+
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("location")
+            response.close()
+            if not location:
+                raise UnsafeDownloadURL(
+                    f"'{current}' answered {response.status_code} with no destination."
+                )
+            current = urljoin(current, location)
+            continue
+
+        response.raise_for_status()
+
+        declared = response.headers.get("content-length")
+        cap = max_iso_bytes()
+        if declared and declared.isdigit() and int(declared) > cap:
+            response.close()
+            raise UnsafeDownloadURL(
+                f"'{current}' declares {int(declared)} bytes, over the {cap}-byte cap. "
+                f"Raise {MAX_ISO_BYTES_ENV} if this image really is that large."
+            )
+        return response
+
+    raise UnsafeDownloadURL(
+        f"'{url}' redirected more than {MAX_ISO_REDIRECTS} times without serving anything."
+    )
 
 
 def extract_iso_from_archive(archive_path: str, dest_dir: str) -> str:
@@ -2106,6 +2382,14 @@ def download_linux_iso(
 
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=response)
 
+    # Checked here, in the request, as well as on every hop of the fetch: a refusal that only
+    # reaches the background task is indistinguishable from a download still running, and the
+    # message names the setting that would permit the URL.
+    try:
+        ensure_download_url_allowed(download_url)
+    except UnsafeDownloadURL as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     linux_iso_dir = get_linux_iso_dir()
     os.makedirs(linux_iso_dir, exist_ok=True)
 
@@ -2145,13 +2429,11 @@ def download_linux_iso(
 
     def download_iso(url: str, dest_path: str, key: str):
         """Download ISO in background with progress tracking."""
-        import requests
         import time
 
         try:
-            # Use streaming download with progress
-            response = requests.get(url, stream=True, timeout=3600, allow_redirects=True)
-            response.raise_for_status()
+            # Follows redirects itself so that each hop is checked; see the SEC-039 note above.
+            response = open_validated_download(url, timeout=3600)
 
             # Get total size if available
             total_size = response.headers.get("content-length")
@@ -2160,6 +2442,7 @@ def download_linux_iso(
                 _active_linux_downloads[key]["total_bytes"] = total_size
 
             # Download with progress tracking
+            size_cap = max_iso_bytes()
             downloaded = 0
             with open(dest_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
@@ -2175,6 +2458,13 @@ def download_linux_iso(
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+                        # A server that declares no length, or lies about it, otherwise writes
+                        # until the host disk is full and every running range stops with it.
+                        if downloaded > size_cap:
+                            raise UnsafeDownloadURL(
+                                f"Download exceeded the {size_cap}-byte cap. "
+                                f"Raise {MAX_ISO_BYTES_ENV} if this image really is that large."
+                            )
                         _active_linux_downloads[key]["progress_bytes"] = downloaded
 
             _active_linux_downloads[key]["status"] = "completed"
@@ -2494,6 +2784,13 @@ def download_macos_iso(
             detail="No download URL available. macOS images are typically downloaded by dockur at runtime. Provide a custom URL or upload the ISO manually.",
         )
 
+    # Refused in the request rather than only in the background task, so the admin who supplied
+    # the URL reads why. See the SEC-039 note at the top of this module.
+    try:
+        ensure_download_url_allowed(download_url)
+    except UnsafeDownloadURL as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     # Initialize tracking
     _active_macos_downloads[request.version] = {
         "status": "downloading",
@@ -2505,18 +2802,18 @@ def download_macos_iso(
 
     def download_macos_iso_task(url: str, dest_path: str, version: str):
         """Download macOS ISO in background with progress tracking."""
-        import requests
         import time
 
         try:
-            response = requests.get(url, stream=True, timeout=7200, allow_redirects=True)
-            response.raise_for_status()
+            # Follows redirects itself so that each hop is checked; see the SEC-039 note above.
+            response = open_validated_download(url, timeout=7200)
 
             total_size = response.headers.get("content-length")
             if total_size:
                 total_size = int(total_size)
                 _active_macos_downloads[version]["total_bytes"] = total_size
 
+            size_cap = max_iso_bytes()
             downloaded = 0
             with open(dest_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -2533,6 +2830,13 @@ def download_macos_iso(
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+                        # A server that declares no length, or lies about it, otherwise writes
+                        # until the host disk is full and every running range stops with it.
+                        if downloaded > size_cap:
+                            raise UnsafeDownloadURL(
+                                f"Download exceeded the {size_cap}-byte cap. "
+                                f"Raise {MAX_ISO_BYTES_ENV} if this image really is that large."
+                            )
                         _active_macos_downloads[version]["progress_bytes"] = downloaded
 
             _active_macos_downloads[version]["status"] = "completed"
@@ -2947,6 +3251,15 @@ def download_custom_iso(
     from proving_ground.config import get_settings
 
     settings = get_settings()
+
+    # This endpoint is the one SEC-039 was written about: the URL comes straight out of the
+    # request body with no catalogue entry behind it. Refused here, in the request, so the admin
+    # who pasted it reads why; every redirect it takes is checked again during the fetch.
+    try:
+        ensure_download_url_allowed(request.url)
+    except UnsafeDownloadURL as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     custom_iso_dir = os.path.join(settings.iso_cache_dir, "custom-isos")
     os.makedirs(custom_iso_dir, exist_ok=True)
 
@@ -2987,7 +3300,6 @@ def download_custom_iso(
 
     def download_iso(url: str, dest_path: str, name: str, filename: str, iso_dir: str):
         """Download ISO in background with progress tracking. Supports compressed archives."""
-        import requests
         import json
         import time
         import shutil
@@ -3009,9 +3321,8 @@ def download_custom_iso(
             else:
                 download_path = dest_path
 
-            # Use streaming download with progress
-            response = requests.get(url, stream=True, timeout=3600, allow_redirects=True)
-            response.raise_for_status()
+            # Follows redirects itself so that each hop is checked; see the SEC-039 note above.
+            response = open_validated_download(url, timeout=3600)
 
             # Get total size if available
             total_size = response.headers.get("content-length")
@@ -3020,6 +3331,7 @@ def download_custom_iso(
                 _active_custom_downloads[filename]["total_bytes"] = total_size
 
             # Download with progress tracking
+            size_cap = max_iso_bytes()
             downloaded = 0
             with open(download_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
@@ -3035,6 +3347,13 @@ def download_custom_iso(
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+                        # A server that declares no length, or lies about it, otherwise writes
+                        # until the host disk is full and every running range stops with it.
+                        if downloaded > size_cap:
+                            raise UnsafeDownloadURL(
+                                f"Download exceeded the {size_cap}-byte cap. "
+                                f"Raise {MAX_ISO_BYTES_ENV} if this image really is that large."
+                            )
                         _active_custom_downloads[filename]["progress_bytes"] = downloaded
 
             # If it's an archive, extract and find the ISO
@@ -4227,6 +4546,31 @@ def download_windows_iso(
 
         primary_download_url = download_urls[0]
 
+    # Every mirror, not just the first: the task below falls through to the next URL on a 403 or
+    # 404, so checking only download_urls[0] would let the fallback reach a refused destination.
+    # A refused mirror is dropped rather than failing the request, because the built-in lists
+    # name third-party hosts and one of them being unresolvable today should not stop a download
+    # the other mirrors can serve. Only an empty list is an error, and the admin reads why.
+    # Each surviving URL is checked again, with its redirects, when it is actually fetched.
+    permitted_urls = []
+    first_refusal = None
+    for candidate in download_urls:
+        try:
+            ensure_download_url_allowed(candidate)
+        except UnsafeDownloadURL as exc:
+            first_refusal = first_refusal or exc
+            logger.warning("Skipping ISO mirror %s: %s", candidate, exc)
+            continue
+        permitted_urls.append(candidate)
+
+    if not permitted_urls:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(first_refusal or "No usable download URL for this version."),
+        )
+    download_urls = permitted_urls
+    primary_download_url = download_urls[0]
+
     windows_iso_dir = get_windows_iso_dir()
     os.makedirs(windows_iso_dir, exist_ok=True)
 
@@ -4277,9 +4621,10 @@ def download_windows_iso(
                     _active_downloads[version]["fallback_attempt"] = url_index + 1
                     _active_downloads[version]["progress_bytes"] = 0
 
-                # Use streaming download with progress
-                response = requests.get(url, stream=True, timeout=3600, allow_redirects=True)
-                response.raise_for_status()
+                # Follows redirects itself so that each hop is checked, and still raises
+                # requests.exceptions.HTTPError, which the mirror fallback below keys off.
+                # See the SEC-039 note at the top of this module.
+                response = open_validated_download(url, timeout=3600)
 
                 # Get total size if available
                 total_size = response.headers.get("content-length")
@@ -4288,6 +4633,7 @@ def download_windows_iso(
                     _active_downloads[version]["total_bytes"] = total_size
 
                 # Download with progress tracking
+                size_cap = max_iso_bytes()
                 downloaded = 0
                 with open(dest_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
@@ -4303,6 +4649,14 @@ def download_windows_iso(
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
+                            # A server that declares no length, or lies about it, otherwise
+                            # writes until the host disk is full and every running range stops
+                            # with it.
+                            if downloaded > size_cap:
+                                raise UnsafeDownloadURL(
+                                    f"Download exceeded the {size_cap}-byte cap. Raise "
+                                    f"{MAX_ISO_BYTES_ENV} if this image really is that large."
+                                )
                             _active_downloads[version]["progress_bytes"] = downloaded
 
                 _active_downloads[version]["status"] = "completed"
@@ -4313,6 +4667,21 @@ def download_windows_iso(
                 if version in _active_downloads:
                     del _active_downloads[version]
                 return  # Success!
+
+            except UnsafeDownloadURL as e:
+                # Not a mirror that happens to be down -- a destination or a size this platform
+                # will not accept. Trying the next mirror re-runs the same refusal, and on the
+                # size cap it would re-download tens of gigabytes to reach it, so this stops the
+                # whole task and reports the refusal itself rather than "all mirrors failed".
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+                if version in _active_downloads:
+                    _active_downloads[version]["status"] = "failed"
+                    _active_downloads[version]["error"] = str(e)
+                    time.sleep(5)
+                    if version in _active_downloads:
+                        del _active_downloads[version]
+                return
 
             except requests.exceptions.HTTPError as e:
                 last_error = e

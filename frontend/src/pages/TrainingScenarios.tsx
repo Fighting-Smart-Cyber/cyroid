@@ -1,14 +1,34 @@
 // frontend/src/pages/TrainingScenarios.tsx
+/**
+ * The scenario library: every scenario file the platform can read, and every one it cannot.
+ *
+ * This page used to print the server's own storage path under the heading -- a directory inside
+ * a container that no user can open and that tells a reader where the platform keeps its files.
+ * What an author actually needs is the count, which files are unreadable and why, and whether a
+ * scenario can be applied on this substrate at all.
+ */
 import { useEffect, useState, useRef } from 'react'
+import { isAxiosError } from 'axios'
 import { scenariosApi } from '../services/api'
-import type { Scenario } from '../types'
-import { Loader2, Target, Shield, UserX, Clock, Zap, AlertTriangle, Upload, RefreshCw, Trash2, FolderOpen, FolderEdit, List } from 'lucide-react'
+import type { Scenario, ScenariosListResponse } from '../types'
+import { Loader2, Target, Shield, UserX, Clock, Zap, AlertTriangle, Upload, RefreshCw, Trash2, FileWarning, FolderEdit, List } from 'lucide-react'
 import clsx from 'clsx'
 import { toast } from '../stores/toastStore'
 import { ConfirmDialog } from '../components/common/ConfirmDialog'
 import { FileBrowser } from '../components/files/FileBrowser'
+import { useSubstrate } from '../stores/capabilitiesStore'
 
 type TabType = 'scenarios' | 'files'
+
+/** A file in the scenario library the API could not read as a scenario. */
+interface ScenarioProblem {
+  file: string
+  error: string
+}
+
+// The list endpoint names the files it could not read alongside the ones it could, so a broken
+// file is one named entry here rather than a scenario that silently never appears.
+type ScenariosListPayload = ScenariosListResponse & { problems?: ScenarioProblem[] }
 
 const categoryConfig = {
   'red-team': {
@@ -37,10 +57,45 @@ const difficultyConfig = {
   advanced: { label: 'Advanced', color: 'bg-red-100 text-red-800' },
 }
 
+// A scenario file names its own category and difficulty, and nothing constrains either to the
+// values drawn here -- the product's own file template used to suggest "purple-team" and
+// "expert". This page fell back to red-team and intermediate, so a file saying "expert" was
+// labelled "Intermediate": an author has no reason to suspect the field was ignored when the
+// page confidently prints a value the file never declared.
+const unknownCategory = {
+  label: 'Uncategorised',
+  icon: Target,
+  color: 'text-gray-600',
+  bgColor: 'bg-gray-100',
+}
+
+const unknownDifficulty = { label: 'Unrated', color: 'bg-gray-100 text-gray-800' }
+
+/** Whatever the server said went wrong, or a fallback that at least names the operation. */
+function reason(err: unknown, fallback: string): string {
+  if (isAxiosError(err)) {
+    const detail = err.response?.data?.detail
+    if (typeof detail === 'string' && detail) return detail
+    // A rejected body comes back as a list of field errors; rendering that array into JSX is
+    // what blanks a page with "Objects are not valid as a React child".
+    if (Array.isArray(detail)) {
+      const messages = detail
+        .map((d) => (d && typeof d === 'object' && typeof d.msg === 'string' ? d.msg : null))
+        .filter((m): m is string => m !== null)
+      if (messages.length) return messages.join('; ')
+    }
+    if (!err.response) return `${fallback} — no answer from the server`
+  }
+  if (err instanceof Error && err.message) return err.message
+  return fallback
+}
+
 export default function TrainingScenarios() {
+  const { isKubernetes } = useSubstrate()
   const [activeTab, setActiveTab] = useState<TabType>('scenarios')
   const [scenarios, setScenarios] = useState<Scenario[]>([])
-  const [scenariosDir, setScenariosDir] = useState<string>('')
+  const [problems, setProblems] = useState<ScenarioProblem[]>([])
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
@@ -61,11 +116,16 @@ export default function TrainingScenarios() {
   const fetchScenarios = async () => {
     try {
       const response = await scenariosApi.list(categoryFilter || undefined)
-      setScenarios(response.data.scenarios)
-      setScenariosDir(response.data.scenarios_dir)
-    } catch (err) {
-      console.error('Failed to fetch scenarios:', err)
-      toast.error('Failed to load scenarios')
+      const payload = response.data as ScenariosListPayload
+      setScenarios(payload.scenarios)
+      setProblems(payload.problems ?? [])
+      setLoadError(null)
+    } catch (err: unknown) {
+      const detail = reason(err, 'Failed to load scenarios')
+      setScenarios([])
+      setProblems([])
+      setLoadError(detail)
+      toast.error(detail)
     } finally {
       setLoading(false)
     }
@@ -84,9 +144,8 @@ export default function TrainingScenarios() {
       const response = await scenariosApi.upload(file, false)
       toast.success(`Uploaded scenario: ${response.data.name}`)
       fetchScenarios()
-    } catch (err: any) {
-      const detail = err.response?.data?.detail || 'Failed to upload scenario'
-      toast.error(detail)
+    } catch (err: unknown) {
+      toast.error(reason(err, 'Failed to upload scenario'))
     } finally {
       setUploading(false)
       if (fileInputRef.current) {
@@ -101,8 +160,8 @@ export default function TrainingScenarios() {
       const response = await scenariosApi.refresh()
       toast.success(`Refreshed: ${response.data.total} scenarios found`)
       fetchScenarios()
-    } catch (err) {
-      toast.error('Failed to refresh scenarios')
+    } catch (err: unknown) {
+      toast.error(reason(err, 'Failed to refresh scenarios'))
     } finally {
       setRefreshing(false)
     }
@@ -113,8 +172,8 @@ export default function TrainingScenarios() {
       await scenariosApi.delete(id)
       toast.success('Scenario deleted')
       fetchScenarios()
-    } catch (err) {
-      toast.error('Failed to delete scenario')
+    } catch (err: unknown) {
+      toast.error(reason(err, 'Failed to delete scenario'))
     }
     setDeleteConfirm({ open: false, id: '', name: '' })
   }
@@ -138,14 +197,19 @@ export default function TrainingScenarios() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Training Scenarios</h1>
           <p className="mt-2 text-sm text-gray-700">
-            Pre-built cyber training scenarios ready to deploy to your ranges
+            Each scenario is a timeline of injects addressed to the roles it names.
           </p>
-          {scenariosDir && (
-            <p className="mt-1 text-xs text-gray-500 flex items-center">
-              <FolderOpen className="h-3 w-3 mr-1" />
-              {scenariosDir}
-            </p>
-          )}
+          {/* The category filter is applied by the server, so `scenarios` holds that category
+              alone while `problems` covers the whole directory. Counting the two together under
+              one word would report a library that is mostly broken whenever a narrow filter is
+              set, so the readable count says which set it is counting. */}
+          <p className="mt-1 text-xs text-gray-500">
+            {scenarios.length} scenario{scenarios.length !== 1 ? 's' : ''}
+            {categoryFilter ? ' in this category' : ' readable'}
+            {problems.length > 0 &&
+              `, ${problems.length} file${problems.length !== 1 ? 's' : ''} in the library unreadable`}
+            {' · edit the files on the Scenario Files tab'}
+          </p>
         </div>
         {activeTab === 'scenarios' && (
           <div className="mt-4 sm:mt-0 flex gap-2">
@@ -172,7 +236,7 @@ export default function TrainingScenarios() {
               onClick={handleRefresh}
               disabled={refreshing}
               className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50"
-              title="Refresh from filesystem"
+              title="Re-read the scenario files"
             >
               <RefreshCw className={clsx("h-4 w-4", refreshing && "animate-spin")} />
             </button>
@@ -204,6 +268,36 @@ export default function TrainingScenarios() {
       {/* Scenarios Tab */}
       {activeTab === 'scenarios' && (
         <>
+          {/* Files that are meant to be scenarios and are not. Named here, with the parser's own
+              message, because the alternative is an author staring at a list their file is
+              missing from. */}
+          {problems.length > 0 && (
+            <div className="mt-6 p-4 bg-amber-50 border border-amber-200 rounded-md">
+              <p className="flex items-center text-sm font-medium text-amber-900">
+                <FileWarning className="h-4 w-4 mr-1.5" />
+                {problems.length} file{problems.length !== 1 ? 's' : ''} in the scenario library
+                could not be read
+              </p>
+              <ul className="mt-2 ml-5 list-disc space-y-1 text-sm text-amber-800">
+                {problems.map((p) => (
+                  <li key={p.file}>
+                    <span className="font-mono">{p.file}</span> — {p.error}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 text-xs text-amber-700">
+                Fix or delete these on the Scenario Files tab. Until then they appear nowhere else
+                in the product.
+              </p>
+            </div>
+          )}
+
+          {loadError && (
+            <div className="mt-6 p-4 bg-red-50 border border-red-200 rounded-md text-sm text-red-800">
+              {loadError}
+            </div>
+          )}
+
           {/* Filters */}
       <div className="mt-6 flex flex-col sm:flex-row gap-4">
         <input
@@ -232,14 +326,14 @@ export default function TrainingScenarios() {
           <p className="mt-1 text-sm text-gray-500">
             {searchQuery || categoryFilter
               ? 'Try adjusting your filters.'
-              : 'Upload a YAML file or add scenarios to the scenarios directory.'}
+              : 'Upload a YAML file, or create one from the Training Scenario template on the Scenario Files tab.'}
           </p>
         </div>
       ) : (
         <div className="mt-8 grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
           {filteredScenarios.map((scenario) => {
-            const catConfig = categoryConfig[scenario.category] || categoryConfig['red-team']
-            const diffConfig = difficultyConfig[scenario.difficulty] || difficultyConfig.intermediate
+            const catConfig = categoryConfig[scenario.category] || unknownCategory
+            const diffConfig = difficultyConfig[scenario.difficulty] || unknownDifficulty
             const CategoryIcon = catConfig.icon
 
             return (
@@ -300,8 +394,13 @@ export default function TrainingScenarios() {
                 </div>
 
                 <div className="bg-gray-50 px-5 py-3">
+                  {/* Applying a scenario binds its roles to the range's VM rows, which only the
+                      Docker substrate writes. Telling a Kubernetes user to go and do it on a
+                      range's page sends them after a button that install does not show. */}
                   <p className="text-xs text-gray-500">
-                    Deploy this scenario from a Range's detail page
+                    {isKubernetes
+                      ? 'Readable here. Applying a scenario to a range is not available on this substrate yet.'
+                      : "Apply this scenario from a running range's detail page."}
                   </p>
                 </div>
               </div>
@@ -317,7 +416,8 @@ export default function TrainingScenarios() {
         <div className="mt-6">
           <div className="mb-4">
             <p className="text-sm text-gray-500">
-              Browse and edit scenario YAML files directly. Changes will be reflected after refreshing the scenarios list.
+              Browse and edit scenario YAML files directly. Changes show up in the list after a
+              refresh.
             </p>
           </div>
           <FileBrowser basePath="scenarios" title="" />
@@ -329,7 +429,7 @@ export default function TrainingScenarios() {
         onCancel={() => setDeleteConfirm({ open: false, id: '', name: '' })}
         onConfirm={() => handleDelete(deleteConfirm.id)}
         title="Delete Scenario"
-        message={`Are you sure you want to delete "${deleteConfirm.name}"? This will remove the YAML file from the filesystem.`}
+        message={`Are you sure you want to delete "${deleteConfirm.name}"? This deletes the scenario's YAML file.`}
         confirmLabel="Delete"
         variant="danger"
       />

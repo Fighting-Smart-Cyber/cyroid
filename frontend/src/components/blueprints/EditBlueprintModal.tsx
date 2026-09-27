@@ -1,11 +1,26 @@
 // frontend/src/components/blueprints/EditBlueprintModal.tsx
-import { useState, useCallback } from 'react';
+/**
+ * Editing a blueprint's config as JSON.
+ *
+ * This is the authoring path for a Kubernetes (v2) blueprint, and until a structured editor
+ * speaking workloads and capability charts exists it is the only one: the visual editor draws
+ * networks and VMs, and opening a v2 blueprint in it would write back a config stripped of
+ * everything it could not read. Validation here stops at what is cheap to check — the server
+ * owns the schema, and a client that refuses more than the server does is a config the user
+ * cannot save for no reason they can see.
+ */
+import { useCallback, useState } from 'react';
 import Editor from '@monaco-editor/react';
 import { Save, AlertTriangle, Loader2 } from 'lucide-react';
 import clsx from 'clsx';
 import { Modal, ModalFooter } from '../common/Modal';
 import { blueprintsApi, BlueprintDetail } from '../../services/api';
 import { toast } from '../../stores/toastStore';
+import {
+  apiErrorDetail,
+  blueprintSchemaVersion,
+  validateBlueprintConfigJson,
+} from '../../lib/blueprints';
 
 interface EditBlueprintModalProps {
   blueprint: BlueprintDetail;
@@ -26,30 +41,17 @@ export function EditBlueprintModal({
   const [saving, setSaving] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
-  // Validate JSON on change
+  const schemaVersion = blueprintSchemaVersion(blueprint.config);
+
   const handleEditorChange = useCallback(
     (value: string | undefined) => {
       const newContent = value || '';
       setConfigJson(newContent);
-
-      // Check if content changed
-      try {
-        const parsed = JSON.parse(newContent);
-        const original = JSON.stringify(blueprint.config, null, 2);
-        setHasChanges(newContent !== original);
-        setValidationError(null);
-
-        // Basic validation of required fields
-        if (!parsed.networks || !Array.isArray(parsed.networks)) {
-          setValidationError('Config must have a "networks" array');
-        } else if (!parsed.vms || !Array.isArray(parsed.vms)) {
-          setValidationError('Config must have a "vms" array');
-        }
-      } catch (e: any) {
-        setValidationError(`Invalid JSON: ${e.message}`);
-        setHasChanges(true); // Allow user to see there's a problem
-      }
+      setHasChanges(newContent !== JSON.stringify(blueprint.config, null, 2));
+      setValidationError(validateBlueprintConfigJson(newContent));
+      setSaveError(null);
     },
     [blueprint.config]
   );
@@ -63,25 +65,28 @@ export function EditBlueprintModal({
   }, [hasChanges, onClose]);
 
   const handleSave = useCallback(async () => {
-    if (validationError) {
-      toast.error('Please fix validation errors before saving');
+    const problem = validateBlueprintConfigJson(configJson);
+    if (problem) {
+      setValidationError(problem);
       return;
     }
 
     setSaving(true);
+    setSaveError(null);
     try {
       const config = JSON.parse(configJson);
       await blueprintsApi.update(blueprint.id, { config });
       toast.success(`Blueprint updated to version ${blueprint.version + 1}`);
       onSaved?.();
       onClose();
-    } catch (err: any) {
-      const detail = err.response?.data?.detail || 'Failed to save blueprint';
-      toast.error(detail);
+    } catch (err: unknown) {
+      // Kept on the page rather than toasted away: a schema refusal names the field it refused
+      // and the user needs it in front of them while they fix the config it came from.
+      setSaveError(apiErrorDetail(err, 'The server refused the config and did not say why.'));
     } finally {
       setSaving(false);
     }
-  }, [configJson, validationError, blueprint.id, blueprint.version, onSaved, onClose]);
+  }, [configJson, blueprint.id, blueprint.version, onSaved, onClose]);
 
   return (
     <Modal
@@ -95,6 +100,9 @@ export function EditBlueprintModal({
     >
       {/* Status bar */}
       <div className="flex items-center gap-3 px-4 py-2 bg-gray-100 border-b text-sm">
+        <span className="px-2 py-0.5 text-xs font-medium bg-gray-200 text-gray-700 rounded">
+          schema v{schemaVersion}
+        </span>
         {hasChanges && (
           <span className="px-2 py-0.5 text-xs font-medium bg-yellow-100 text-yellow-700 rounded">
             Unsaved
@@ -107,7 +115,10 @@ export function EditBlueprintModal({
           </span>
         )}
         <span className="text-xs text-gray-500 ml-auto">
-          JSON | Ctrl+S to save | Esc to close
+          {schemaVersion === 2
+            ? 'Declares networks, workloads and capabilities'
+            : 'Declares networks and vms'}{' '}
+          | Esc to close
         </span>
       </div>
 
@@ -133,12 +144,13 @@ export function EditBlueprintModal({
         />
       </div>
 
-      {/* Validation Warning */}
-      {validationError && (
-        <div className="px-4 py-2 bg-red-50 border-t border-red-100">
+      {(validationError || saveError) && (
+        <div className="px-4 py-2 bg-red-50 border-t border-red-100 max-h-40 overflow-y-auto">
           <div className="flex items-start gap-2">
             <AlertTriangle className="h-4 w-4 text-red-600 mt-0.5 flex-shrink-0" />
-            <div className="text-sm text-red-800">{validationError}</div>
+            <div className="text-sm text-red-800 whitespace-pre-wrap">
+              {validationError ?? saveError}
+            </div>
           </div>
         </div>
       )}

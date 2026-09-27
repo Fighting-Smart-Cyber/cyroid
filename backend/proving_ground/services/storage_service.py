@@ -4,10 +4,9 @@ import hashlib
 import io
 import logging
 from typing import Optional, BinaryIO
-from minio import Minio
 from minio.error import S3Error
 
-from proving_ground.config import get_settings
+from proving_ground.services.object_store import artifact_bucket, ensure_bucket, object_client
 
 logger = logging.getLogger(__name__)
 
@@ -16,25 +15,14 @@ class StorageService:
     """Service for managing file storage with MinIO."""
 
     def __init__(self):
-        settings = get_settings()
-        self.client = Minio(
-            settings.minio_endpoint,
-            access_key=settings.minio_access_key,
-            secret_key=settings.minio_secret_key,
-            secure=settings.minio_secure,
-        )
-        self.bucket = settings.minio_bucket
-        self._ensure_bucket()
-
-    def _ensure_bucket(self):
-        """Create bucket if it doesnt exist."""
-        try:
-            if not self.client.bucket_exists(self.bucket):
-                self.client.make_bucket(self.bucket)
-                logger.info(f"Created bucket: {self.bucket}")
-        except S3Error as e:
-            logger.error(f"Failed to ensure bucket: {e}")
-            raise
+        self.client = object_client()
+        self.bucket = artifact_bucket()
+        # Was: make_bucket, and re-raise on failure. That meant an identity scoped to a
+        # pre-provisioned bucket could not construct the service at all, surfacing as a 500 on
+        # the first artifact request rather than as a configuration problem at install. Called
+        # for its effect -- create the bucket when that is permitted, log and carry on when it
+        # is not; put_object already reports what happens if it really is missing.
+        ensure_bucket(self.client, self.bucket)
 
     def upload_file(
         self,

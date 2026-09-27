@@ -3,14 +3,19 @@ from uuid import UUID
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from proving_ground.api.deps import get_db, get_current_user
+from proving_ground.api.deps import get_db, get_current_user, check_range_access
 from proving_ground.models.user import User
-from proving_ground.models.range import Range
 from proving_ground.models.vm import VM
 from proving_ground.models.event_log import EventType
 from proving_ground.schemas.event_log import EventLogResponse, EventLogList
 from proving_ground.services.event_service import EventService
 
+# The event log belongs to a range and answers to the range's read rule, via
+# the shared helper rather than a fourth owner-only comparison of its own.
+# The comparison this replaced granted nobody but the creator: an administrator
+# was refused on a range they did not make, so the person asked to explain a
+# failed deploy could not read the placement reason the worker wrote here, and
+# the learner the range is assigned to was refused their own range's history.
 router = APIRouter(prefix="/events", tags=["events"])
 
 
@@ -23,11 +28,7 @@ def get_range_events(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    range_obj = db.query(Range).filter(Range.id == range_id).first()
-    if not range_obj:
-        raise HTTPException(status_code=404, detail="Range not found")
-    if range_obj.created_by != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    check_range_access(range_id, current_user, db)
 
     service = EventService(db)
     events, total = service.get_events(range_id, limit, offset, event_types)
@@ -46,9 +47,9 @@ def get_vm_events(
     if not vm:
         raise HTTPException(status_code=404, detail="VM not found")
 
-    range_obj = db.query(Range).filter(Range.id == vm.range_id).first()
-    if range_obj.created_by != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    # Also the 404 for a VM whose range row is gone. The comparison this
+    # replaced dereferenced that fetch unchecked and answered with a 500.
+    check_range_access(vm.range_id, current_user, db)
 
     service = EventService(db)
     events = service.get_vm_events(vm_id, limit)

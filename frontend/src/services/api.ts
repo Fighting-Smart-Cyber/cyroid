@@ -44,6 +44,69 @@ export const versionApi = {
   get: () => api.get<VersionInfo>('/version'),
 }
 
+// Feedback API
+//
+// Telling us something: an idea, a defect, or a problem with a guide or a range. The context is
+// read from where the person already is rather than asked for -- see FeedbackDialog.
+export type FeedbackKind = 'bug' | 'idea' | 'content_problem' | 'range_problem'
+export type FeedbackStatus =
+  | 'open'
+  | 'triaged'
+  | 'planned'
+  | 'in_progress'
+  | 'resolved'
+  | 'declined'
+export type FeedbackSource = 'app' | 'walkthrough' | 'range' | 'console'
+
+export interface FeedbackContext {
+  route?: string
+  app_version?: string
+  range_name?: string
+  content_title?: string
+  content_version?: string
+  step?: string
+}
+
+export interface FeedbackCreate {
+  kind: FeedbackKind
+  title: string
+  description?: string
+  source?: FeedbackSource
+  source_ref?: string | null
+  range_id?: string | null
+  content_id?: string | null
+  context?: FeedbackContext
+}
+
+export interface Feedback extends FeedbackCreate {
+  id: string
+  status: FeedbackStatus
+  author_id: string
+  /** The sender's name. A triage list of UUIDs is a list nobody can read. */
+  author_username?: string | null
+  created_at: string
+  updated_at?: string | null
+}
+
+export const feedbackApi = {
+  submit: (body: FeedbackCreate) => api.post<Feedback>('/feedback', body),
+  /**
+   * What this account may see: an author sees their own, staff see everything. The scoping is
+   * the server's, not a parameter — asking for someone else's returns nothing rather than 403.
+   */
+  list: (params?: {
+    kind?: FeedbackKind
+    status?: FeedbackStatus
+    range_id?: string
+    content_id?: string
+    source_ref_prefix?: string
+  }) => api.get<Feedback[]>('/feedback', { params }),
+  get: (id: string) => api.get<Feedback>(`/feedback/${id}`),
+  /** Staff only; the server refuses an author changing the status of their own report. */
+  setStatus: (id: string, status: FeedbackStatus) =>
+    api.patch<Feedback>(`/feedback/${id}`, { status }),
+}
+
 // Auth API
 export interface LoginRequest {
   username: string
@@ -291,6 +354,18 @@ export interface RangeConsoleRoutes {
   routes: string
 }
 
+export type RangeVisibility = 'private' | 'shared' | 'public'
+
+export interface RangeShareEntry {
+  user_id: string
+  username: string | null
+}
+
+export interface RangeVisibilityInfo {
+  visibility: RangeVisibility
+  shared_with: RangeShareEntry[]
+}
+
 export const rangesApi = {
   list: () => api.get<Range[]>('/ranges'),
   get: (id: string) => api.get<Range>(`/ranges/${id}`),
@@ -304,6 +379,19 @@ export const rangesApi = {
   sync: (id: string) => api.post<SyncRangeResponse>(`/ranges/${id}/sync`),
   getDeploymentStatus: (rangeId: string) =>
     api.get<DeploymentStatusResponse>(`/ranges/${rangeId}/deployment-status`),
+
+  // Who can see this range. Changing it requires ownership; reading it only
+  // requires being able to see the range at all.
+  getVisibility: (rangeId: string) =>
+    api.get<RangeVisibilityInfo>(`/ranges/${rangeId}/visibility`),
+  setVisibility: (rangeId: string, visibility: RangeVisibility, sharedWith?: string[]) =>
+    api.put<RangeVisibilityInfo>(`/ranges/${rangeId}/visibility`, {
+      visibility,
+      // Omitted rather than sent empty when unchanged: the API leaves the share
+      // list alone when the field is absent, so switching to shared does not
+      // silently drop existing grants.
+      ...(sharedWith === undefined ? {} : { shared_with: sharedWith }),
+    }),
 
   // VNC diagnostics and repair
   getVncStatus: (rangeId: string) =>
@@ -1160,13 +1248,22 @@ export interface Blueprint {
 }
 
 export interface BlueprintDetail extends Blueprint {
-  config: BlueprintConfig;
+  // The stored document, not a shape this file can promise. A blueprint is v1 (networks and
+  // VMs, Era A) or v2 (workloads and capabilities, Era B), told apart by `schemaVersion`, and
+  // typing it as the v1 shape is what made every v2 field read `undefined`. Read it through
+  // the helpers in src/lib/blueprints.ts, which survive a field being absent or the wrong type.
+  config: Record<string, unknown>;
+  schema_version?: number;
   created_by_username?: string;
 }
 
 export interface BlueprintCreate {
-  range_id: string;
   name: string;
+  // Save-from-range (Era A only: an Era A extractor cannot describe a Kubernetes range, and the
+  // API refuses it on that substrate) -- or a config authored directly, which is the only way to
+  // produce a v2 blueprint.
+  range_id?: string;
+  config?: Record<string, unknown>;
   description?: string;
   // DEPRECATED: No longer used with DinD isolation - kept for backward compatibility
   base_subnet_prefix?: string;
@@ -1298,11 +1395,10 @@ export const blueprintsApi = {
   },
   export: async (id: string, options: BlueprintExportOptions = {}): Promise<Blob> => {
     const params = new URLSearchParams();
-    // Add token as query param for download endpoints (backend expects this)
-    const token = localStorage.getItem('token');
-    if (token) {
-      params.append('token', token);
-    }
+    // No `token` parameter. This goes through the shared axios instance, whose interceptor
+    // already sets `Authorization: Bearer`, so the session was being sent twice -- and the
+    // copy in the URL lands in browser history and in every proxy log between here and the
+    // API, which is the whole of SEC-035.
     if (options.include_msel !== undefined) {
       params.append('include_msel', String(options.include_msel));
     }
@@ -1448,6 +1544,12 @@ export interface CleanupRequest {
   force?: boolean
 }
 
+export interface RangeTeardownFailure {
+  range_id: string
+  range_name: string
+  reason: string
+}
+
 export interface CleanupResult {
   ranges_cleaned: number
   dind_containers_removed: number
@@ -1457,6 +1559,11 @@ export interface CleanupResult {
   database_records_deleted: number
   errors: string[]
   orphaned_resources_cleaned: number
+  // Kubernetes only. A range whose namespace did not come down keeps its row -- the row is the
+  // only record of which namespace belonged to it -- and is reported here rather than counted
+  // as cleaned.
+  namespaces_removed?: number
+  residue?: RangeTeardownFailure[]
 }
 
 export interface DockerContainerInfo {

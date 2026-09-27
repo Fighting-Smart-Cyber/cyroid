@@ -1,21 +1,72 @@
 # backend/proving_ground/services/inject_service.py
+"""Execute an MSEL inject's actions against a range's machines -- MSEL-055.
+
+An inject fires in the middle of a live exercise and its status is the record of what the
+exercise actually did. Two of the things this file used to claim were not true.
+
+`place_file` logged "Would place ..." and returned ``{"placed": True}``, so an inject whose only
+action was a file placement closed COMPLETED with a green tick over a machine that had received
+nothing. A controller could not tell a real placement from a simulated one, and the record of the
+exercise was wrong in a way nobody would notice until it mattered.
+
+`run_command` resolves its target through ``VM.container_id``. A range machine on the Kubernetes
+substrate is a KubeVirt virtual machine and has no container id -- and its range has no VM rows
+at all -- so on that substrate every inject reported every one of its targets missing.
+
+**Why this refuses on Kubernetes rather than routing through the capability runtime.** The one
+escape hatch is ``CapabilityRuntime.exec``, and it reaches a *capability's* pods by label
+selector -- not a learner's machine, whose guest sits behind a virt-launcher pod that nothing
+here speaks to. There is no guest-agent path in this codebase to borrow. Sending an inject
+through ``exec`` anyway would also rebuild the original defect somewhere new, because
+``exec_in_pod`` reports exit code 0 whatever the command did, so a failed inject would once
+again close COMPLETED. A refusal that names the substrate is the honest answer until a
+guest-side path exists.
+"""
+
+from __future__ import annotations
+
+import logging
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Any, Dict, Optional
+
 from sqlalchemy.orm import Session
+
+from proving_ground.config import get_settings
 from proving_ground.models.inject import Inject, InjectStatus
 from proving_ground.models.vm import VM
 from proving_ground.services.docker_service import DockerService
-import logging
 
 logger = logging.getLogger(__name__)
 
+KUBERNETES_SUBSTRATE = "kubernetes"
+
+SUBSTRATE_REFUSAL = (
+    "This install runs on the Kubernetes substrate, where a range's machines are KubeVirt "
+    "virtual machines. Running a command or placing a file inside a machine needs a guest-side "
+    "path this platform does not have yet. Nothing was run and nothing was placed."
+)
+
+PLACE_FILE_REFUSAL = (
+    "Placing a file from an inject is not implemented -- it only ever recorded the intent. "
+    "Nothing was placed. Upload the file as an artifact and create an artifact placement "
+    "against the machine, which does copy it."
+)
+
 
 class InjectService:
-    """Service for executing MSEL injects on target VMs."""
+    """Run an inject's actions, or refuse in terms an exercise record can be read back from."""
 
-    def __init__(self, db: Session, docker_service: DockerService):
+    def __init__(
+        self,
+        db: Session,
+        docker_service: DockerService,
+        substrate: Optional[str] = None,
+    ):
         self.db = db
         self.docker = docker_service
+        # Read once, at construction, so the decision cannot change halfway through an inject
+        # and so a caller can pin it. Callers that pass nothing get this host's own setting.
+        self.substrate = substrate or get_settings().range_substrate
 
     def execute_inject(self, inject: Inject, vm_map: Dict[str, VM]) -> Dict[str, Any]:
         """
@@ -28,6 +79,10 @@ class InjectService:
         Returns:
             Dict with 'success' boolean and 'results' list
         """
+        if self.substrate == KUBERNETES_SUBSTRATE:
+            # Refused before EXECUTING is set, so nothing in the record implies it ever started.
+            return self._refuse(inject, SUBSTRATE_REFUSAL)
+
         inject.status = InjectStatus.EXECUTING
         inject.executed_at = datetime.now(timezone.utc)
         self.db.commit()
@@ -64,6 +119,20 @@ class InjectService:
 
         return {"success": success, "results": results}
 
+    def _refuse(self, inject: Inject, reason: str) -> Dict[str, Any]:
+        """Record an inject that could not run, having never claimed that it did.
+
+        FAILED rather than left PENDING: somebody pressed Execute during a live exercise and the
+        inject did not happen, so the timeline has to carry that. The reason goes into
+        `execution_log` as well as the response, or it survives only until the page is closed.
+        """
+        logger.warning("Refusing inject %s: %s", inject.id, reason)
+        inject.status = InjectStatus.FAILED
+        inject.executed_at = datetime.now(timezone.utc)
+        inject.execution_log = reason
+        self.db.commit()
+        return {"success": False, "results": [{"error": reason}]}
+
     def _execute_command(self, params: Dict, vm_map: Dict[str, VM]) -> Dict:
         """Execute a command on a target VM."""
         target_vm_name = params.get("target_vm")
@@ -80,22 +149,22 @@ class InjectService:
         return {"exit_code": exit_code, "output": output}
 
     def _place_file(self, params: Dict, vm_map: Dict[str, VM]) -> Dict:
-        """Place a file on a target VM."""
+        """Refuse a file placement rather than report one that did not happen.
+
+        Nothing here ever copied a file. Returning an error is what puts the inject into FAILED,
+        which is what a controller has to see; naming the artifact placement endpoint -- the path
+        that does perform the copy -- is the difference between a dead end and a next step.
+        """
         target_vm_name = params.get("target_vm")
-        filename = params.get("filename")
-        target_path = params.get("target_path")
 
         if target_vm_name not in vm_map:
             return {"error": f"VM {target_vm_name} not found"}
 
-        vm = vm_map[target_vm_name]
-        if not vm.container_id:
-            return {"error": f"VM {target_vm_name} has no container"}
-
-        # TODO: Implement actual file placement via artifact service
-        # For now, just log the action and report success
-        logger.info(f"Would place {filename} at {target_path} on {target_vm_name}")
-        return {"placed": True, "path": target_path, "filename": filename}
+        return {
+            "error": PLACE_FILE_REFUSAL,
+            "filename": params.get("filename"),
+            "target_path": params.get("target_path"),
+        }
 
     def skip_inject(self, inject: Inject, reason: str = "") -> None:
         """Mark an inject as skipped."""

@@ -56,8 +56,13 @@ def test_execute_inject_place_file():
 
     result = service.execute_inject(inject, {"test-vm": vm})
 
-    assert result["success"] == True
+    # A place_file action refuses. Nothing in this path ever copied a file, on either
+    # substrate, and the inject reported success anyway -- an exercise controller fired an
+    # inject during a live exercise, was told it landed, and nothing had been placed. The
+    # refusal is what puts the inject into FAILED, which is what the controller has to see.
+    assert result["success"] is False
     assert len(result["results"]) == 1
+    assert "error" in result["results"][0]["result"]
 
 
 def test_execute_inject_vm_not_found():

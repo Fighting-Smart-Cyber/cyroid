@@ -5,13 +5,16 @@ from pydantic import BaseModel
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from proving_ground.api.deps import get_db, get_current_user
+from proving_ground.api.deps import get_db, get_current_user, check_range_access
 from proving_ground.models.user import User
-from proving_ground.models.range import Range
 from proving_ground.models.vm import VM
 from proving_ground.models.connection import ConnectionProtocol, ConnectionState
 from proving_ground.services.connection_service import ConnectionService
 
+# Observed traffic is a read of the range, so it answers to the range's read
+# rule through the shared helper. The owner-only comparison this replaced
+# refused an administrator on a range they did not create, and refused the
+# learner it is assigned to, on their own range's traffic.
 router = APIRouter(prefix="/connections", tags=["connections"])
 
 
@@ -50,11 +53,7 @@ def get_range_connections(
     current_user: User = Depends(get_current_user),
 ):
     """Get connections for a range."""
-    range_obj = db.query(Range).filter(Range.id == range_id).first()
-    if not range_obj:
-        raise HTTPException(status_code=404, detail="Range not found")
-    if range_obj.created_by != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    check_range_access(range_id, current_user, db)
 
     service = ConnectionService(db)
     connections, total = service.get_connections(range_id, limit, offset, active_only)
@@ -77,9 +76,9 @@ def get_vm_connections(
     if not vm:
         raise HTTPException(status_code=404, detail="VM not found")
 
-    range_obj = db.query(Range).filter(Range.id == vm.range_id).first()
-    if range_obj.created_by != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    # Also the 404 for a VM whose range row is gone. The comparison this
+    # replaced dereferenced that fetch unchecked and answered with a 500.
+    check_range_access(vm.range_id, current_user, db)
 
     service = ConnectionService(db)
     connections = service.get_vm_connections(vm_id, direction, limit)

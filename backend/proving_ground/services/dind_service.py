@@ -32,6 +32,9 @@ class DinDService:
     def __init__(self):
         self.host_client = docker.from_env()
         self._range_clients: dict[str, docker.DockerClient] = {}
+        # The address each cached client is pointed at, so a range whose DinD
+        # moved is noticed rather than served a client for the old one.
+        self._range_client_urls: dict[str, str] = {}
 
     def _sanitize_name(self, name: str) -> str:
         """
@@ -492,14 +495,30 @@ class DinDService:
             DockerClient connected to the range's Docker daemon
         """
         range_id_str = str(range_id)
-        if range_id_str not in self._range_clients:
-            logger.debug(f"Creating Docker client for range {range_id} at {docker_url}")
-            # Set a longer timeout (10 min) for large image transfers
-            self._range_clients[range_id_str] = docker.DockerClient(
-                base_url=docker_url, timeout=600  # 10 minute timeout for large image operations
-            )
+        cached = self._range_clients.get(range_id_str)
+        if cached is not None and self._range_client_urls.get(range_id_str) == docker_url:
+            return cached
 
-        return self._range_clients[range_id_str]
+        if cached is not None:
+            # Same range, different DinD. Keeping the old client sends every
+            # subsequent call to an address that now belongs to nobody, which
+            # surfaces as "No route to host" on the first request of the
+            # redeploy rather than as anything about a stale client.
+            logger.info(
+                f"Range {range_id}'s DinD moved from "
+                f"{self._range_client_urls.get(range_id_str)} to {docker_url}; "
+                "replacing its cached Docker client"
+            )
+            self.close_range_client(range_id_str)
+
+        logger.debug(f"Creating Docker client for range {range_id} at {docker_url}")
+        # Set a longer timeout (10 min) for large image transfers
+        client = docker.DockerClient(
+            base_url=docker_url, timeout=600  # 10 minute timeout for large image operations
+        )
+        self._range_clients[range_id_str] = client
+        self._range_client_urls[range_id_str] = docker_url
+        return client
 
     def close_range_client(self, range_id: str) -> None:
         """Close and remove cached Docker client for a range."""
@@ -510,6 +529,7 @@ class DinDService:
             except Exception:
                 pass
             del self._range_clients[range_id_str]
+            self._range_client_urls.pop(range_id_str, None)
             logger.debug(f"Closed Docker client for range {range_id}")
 
     def close_all_range_clients(self) -> None:

@@ -2,16 +2,22 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from proving_ground.config import get_settings
+from proving_ground.services.docker_service import DOCKER_SDK_ERROR
+from proving_ground.api import kubernetes_ranges
 from proving_ground.api.auth import router as auth_router
 from proving_ground.api.users import router as users_router
 from proving_ground.api.ranges import router as ranges_router
 from proving_ground.api.networks import router as networks_router
 from proving_ground.api.vms import router as vms_router
 from proving_ground.api.websocket import router as websocket_router
+from proving_ground.api.kubernetes_console import router as kubernetes_console_router
+from proving_ground.api.feedback import router as feedback_router
+from proving_ground.api.kubernetes_apps import router as kubernetes_apps_router
 from proving_ground.api.artifacts import router as artifacts_router
 from proving_ground.api.snapshots import router as snapshots_router
 from proving_ground.api.events import router as events_router
@@ -20,6 +26,7 @@ from proving_ground.api.msel import router as msel_router
 from proving_ground.api.walkthrough import router as walkthrough_router
 from proving_ground.api.cache import router as cache_router
 from proving_ground.api.system import router as system_router
+from proving_ground.api.capabilities import router as capabilities_router
 from proving_ground.api.blueprints import router as blueprints_router
 from proving_ground.api.instances import router as instances_router
 from proving_ground.api.scenarios import router as scenarios_router
@@ -39,6 +46,20 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events for startup and shutdown."""
+    # Before anything else: an install that kept a credential this repository ships is not an
+    # install, and finding out at startup beats finding out from an incident.
+    from proving_ground.config import require_production_secrets
+
+    require_production_secrets(settings)
+
+    # The capability contract is the licence boundary (ADR-0011) and imports nothing from the
+    # engine, so the engine hands it this cluster's pod and service CIDRs rather than the
+    # contract reaching out for settings. Without this the guard keeps k3s's ranges, which are
+    # wrong on every other distribution in both directions.
+    from proving_ground.capability.networking import set_reserved_cidrs
+
+    set_reserved_cidrs(settings.cluster_reserved_cidrs)
+
     # Startup
     from proving_ground.services.event_broadcaster import get_connection_manager, get_broadcaster
     from proving_ground.services.scenario_filesystem import get_scenarios_dir
@@ -79,7 +100,41 @@ async def lifespan(app: FastAPI):
     logger.info("Real-time event services stopped")
 
 
-API_DESCRIPTION = """
+# The product runs on one of two substrates and they do not describe themselves the same
+# way. One text naming Docker, containers and a create-range / add-networks / add-VMs quick
+# start is wrong on a Kubernetes install in the one document a reader consults to find out
+# what is true -- and every step of that quick start is refused there.
+_KUBERNETES = settings.range_substrate == "kubernetes"
+
+_CONCEPTS_KUBERNETES = """
+# PROVING GROUND - Cyber Range Orchestrator
+
+PROVING GROUND is a platform for training people on capabilities, using disposable,
+mission-relevant environments. **This install runs ranges on Kubernetes.**
+
+## Concepts
+
+- **Blueprint**: what a range is instantiated from -- its networks, its workloads and its
+  capabilities. On this substrate it is the only way a range is composed.
+- **Range**: a placement decision -- a namespace, or a virtual cluster, holding one instance of
+  a blueprint
+- **Workload**: a machine in the range, run by KubeVirt, attached to the range's networks
+- **Capability**: the software being trained against, installed from an unmodified upstream Helm
+  chart, with seed / reset / verify hooks and a scope
+
+## Quick Start
+
+1. **List blueprints**: `GET /api/v1/blueprints`
+2. **Deploy an instance**: `POST /api/v1/blueprints/{id}/deploy`
+3. **Watch it come up**: `GET /api/v1/ranges/{id}/workloads`
+4. **Open a console**: the WebSocket endpoints or the UI
+5. **Tear it down**: `DELETE /api/v1/ranges/{id}`
+
+Creating networks and virtual machines directly is a Docker-substrate path and is refused here:
+a range's composition is declared in its blueprint.
+"""
+
+_CONCEPTS_DOCKER = """
 # PROVING GROUND - Cyber Range Orchestrator In Docker
 
 PROVING GROUND is a platform for creating and managing cyber training ranges using Docker containers and VMs.
@@ -99,6 +154,20 @@ PROVING GROUND is a platform for creating and managing cyber training ranges usi
 4. **Deploy**: `POST /api/v1/ranges/{id}/deploy`
 5. **Access consoles**: Use the WebSocket endpoints or UI
 
+"""
+
+
+def _concepts(kubernetes: bool) -> str:
+    """The half of the description that differs by substrate. A function, not a branch at
+    import: a test that wants the other answer would otherwise have to reload this module and
+    clear the settings cache, and clearing that cache hands every module that captured
+    `get_settings()` at import a different object than the one a later test patches."""
+    return _CONCEPTS_KUBERNETES if kubernetes else _CONCEPTS_DOCKER
+
+
+API_DESCRIPTION = (
+    _concepts(_KUBERNETES)
+    + """
 ## Authentication
 
 All endpoints (except `/health` and `/api/v1/auth/*`) require a JWT token.
@@ -117,6 +186,7 @@ Include it in the `Authorization` header: `Bearer <token>`
 - `/api/health` - API health check (alias)
 - `/api/v1/health` - Versioned health check (alias)
 """
+)
 
 app = FastAPI(
     title=settings.app_name,
@@ -165,13 +235,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.exception_handler(DOCKER_SDK_ERROR)
+async def docker_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    """Answer a request that needed a Docker daemon and could not have one.
+
+    Around thirty routes build a client the moment they are called -- the
+    infrastructure and system pages, the whole image cache, range validate. On
+    the Kubernetes substrate there is no socket to build it against, so all of
+    them answered a bare `Internal Server Error` with nothing in the body, and
+    the one fact that resolves the confusion -- that this install has no Docker
+    -- was legible only to someone holding kubectl.
+
+    Gating those routers per substrate is the real fix. This is the floor
+    beneath it, so that a route nobody has reached yet still refuses in a way
+    the person reading it can act on, and so that a Docker host which loses its
+    socket says so rather than looking like a bug in the route.
+    """
+    # Starlette routes a websocket endpoint's exception to this same handler,
+    # and a WebSocket carries no `method` -- reading one here would replace the
+    # failure with an AttributeError raised inside the handler itself.
+    route = f"{request.scope.get('method', 'WS')} {request.url.path}"
+    if kubernetes_ranges.is_kubernetes():
+        logger.warning("Docker SDK error on %s: %s", route, exc)
+        return JSONResponse(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            content={
+                "detail": (
+                    "This install runs on the Kubernetes substrate. "
+                    f"{route} belongs to the Docker substrate and is not available here."
+                )
+            },
+        )
+    # On a Docker host the same exception is a fault rather than an absence.
+    # Starlette logged the traceback itself while nothing handled it; handling
+    # it here has to keep that, or the only record of which call failed is gone.
+    # The detail carries the SDK's own message because the cause is not always a
+    # missing socket -- a daemon that answers and refuses raises from the same
+    # tree, and "could not reach it" would be a false explanation.
+    logger.error("Docker SDK error on %s: %s", route, exc, exc_info=exc)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "detail": (
+                f"{route} needs the Docker daemon and the call failed: {exc}. Check that "
+                "the daemon is running and that the API can reach its socket."
+            )
+        },
+    )
+
+
 # Include routers
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(feedback_router, prefix="/api/v1")
 app.include_router(users_router, prefix="/api/v1")
 app.include_router(ranges_router, prefix="/api/v1")
 app.include_router(networks_router, prefix="/api/v1")
 app.include_router(vms_router, prefix="/api/v1")
 app.include_router(websocket_router, prefix="/api/v1")
+app.include_router(kubernetes_console_router, prefix="/api/v1")
+app.include_router(kubernetes_apps_router, prefix="/api/v1")
 app.include_router(artifacts_router, prefix="/api/v1")
 app.include_router(snapshots_router, prefix="/api/v1")
 app.include_router(events_router, prefix="/api/v1")
@@ -180,6 +303,7 @@ app.include_router(msel_router, prefix="/api/v1")
 app.include_router(walkthrough_router, prefix="/api/v1")
 app.include_router(cache_router, prefix="/api/v1")
 app.include_router(system_router, prefix="/api/v1")
+app.include_router(capabilities_router, prefix="/api/v1")
 app.include_router(blueprints_router, prefix="/api/v1")
 app.include_router(instances_router, prefix="/api/v1")
 app.include_router(scenarios_router, prefix="/api/v1")
@@ -213,7 +337,44 @@ async def get_version():
     }
 
 
-AI_CONTEXT = """# PROVING GROUND API Quick Reference (for AI Assistants)
+@app.get("/api/v1/branding")
+async def get_branding():
+    """What this deployment calls itself.
+
+    **Deliberately unauthenticated.** The sign-in page renders the product name
+    before anyone has credentials, so gating this would leave the first screen
+    anybody sees unable to name the product.
+
+    Nothing here is sensitive: it is the name, the tagline and optional colour
+    overrides — the same things printed on the page that serves it.
+    """
+    return {
+        "product_name": settings.branding_product_name,
+        "tagline": settings.branding_tagline,
+        "primary_palette": settings.branding_primary_palette,
+    }
+
+
+_AI_OVERVIEW_KUBERNETES = """# PROVING GROUND API Quick Reference (for AI Assistants)
+
+## Overview
+This install runs ranges on Kubernetes. A range is an instance of a blueprint, placed in a
+namespace (or a virtual cluster); its machines are KubeVirt workloads on Multus network
+attachments, and the software being trained against is installed from an unmodified upstream
+Helm chart with seed / reset / verify hooks.
+
+## Core Workflow
+1. GET  /api/v1/blueprints - List blueprints
+2. POST /api/v1/blueprints/{id}/deploy - Deploy an instance; this is how a range is created
+3. GET  /api/v1/ranges/{id}/workloads - Machines, their phase and their addresses
+4. POST /api/v1/ranges/{id}/start | /stop - Start or stop the range's machines
+5. DELETE /api/v1/ranges/{id} - Destroy the namespace and everything in it
+
+The Docker-substrate endpoints below (networks, VMs, the image cache, snapshots) are refused on
+this install with 501 or 409: composition is declared in the blueprint.
+"""
+
+_AI_OVERVIEW_DOCKER = """# PROVING GROUND API Quick Reference (for AI Assistants)
 
 ## Overview
 PROVING GROUND creates Docker-based cyber training ranges with isolated networks and VMs.
@@ -228,6 +389,17 @@ Uses a three-tier Image Library: Base Images (containers/ISOs), Golden Images (c
 6. POST /api/v1/ranges/{id}/stop - Stop a running range
 7. POST /api/v1/ranges/{id}/teardown - Destroy and reset to draft
 
+"""
+
+
+def _ai_overview(kubernetes: bool) -> str:
+    """As `_concepts`, for the guide an assistant reads before generating calls."""
+    return _AI_OVERVIEW_KUBERNETES if kubernetes else _AI_OVERVIEW_DOCKER
+
+
+AI_CONTEXT = (
+    _ai_overview(_KUBERNETES)
+    + """
 ## Key Endpoints
 
 ### Ranges
@@ -324,6 +496,7 @@ Get token via: POST /api/v1/auth/login {"username": "x", "password": "y"}
 - VMs can have multiple network interfaces via POST /vms/{id}/networks/{network_id}
 - Use Blueprints for reusable range configurations
 """
+)
 
 
 @app.get("/api/v1/schema/ai-context", tags=["system"])

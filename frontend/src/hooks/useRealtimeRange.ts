@@ -9,12 +9,50 @@
  * - Event callbacks for UI updates
  */
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { api } from '../services/api'
 import { useAuthStore } from '../stores/authStore'
 import { RealtimeEvent, WebSocketConnectionState } from '../types'
 
 const WS_BASE_URL = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_WS_URL || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
 const MAX_RECONNECT_ATTEMPTS = 5
 const INITIAL_RECONNECT_DELAY = 1000
+
+/** The sockets a ticket can be minted for, spelled as the API spells them. */
+export type WebSocketTicketKind = 'console' | 'vnc' | 'range-console' | 'status' | 'events'
+
+/**
+ * Exchange the session for a short-lived cookie that opens ONE websocket.
+ *
+ * `new WebSocket(url)` takes a URL and nothing else, so the session JWT used to
+ * travel in the query string -- which put a credential good for the whole API
+ * into the browser's history, into the access log of every proxy and ingress
+ * between here and the server, and into a Referer if the page ever linked out.
+ * What comes back from this call is an HttpOnly cookie scoped to that one
+ * socket's path; the browser sends it on the handshake by itself, so the URL
+ * carries nothing worth stealing.
+ *
+ * Call it immediately before every connect, reconnects included: a ticket is
+ * good for minutes, not for the life of the page.
+ *
+ * It lives in this module because four callers need it and a second copy of an
+ * access decision is the kind that gets fixed in one place and stays broken in
+ * the other. It belongs in a websocket service module once there is one.
+ *
+ * Rejects if the server refuses, so the caller can say why rather than opening
+ * a socket that is about to be closed under it.
+ */
+export async function requestWebSocketTicket(
+  kind: WebSocketTicketKind,
+  resourceId?: string
+): Promise<void> {
+  await api.post('/ws/ticket', { kind, resource_id: resourceId ?? null })
+}
+
+/** Exponential backoff with jitter, so many clients do not reconnect in lockstep. */
+function reconnectDelay(attempt: number): number {
+  const baseDelay = Math.min(INITIAL_RECONNECT_DELAY * Math.pow(2, attempt), 30000)
+  return Math.round(baseDelay + Math.random() * 0.25 * baseDelay)
+}
 
 interface UseRealtimeRangeOptions {
   onEvent?: (event: RealtimeEvent) => void
@@ -61,7 +99,12 @@ export function useRealtimeRange(
     callbacksRef.current = { onEvent, onStatusChange, onVmStatusChange, onDeploymentProgress, onError }
   }, [onEvent, onStatusChange, onVmStatusChange, onDeploymentProgress, onError])
 
-  const connect = useCallback(() => {
+  // A scheduled retry has to call the *current* `connect`, and `connect`
+  // cannot name itself inside its own initializer. The ref is that
+  // indirection, kept in step by the effect below.
+  const connectRef = useRef<() => Promise<void>>(() => Promise.resolve())
+
+  const connect: () => Promise<void> = useCallback(async () => {
     if (!token || !rangeId || !enabled) return
 
     // Prevent rapid reconnection - wait for previous close to complete
@@ -78,8 +121,34 @@ export function useRealtimeRange(
 
     setConnectionState('connecting')
 
-    // Build WebSocket URL with token and optional range_id
-    const wsUrl = `${WS_BASE_URL}/api/v1/ws/events?token=${encodeURIComponent(token)}&range_id=${encodeURIComponent(rangeId)}`
+    // The credential is a cookie the API sets, not a query parameter. Minted
+    // here rather than once per page because it is deliberately short-lived.
+    try {
+      await requestWebSocketTicket('events')
+    } catch (err) {
+      console.error('[WebSocket] Ticket refused:', err)
+      if (!mountedRef.current) return
+      setConnectionState('error')
+      callbacksRef.current.onError?.('Could not obtain a websocket ticket')
+      // Treated as a failed connection rather than a dead end: a refused mint
+      // is usually a blip or an expired session, and giving up silently leaves
+      // the range page showing stale state with nothing saying why.
+      if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS && enabled) {
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (mountedRef.current) {
+            reconnectAttemptsRef.current++
+            void connectRef.current()
+          }
+        }, reconnectDelay(reconnectAttemptsRef.current))
+      }
+      return
+    }
+
+    // The effect was torn down while the ticket was in flight.
+    if (!mountedRef.current) return
+
+    // No token in the URL: see requestWebSocketTicket.
+    const wsUrl = `${WS_BASE_URL}/api/v1/ws/events?range_id=${encodeURIComponent(rangeId)}`
 
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
@@ -162,24 +231,22 @@ export function useRealtimeRange(
 
       // Attempt reconnection if not a clean close and we haven't exceeded attempts
       if (event.code !== 1000 && reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS && enabled) {
-        const baseDelay = Math.min(
-          INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttemptsRef.current),
-          30000 // Max 30 seconds
-        )
-        // Add random jitter (0-25%) to prevent thundering herd when many clients reconnect
-        const jitter = Math.random() * 0.25 * baseDelay
-        const delay = Math.round(baseDelay + jitter)
+        const delay = reconnectDelay(reconnectAttemptsRef.current)
         console.log(`[WebSocket] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1})`)
 
         reconnectTimeoutRef.current = setTimeout(() => {
           if (mountedRef.current) {
             reconnectAttemptsRef.current++
-            connect()
+            void connectRef.current()
           }
         }, delay)
       }
     }
   }, [token, rangeId, enabled])
+
+  useEffect(() => {
+    connectRef.current = connect
+  }, [connect])
 
   // Subscribe to additional range
   const subscribe = useCallback((targetRangeId: string) => {
@@ -220,7 +287,7 @@ export function useRealtimeRange(
       // Small delay to avoid React 18 Strict Mode double-render race condition
       connectTimeout = setTimeout(() => {
         if (mountedRef.current) {
-          connect()
+          void connect()
         }
       }, 100)
     }

@@ -151,10 +151,22 @@ def test_catalog_identifiers_preserved(name, needle):
 
 
 def test_content_bucket_name_preserved():
-    content = (BACKEND / "api" / "content.py").read_text(encoding="utf-8")
-    assert CONTENT_BUCKET_NEEDLE in content, (
+    """The DEFAULT moved from a literal in api/content.py to a setting in config.py.
+
+    What the guard protects is the name, not its address: renaming it orphans content already
+    stored under the old bucket. Making it configurable is the opposite of renaming it -- an
+    environment that pre-provisions buckets could not name them while it was a bare literal in
+    two functions. The default is unchanged, and this asserts that.
+    """
+    config = (BACKEND / "config.py").read_text(encoding="utf-8")
+    assert CONTENT_BUCKET_NEEDLE in config, (
         "proving-ground-content MinIO bucket name was renamed — this orphans "
         "content already stored under the old bucket. See CLAUDE.md."
+    )
+    content = (BACKEND / "api" / "content.py").read_text(encoding="utf-8")
+    assert "content_bucket()" in content, (
+        "api/content.py must resolve the bucket through object_store.content_bucket(), so the "
+        "name has exactly one definition."
     )
 
 

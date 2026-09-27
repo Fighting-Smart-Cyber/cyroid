@@ -34,6 +34,13 @@ class TraefikRouteService:
         self.routes_dir = Path(
             routes_dir or os.environ.get("TRAEFIK_VNC_ROUTES_DIR", "/etc/traefik/vnc-routes")
         )
+        # Where Traefik reaches the API to authorise a console request. Traefik
+        # resolves this on the shared compose network, so it is a service name
+        # rather than the public host -- the check must not depend on the
+        # deployment being reachable from outside itself.
+        self.authz_address = os.environ.get(
+            "CONSOLE_AUTHZ_ADDRESS", "http://api:8000/api/v1/vms/console-authz"
+        )
 
     def _ensure_routes_dir(self) -> bool:
         """Ensure the routes directory exists. Returns True if successful."""
@@ -109,8 +116,29 @@ class TraefikRouteService:
             middleware_name = f"vnc-strip-{vm_id_short}"
             middlewares[middleware_name] = {"stripPrefix": {"prefixes": [f"/vnc/{vm_id}"]}}
 
-            # Build middleware list for this route
-            route_middlewares = [middleware_name]
+            # Authorise BEFORE anything else runs.
+            #
+            # Everything after this point is what made the route dangerous: the
+            # prefix is stripped and a Basic Authorization header is injected on
+            # the caller's behalf, so reaching the service at all was full
+            # console access. Nothing checked who was asking -- knowing a VM's
+            # id was enough, with no login anywhere in the path.
+            #
+            # forwardAuth puts the API in front of that. Traefik calls
+            # /api/v1/vms/console-authz first and proxies only on a 2xx; the
+            # console ticket cookie is the credential, since the iframe cannot
+            # carry the app's JWT. Ordering is the whole point: this must be
+            # FIRST in the list, or the credentials are injected regardless.
+            authz_middleware_name = f"vnc-authz-{vm_id_short}"
+            middlewares[authz_middleware_name] = {
+                "forwardAuth": {
+                    "address": f"{self.authz_address}",
+                    # Traefik sends the original request's method, host and URI
+                    # in these; console-authz reads the VM id out of the URI.
+                    "authResponseHeaders": [],
+                }
+            }
+            route_middlewares = [authz_middleware_name, middleware_name]
 
             # For KasmVNC (port 6901), add auth header middleware for auto-login
             if requires_ssl:

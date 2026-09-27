@@ -9,7 +9,7 @@ Each range gets a dedicated VyOS container that:
 - Enforces isolation via firewall rules
 """
 import docker
-from docker.errors import APIError, NotFound, ImageNotFound
+from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from typing import Optional
 import logging
 import time
@@ -29,13 +29,18 @@ class VyOSService:
         self._verify_connection()
 
     def _verify_connection(self) -> None:
-        """Verify connection to Docker daemon."""
+        """Verify connection to Docker daemon.
+
+        Raises the SDK's own exception, like DockerService does, so that a host
+        with no daemon lands in the app-level refusal that names the substrate
+        instead of reaching the browser as a bare 500 with an empty body.
+        """
         try:
             self.client.ping()
             logger.info("VyOS Service: Connected to Docker daemon")
         except Exception as e:
             logger.error(f"VyOS Service: Failed to connect to Docker daemon: {e}")
-            raise RuntimeError("Cannot connect to Docker daemon") from e
+            raise DockerException("Cannot connect to Docker daemon") from e
 
     def ensure_vyos_image(self) -> bool:
         """

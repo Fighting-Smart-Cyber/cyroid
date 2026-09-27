@@ -6,8 +6,10 @@ This service enables real-time UI updates by broadcasting events
 to connected WebSocket clients through Redis pub/sub.
 """
 import asyncio
+import json
 import logging
-from typing import Optional, Dict, Set, Any
+from dataclasses import dataclass
+from typing import Callable, Optional, Dict, Set, Any
 from uuid import UUID
 from datetime import datetime
 
@@ -126,6 +128,20 @@ class EventBroadcaster:
             logger.error(f"Failed to broadcast event: {e}")
 
 
+def _receives_nothing(_event: Dict[str, Any]) -> bool:
+    """The default entitlement: a connection that did not say who is behind it
+    receives only the channels it explicitly subscribed to."""
+    return False
+
+
+@dataclass
+class _Connection:
+    """A live socket and the rule that decides which global events reach it."""
+
+    websocket: Any
+    may_receive: Callable[[Dict[str, Any]], bool]
+
+
 class ConnectionManager:
     """
     Manages WebSocket connections and their subscriptions.
@@ -137,8 +153,8 @@ class ConnectionManager:
     """
 
     def __init__(self):
-        # Map of connection_id -> websocket
-        self._connections: Dict[str, Any] = {}
+        # Map of connection_id -> _Connection
+        self._connections: Dict[str, _Connection] = {}
         # Map of connection_id -> set of subscribed channels
         self._subscriptions: Dict[str, Set[str]] = {}
         # Map of channel -> set of connection_ids
@@ -175,9 +191,26 @@ class ConnectionManager:
 
         logger.info("ConnectionManager stopped")
 
-    async def connect(self, connection_id: str, websocket: Any) -> None:
-        """Register a new WebSocket connection."""
-        self._connections[connection_id] = websocket
+    async def connect(
+        self,
+        connection_id: str,
+        websocket: Any,
+        may_receive: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> None:
+        """Register a new WebSocket connection.
+
+        `may_receive` decides, event by event, whether this connection is
+        entitled to something published on the global channel. It defaults to
+        refusing everything, because the alternative default is the defect this
+        parameter exists to close: the global channel used to be delivered to
+        every connected socket, so authorising a subscription decided nothing.
+        A caller that does not say who is on the other end of the socket gets
+        only the channels it asks for by name.
+        """
+        self._connections[connection_id] = _Connection(
+            websocket=websocket,
+            may_receive=may_receive or _receives_nothing,
+        )
         self._subscriptions[connection_id] = set()
         logger.info(f"WebSocket connected: {connection_id}")
 
@@ -224,15 +257,17 @@ class ConnectionManager:
             if not self._channel_subscribers[channel] and self._pubsub:
                 await self._pubsub.unsubscribe(channel)
 
-    def subscribe_to_range(self, connection_id: str, range_id: str) -> asyncio.Task:
-        """Subscribe to all events for a specific range."""
-        channel = f"{RANGE_CHANNEL_PREFIX}{range_id}"
-        return asyncio.create_task(self.subscribe(connection_id, channel))
+    async def subscribe_to_range(self, connection_id: str, range_id: str) -> None:
+        """Subscribe to all events for a specific range.
 
-    def subscribe_to_vm(self, connection_id: str, vm_id: str) -> asyncio.Task:
-        """Subscribe to all events for a specific VM."""
-        channel = f"{VM_CHANNEL_PREFIX}{vm_id}"
-        return asyncio.create_task(self.subscribe(connection_id, channel))
+        The caller must have established that this connection's user may read
+        the range; nothing below this line checks.
+        """
+        await self.subscribe(connection_id, f"{RANGE_CHANNEL_PREFIX}{range_id}")
+
+    async def subscribe_to_vm(self, connection_id: str, vm_id: str) -> None:
+        """Subscribe to all events for a specific VM, on the same terms."""
+        await self.subscribe(connection_id, f"{VM_CHANNEL_PREFIX}{vm_id}")
 
     async def _listen(self) -> None:
         """Listen for Redis pub/sub messages and route to connections."""
@@ -248,24 +283,62 @@ class ConnectionManager:
             logger.error(f"Redis listener error: {e}")
 
     async def _route_message(self, channel: str, data: str) -> None:
-        """Route a message to all subscribed connections."""
-        # Get subscribers for this channel
-        subscribers = set()
+        """Route a message to the connections entitled to it.
 
-        # Global channel goes to everyone
-        if channel == EVENTS_CHANNEL:
-            subscribers = set(self._connections.keys())
-        else:
-            subscribers = self._channel_subscribers.get(channel, set())
+        A range or VM channel was subscribed to by name, and the endpoint
+        authorised that subscription, so every subscriber on it gets the
+        message. The global channel is the one that leaked: every event is
+        published to it as well, and it was delivered to every connected
+        socket, so a learner's notification feed carried every other cohort's
+        deployment messages and every notification addressed to someone else.
+        It is now filtered per connection.
 
-        # Send to all subscribers
-        for connection_id in subscribers:
-            websocket = self._connections.get(connection_id)
-            if websocket:
-                try:
-                    await websocket.send_text(data)
-                except Exception as e:
-                    logger.warning(f"Failed to send to {connection_id}: {e}")
+        A connection already subscribed to the event's own range or VM channel
+        is skipped here, because the same payload reaches it on that channel --
+        without this it arrived twice.
+        """
+        if channel != EVENTS_CHANNEL:
+            for connection_id in list(self._channel_subscribers.get(channel, set())):
+                await self._send(connection_id, data)
+            return
+
+        try:
+            event = json.loads(data)
+        except (TypeError, ValueError):
+            logger.warning("Dropping an unparseable payload on %s", EVENTS_CHANNEL)
+            return
+
+        specific = self._channels_of(event)
+        for connection_id, connection in list(self._connections.items()):
+            if self._subscriptions.get(connection_id, set()) & specific:
+                continue
+            try:
+                entitled = connection.may_receive(event)
+            except Exception:
+                # A broken entitlement check must not become a broadcast.
+                logger.exception("Entitlement check failed for %s; refusing", connection_id)
+                entitled = False
+            if entitled:
+                await self._send(connection_id, data)
+
+    @staticmethod
+    def _channels_of(event: Dict[str, Any]) -> Set[str]:
+        """The specific channels this same event was also published to."""
+        channels = set()
+        if event.get("range_id"):
+            channels.add(f"{RANGE_CHANNEL_PREFIX}{event['range_id']}")
+        if event.get("vm_id"):
+            channels.add(f"{VM_CHANNEL_PREFIX}{event['vm_id']}")
+        return channels
+
+    async def _send(self, connection_id: str, data: str) -> None:
+        connection = self._connections.get(connection_id)
+        if connection is None:
+            return
+        try:
+            await connection.websocket.send_text(data)
+        except Exception as e:
+            logger.warning(f"Failed to send to {connection_id}: {e}")
 
 
 # Singleton instances

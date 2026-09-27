@@ -1,5 +1,5 @@
 // frontend/src/pages/BlueprintDetail.tsx
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import {
   blueprintsApi,
@@ -14,6 +14,7 @@ import {
   LayoutTemplate,
   Loader2,
   ArrowLeft,
+  AlertTriangle,
   Rocket,
   Network,
   Server,
@@ -22,12 +23,31 @@ import {
   ExternalLink,
   Download,
   BookOpen,
+  Boxes,
   Pencil,
+  GitPullRequest,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { toast } from '../stores/toastStore';
 import { ConfirmDialog } from '../components/common/ConfirmDialog';
-import { DeployInstanceModal, ExportBlueprintModal, VisualBlueprintEditor } from '../components/blueprints';
+import {
+  ContributeToCatalogModal,
+  DeployInstanceModal,
+  EditBlueprintModal,
+  ExportBlueprintModal,
+  VisualBlueprintEditor,
+} from '../components/blueprints';
+import { BlueprintCatalogDiff, catalogContributionApi } from '../services/catalogContribution';
+import {
+  apiErrorDetail,
+  blueprintCapabilities,
+  blueprintLegacyVms,
+  blueprintNetworks,
+  blueprintSchemaVersion,
+  blueprintWorkloads,
+  isKubernetesBlueprint,
+  usesVisualEditor,
+} from '../lib/blueprints';
 
 const statusColors: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-800',
@@ -42,6 +62,7 @@ export default function BlueprintDetail() {
   const [blueprint, setBlueprint] = useState<BlueprintDetailType | null>(null);
   const [instances, setInstances] = useState<Instance[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'overview' | 'instances'>('overview');
   const [showDeployModal, setShowDeployModal] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<{
@@ -50,12 +71,26 @@ export default function BlueprintDetail() {
   }>({ instance: null, isLoading: false });
   const [showExportModal, setShowExportModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
+  const [showContributeModal, setShowContributeModal] = useState(false);
+  const [catalogDiff, setCatalogDiff] = useState<BlueprintCatalogDiff | null>(null);
   const [contentItems, setContentItems] = useState<ContentListItem[]>([]);
   const [linkedContentIds, setLinkedContentIds] = useState<string[]>([]);
   const [savingContent, setSavingContent] = useState(false);
 
-  const fetchData = async () => {
+  // A failed load has to leave a page behind. This cleared `loading` without ever setting
+  // `blueprint`, so the render below fell through to the spinner and stayed there: one toast,
+  // then an apparent hang, with nothing saying what went wrong or how to get back.
+  //
+  // Only a first load can fail that way. Every later call runs behind a deploy, a clone, a
+  // delete or a save that has already happened, so its failure is a stale page rather than no
+  // page: tearing the blueprint down and drawing the load error instead would blame the action
+  // the user just watched succeed.
+  const loaded = useRef(false);
+
+  const fetchData = useCallback(async () => {
     if (!id) return;
+    if (!loaded.current) setLoading(true);
+    setLoadError(null);
     try {
       const [bpRes, instRes, contentRes] = await Promise.all([
         blueprintsApi.get(id),
@@ -66,16 +101,44 @@ export default function BlueprintDetail() {
       setInstances(instRes.data);
       setContentItems(contentRes.data);
       setLinkedContentIds(bpRes.data.content_ids || []);
-    } catch (err) {
-      console.error('Failed to fetch blueprint:', err);
-      toast.error('Failed to load blueprint');
+      loaded.current = true;
+    } catch (err: unknown) {
+      const message = apiErrorDetail(err, 'The server did not say why.');
+      if (loaded.current) {
+        toast.error(message);
+      } else {
+        setBlueprint(null);
+        setLoadError(message);
+      }
     } finally {
       setLoading(false);
     }
-  };
+  }, [id]);
 
   useEffect(() => {
+    // Another blueprint is a first load again: its failure has to draw the error panel rather
+    // than leave the previous blueprint on screen under this one's id.
+    loaded.current = false;
+    setBlueprint(null);
     fetchData();
+  }, [fetchData]);
+
+  // Whether this blueprint has a catalog to contribute back to, and how far it
+  // has drifted from it. A 404 just means it was authored locally.
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    catalogContributionApi
+      .diff(id)
+      .then((result) => {
+        if (!cancelled) setCatalogDiff(result);
+      })
+      .catch(() => {
+        if (!cancelled) setCatalogDiff(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
   const handleDeploy = async (data: InstanceDeploy) => {
@@ -85,8 +148,8 @@ export default function BlueprintDetail() {
       toast.success('Instance deployed');
       setShowDeployModal(false);
       fetchData();
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to deploy');
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to deploy'));
     }
   };
 
@@ -95,8 +158,8 @@ export default function BlueprintDetail() {
       await instancesApi.clone(instance.id);
       toast.success('Instance cloned');
       fetchData();
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to clone');
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to clone'));
     }
   };
 
@@ -108,9 +171,9 @@ export default function BlueprintDetail() {
       toast.success('Instance deleted');
       setDeleteConfirm({ instance: null, isLoading: false });
       fetchData();
-    } catch (err: any) {
+    } catch (err: unknown) {
       setDeleteConfirm({ instance: null, isLoading: false });
-      toast.error(err.response?.data?.detail || 'Failed to delete');
+      toast.error(apiErrorDetail(err, 'Failed to delete'));
     }
   };
 
@@ -125,22 +188,58 @@ export default function BlueprintDetail() {
     try {
       await blueprintsApi.update(id, { content_ids: newIds });
       toast.success('Linked content updated');
-    } catch (err: any) {
+    } catch (err: unknown) {
       // Revert on error
       setLinkedContentIds(linkedContentIds);
-      toast.error(err.response?.data?.detail || 'Failed to update linked content');
+      toast.error(apiErrorDetail(err, 'Failed to update linked content'));
     } finally {
       setSavingContent(false);
     }
   };
 
-  if (loading || !blueprint) {
+  if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
         <Loader2 className="h-8 w-8 animate-spin text-primary-600" />
       </div>
     );
   }
+
+  if (!blueprint) {
+    return (
+      <div>
+        <Link
+          to="/blueprints"
+          className="inline-flex items-center text-sm text-gray-500 hover:text-gray-700 mb-4"
+        >
+          <ArrowLeft className="h-4 w-4 mr-1" />
+          Back to Blueprints
+        </Link>
+        <div className="bg-white shadow rounded-lg p-8 text-center">
+          <AlertTriangle className="mx-auto h-10 w-10 text-amber-500" />
+          <h3 className="mt-3 text-sm font-medium text-gray-900">
+            This blueprint could not be loaded
+          </h3>
+          <p className="mt-2 text-sm text-gray-600 whitespace-pre-wrap">
+            {loadError ?? 'The server returned no blueprint.'}
+          </p>
+          <button
+            onClick={fetchData}
+            className="mt-4 inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+          >
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const schemaVersion = blueprintSchemaVersion(blueprint.config);
+  const isKubernetes = isKubernetesBlueprint(blueprint.config);
+  const networks = blueprintNetworks(blueprint.config);
+  const workloads = blueprintWorkloads(blueprint.config);
+  const legacyVms = blueprintLegacyVms(blueprint.config);
+  const capabilities = blueprintCapabilities(blueprint.config);
 
   return (
     <div>
@@ -159,7 +258,19 @@ export default function BlueprintDetail() {
               <LayoutTemplate className="h-8 w-8 text-indigo-600" />
             </div>
             <div className="ml-4">
-              <h1 className="text-2xl font-bold text-gray-900">{blueprint.name}</h1>
+              <div className="flex items-center gap-2">
+                <h1 className="text-2xl font-bold text-gray-900">{blueprint.name}</h1>
+                <span
+                  title={
+                    isKubernetes
+                      ? 'Declares workloads and capabilities — deployable on Kubernetes'
+                      : 'Declares networks and VMs — deployable on Docker'
+                  }
+                  className="px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700"
+                >
+                  schema v{schemaVersion}
+                </span>
+              </div>
               <p className="text-sm text-gray-500">
                 Version {blueprint.version} · Created by {blueprint.created_by_username}
               </p>
@@ -180,6 +291,21 @@ export default function BlueprintDetail() {
               <Download className="h-4 w-4 mr-2" />
               Export
             </button>
+            {catalogDiff && (
+              <button
+                onClick={() => setShowContributeModal(true)}
+                title={`Contribute your changes back to ${catalogDiff.origin.source_name}`}
+                className="inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+              >
+                <GitPullRequest className="h-4 w-4 mr-2" />
+                Contribute
+                {catalogDiff.has_changes && (
+                  <span className="ml-2 px-1.5 py-0.5 rounded-full text-xs bg-amber-100 text-amber-800">
+                    {catalogDiff.changes.length}
+                  </span>
+                )}
+              </button>
+            )}
             <button
               onClick={() => setShowDeployModal(true)}
               className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700"
@@ -224,40 +350,134 @@ export default function BlueprintDetail() {
         <div className="bg-white shadow rounded-lg p-6">
           <h3 className="text-lg font-medium text-gray-900 mb-4">Configuration</h3>
 
+          {/* Both eras declare networks. Everything below them differs: a v2 blueprint has
+              workloads and capability packages and no `vms` key at all, so reading v1 fields
+              here showed an empty VMs table for the machine the blueprint plainly declares. */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {/* Networks */}
             <div>
               <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
                 <Network className="h-4 w-4 mr-2" />
-                Networks ({blueprint.config.networks.length})
+                Networks ({networks.length})
               </h4>
-              <ul className="space-y-2">
-                {blueprint.config.networks.map((net, i) => (
-                  <li key={i} className="bg-gray-50 rounded p-2 text-sm">
-                    <span className="font-medium">{net.name}</span>
-                    <span className="text-gray-500 ml-2">{net.subnet}</span>
-                  </li>
-                ))}
-              </ul>
+              {networks.length === 0 ? (
+                <p className="text-sm text-gray-500">None declared</p>
+              ) : (
+                <ul className="space-y-2">
+                  {networks.map((net, i) => (
+                    <li key={i} className="bg-gray-50 rounded p-2 text-sm">
+                      <span className="font-medium">{net.name}</span>
+                      <span className="text-gray-500 ml-2">{net.subnet}</span>
+                      {net.gateway && (
+                        <span className="text-gray-400 ml-2">gw {net.gateway}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
 
-            {/* VMs */}
-            <div>
+            {isKubernetes ? (
+              <div>
+                <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
+                  <Server className="h-4 w-4 mr-2" />
+                  Machines ({workloads.length})
+                </h4>
+                {workloads.length === 0 ? (
+                  <p className="text-sm text-gray-500">None declared</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {workloads.map((workload, i) => (
+                      <li key={i} className="bg-gray-50 rounded p-2 text-sm">
+                        <div>
+                          <span className="font-medium">{workload.name}</span>
+                          <span className="text-gray-500 ml-2">
+                            {[workload.osFamily, workload.osVersion].filter(Boolean).join(' ')}
+                          </span>
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1 space-x-3">
+                          {workload.cpus !== null && <span>{workload.cpus} vCPU</span>}
+                          {workload.memoryMb !== null && <span>{workload.memoryMb} MB</span>}
+                          {workload.disks.map((disk) => (
+                            <span key={disk.name}>
+                              {disk.name} {disk.sizeGb ?? '?'} GB{disk.boot ? ' (boot)' : ''}
+                            </span>
+                          ))}
+                        </div>
+                        {workload.interfaces.length > 0 && (
+                          <div className="text-xs text-gray-500 mt-1 space-x-3 font-mono">
+                            {workload.interfaces.map((iface, j) => (
+                              <span key={j}>
+                                {iface.network} {iface.ip ?? 'dhcp'}
+                                {iface.primary ? '*' : ''}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : (
+              <div>
+                <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
+                  <Server className="h-4 w-4 mr-2" />
+                  VMs ({legacyVms.length})
+                </h4>
+                {legacyVms.length === 0 ? (
+                  <p className="text-sm text-gray-500">None declared</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {legacyVms.map((vm, i) => (
+                      <li key={i} className="bg-gray-50 rounded p-2 text-sm">
+                        <span className="font-medium">{vm.hostname}</span>
+                        <span className="text-gray-500 ml-2">{vm.ipAddress}</span>
+                        {vm.image && <span className="text-gray-400 ml-2">({vm.image})</span>}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+
+          {capabilities.length > 0 && (
+            <div className="mt-6 pt-6 border-t">
               <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center">
-                <Server className="h-4 w-4 mr-2" />
-                VMs ({blueprint.config.vms.length})
+                <Boxes className="h-4 w-4 mr-2" />
+                Capabilities ({capabilities.length})
               </h4>
               <ul className="space-y-2">
-                {blueprint.config.vms.map((vm, i) => (
+                {capabilities.map((capability, i) => (
                   <li key={i} className="bg-gray-50 rounded p-2 text-sm">
-                    <span className="font-medium">{vm.hostname}</span>
-                    <span className="text-gray-500 ml-2">{vm.ip_address}</span>
-                    <span className="text-gray-400 ml-2">({vm.base_image_tag || vm.template_name})</span>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">{capability.name}</span>
+                      {capability.version && (
+                        <span className="text-gray-500">{capability.version}</span>
+                      )}
+                      {/* Scope is required of every capability with no default, and reset() and
+                          verify() both key off it, so an undeclared one is worth naming here. */}
+                      <span
+                        className={clsx(
+                          'px-1.5 py-0.5 rounded text-xs',
+                          capability.scope
+                            ? 'bg-indigo-100 text-indigo-700'
+                            : 'bg-red-100 text-red-700'
+                        )}
+                      >
+                        {capability.scope ?? 'no scope declared'}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-500 mt-1">
+                      chart {capability.chartName ?? '—'} {capability.chartVersion ?? ''}
+                      {capability.repository && ` · ${capability.repository}`}
+                      {capability.hooks.length > 0 && ` · hooks: ${capability.hooks.join(', ')}`}
+                    </div>
                   </li>
                 ))}
               </ul>
             </div>
-          </div>
+          )}
 
           {/* Linked Content */}
           <div className="mt-6 pt-6 border-t">
@@ -417,6 +637,15 @@ export default function BlueprintDetail() {
         isLoading={deleteConfirm.isLoading}
       />
 
+      {/* Contribute to Catalog Modal */}
+      {showContributeModal && blueprint && (
+        <ContributeToCatalogModal
+          blueprintId={blueprint.id}
+          blueprintName={blueprint.name}
+          onClose={() => setShowContributeModal(false)}
+        />
+      )}
+
       {/* Export Blueprint Modal */}
       {showExportModal && (
         <ExportBlueprintModal
@@ -425,15 +654,26 @@ export default function BlueprintDetail() {
         />
       )}
 
-      {/* Visual Blueprint Editor */}
-      {showEditModal && (
-        <VisualBlueprintEditor
-          blueprint={blueprint}
-          isOpen={true}
-          onClose={() => setShowEditModal(false)}
-          onSaved={fetchData}
-        />
-      )}
+      {/* The visual editor draws networks and VMs and writes them back, so it cannot open a v2
+          blueprint — it would read fields that are not there and save away the workloads and
+          capabilities it never saw. The JSON editor is the authoring path for those until a
+          structured one exists, and until then it is the only one there is. */}
+      {showEditModal &&
+        (usesVisualEditor(blueprint.config) ? (
+          <VisualBlueprintEditor
+            blueprint={blueprint}
+            isOpen={true}
+            onClose={() => setShowEditModal(false)}
+            onSaved={fetchData}
+          />
+        ) : (
+          <EditBlueprintModal
+            blueprint={blueprint}
+            isOpen={true}
+            onClose={() => setShowEditModal(false)}
+            onSaved={fetchData}
+          />
+        ))}
     </div>
   );
 }

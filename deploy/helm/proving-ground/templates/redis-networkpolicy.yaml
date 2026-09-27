@@ -1,0 +1,31 @@
+# The broker is unauthenticated, so reachability is the access control.
+#
+# Without this any pod in the cluster could read PROVING GROUND's queue,
+# enqueue work of its own, or flush it. That is the same shape of problem as
+# the DinD daemon listening on 2375 with TLS disabled, and it is worth not
+# repeating on the substrate that replaces it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pg-redis-broker
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: broker
+    app.kubernetes.io/part-of: proving-ground
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+      app.kubernetes.io/part-of: proving-ground
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only PROVING GROUND's own pods, and only in this namespace: an empty
+    # namespaceSelector would admit the whole cluster.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: proving-ground
+      ports:
+        - protocol: TCP
+          port: 6379

@@ -1,0 +1,84 @@
+{{- if .Values.minio.enabled }}
+# The k3s profile's object store. Elsewhere the environment supplies an S3-compatible one.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-minio
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.minio.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.minio.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-minio
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "minio" | nindent 4 }}
+spec:
+  selector:
+    {{- include "pg.component" "minio" | nindent 4 }}
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-minio
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "minio" | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "pg.component" "minio" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.component" "minio" | nindent 8 }}
+    spec:
+      {{- include "pg.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: minio
+          image: {{ .Values.minio.image | required "no object-store image: set minio.image to a MinIO image by digest in a registry this cluster can pull from, or minio.enabled=false to supply object storage yourself (ADR-0012)" }}
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: {secretKeyRef: {name: pg-platform, key: MINIO_ACCESS_KEY}}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: pg-platform, key: MINIO_SECRET_KEY}}
+          ports:
+            - name: s3
+              containerPort: 9000
+          readinessProbe:
+            httpGet: {path: /minio/health/ready, port: s3}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /minio/health/live, port: s3}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.minio.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-minio
+{{- end }}

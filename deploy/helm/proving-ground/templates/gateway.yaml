@@ -1,0 +1,174 @@
+{{- if .Values.gateway.enabled }}
+{{- /*
+pg-gateway: the reverse proxy in front of a range's applications.
+
+It exists because the authorisation step cannot be expressed as platform middleware anywhere but
+Traefik -- Azure Application Gateway has no ForwardAuth equivalent, and neither does the AWS Load
+Balancer Controller, GKE's ingress or OpenShift's router. Moving it in-process leaves one vanilla
+networking.k8s.io/v1 Ingress as the only thing a platform has to provide.
+
+It is a separate Deployment with a ServiceAccount of its own because it terminates requests from
+the software a range trains against. Compare what it holds with what pg-api holds: no
+DATABASE_URL, no MinIO keys, no JWT_SECRET_KEY, and one read-only cluster permission instead of
+pods/exec. A compromise here stays here.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pg-gateway
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-pg-gateway
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+rules:
+  # The whole permission. A range's applications are declared as Ingress objects naming a class
+  # no controller serves; reading them is how the gateway learns what is published.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-pg-gateway
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-pg-gateway
+subjects:
+  - kind: ServiceAccount
+    name: pg-gateway
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-gateway
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "gateway" | nindent 4 }}
+spec:
+  selector:
+    {{- include "pg.component" "gateway" | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-gateway
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- include "pg.component" "gateway" | nindent 4 }}
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "pg.component" "gateway" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.component" "gateway" | nindent 8 }}
+      annotations:
+        # A regenerated key pair must restart this, or it verifies with a public half whose
+        # private half the API has already stopped using.
+        checksum/secret: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: pg-gateway
+      {{- include "pg.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        # runAsNonRoot is a REFUSAL, not a request: it tells the kubelet to reject a container
+        # whose image would run as root, and it resolves the image's user by reading the image --
+        # it does not pick one. `backend/Dockerfile` has no USER line, so this pair without a uid
+        # is a deployment that can never start. It shipped that way in 0.53.0 and the gateway
+        # pod sat in CreateContainerConfigError ("container has runAsNonRoot and image will run
+        # as root") until the upgrade timed out; the platform came up and only range application
+        # publishing was down, which is why it survived the chart's own render tests.
+        #
+        # 65534 (nobody) is measured, not assumed: /app and site-packages are world-readable, the
+        # gateway writes nothing, and the pod imports and serves under that uid with the
+        # read-only root filesystem below. It owns no files, which is the point.
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: gateway
+          image: {{ include "pg.image" (dict "Values" .Values "Chart" .Chart "name" "pg-api") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The same image as the API, a different entrypoint. What separates them is what the
+          # pod is GIVEN, not what its filesystem contains.
+          command: ["uvicorn", "proving_ground.gateway.serve:app"]
+          args: ["--host", "0.0.0.0", "--port", "8080"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          env:
+            - name: RANGE_APPS_HOST
+              value: {{ .Values.ingress.appsHost | quote }}
+            - name: RANGE_INGRESS_PATH_PREFIX
+              value: {{ .Values.rangeIngress.pathPrefix | default "" | quote }}
+            - name: CONSOLE_COOKIE_SECURE
+              value: {{ .Values.consoleCookieSecure | default true | quote }}
+            # The PUBLIC half only. This pod VERIFIES the one-use handoff code the API minted;
+            # it must not be able to mint a console ticket or a platform access token.
+            - name: APP_TOKEN_PUBLIC_KEY
+              valueFrom: {secretKeyRef: {name: pg-platform, key: APP_TOKEN_PUBLIC_KEY}}
+            # The ticket is this pod's own: it mints one on redeeming a code and checks it on
+            # every later request. A half of an asymmetric pair cannot do both -- 0.53.1 signed
+            # with the jwt_secret_key fallback and verified with the public key above, so every
+            # ticket failed its own check and no application could be opened. This secret is
+            # shared with the API and with nothing else; jwt_secret_key would mint access tokens.
+            - name: APP_TICKET_SECRET
+              valueFrom: {secretKeyRef: {name: pg-platform, key: APP_TICKET_SECRET}}
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+{{- if .Values.ingress.appsHost }}
+---
+{{- /*
+The one Ingress a platform has to serve for every range's applications: a wildcard host, all
+paths, backed by pg-gateway. One listener for the whole install, rather than one per application
+per range -- which on Application Gateway is a listener count that grows with the class roster.
+
+Deliberately NOT annotated. That is the point of the exercise: the authorisation step is inside
+pg-gateway, so this is an object every ingress controller understands and none has to be
+extended to serve.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pg-apps
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- with (include "pg.appsTlsSecretName" $) }}
+  tls:
+    - hosts: ["*.{{ $.Values.ingress.appsHost }}"]
+      secretName: {{ . | quote }}
+  {{- end }}
+  rules:
+    - host: "*.{{ .Values.ingress.appsHost }}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pg-gateway
+                port: {name: http}
+{{- end }}
+{{- end }}

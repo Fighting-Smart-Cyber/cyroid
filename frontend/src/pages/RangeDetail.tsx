@@ -5,11 +5,19 @@ import { rangesApi, networksApi, vmsApi, imagesApi, NetworkCreate, VMCreate } fr
 import type { Range, Network, VM, RealtimeEvent, BaseImage, GoldenImageLibrary, SnapshotWithLineage, NetworkInterfaceCreate } from '../types'
 import {
   ArrowLeft, Plus, Loader2, X, Play, Square, RotateCw, Camera, RefreshCw,
-  Network as NetworkIcon, Server, Trash2, Rocket, Activity, Monitor, Shield, Pencil, Globe, Router, Wifi, Radio, Wrench, BookOpen, LayoutTemplate, Terminal, Layers, Settings2, HardDriveDownload
+  Network as NetworkIcon, Server, Trash2, Rocket, Activity, Monitor, Shield, Pencil, Globe, Router, Wifi, Radio, Wrench, BookOpen, LayoutTemplate, Terminal, Layers, Settings2, HardDriveDownload,
+  Users,
 } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import clsx from 'clsx'
 import { VncConsole } from '../components/console/VncConsole'
+import RangeVisibilityModal from '../components/ranges/RangeVisibilityModal'
 import { VMConsole } from '../components/console/VMConsole'
+import { KubernetesWorkloads } from '../components/range/KubernetesWorkloads'
+import { useFeature } from '../stores/capabilitiesStore'
+import { needsResourceSync } from '../lib/rangeDetail'
+import { actionFailureMessage, failureReasonForStatus } from '../lib/failureText'
+import { nextTabIndex, tabId, tabPanelId } from '../lib/tabs'
 import { VmEnvironmentModal } from '../components/vms/VmEnvironmentModal'
 import { useAuthStore } from '../stores/authStore'
 import { RelativeTime } from '../components/common/RelativeTime'
@@ -29,6 +37,12 @@ import { CaptureGoldenImageModal } from '../components/range/CaptureGoldenImageM
 import { ScenarioPickerModal, VMMappingModal } from '../components/scenarios'
 import type { Scenario } from '../types'
 
+// Deploy and sync answer a refusal with a list of things to go and fix, and that refusal used to
+// be a dialog the user had to dismiss before the page moved on. A toast at the default five
+// seconds cannot be read in full and cannot be brought back, so the reason a deploy was refused
+// would be gone before the user had it. Long enough to read; the toast still has a close button.
+const REFUSAL_TOAST_MS = 20000
+
 const statusColors: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-800',
   deploying: 'bg-yellow-100 text-yellow-800',
@@ -38,6 +52,16 @@ const statusColors: Record<string, string> = {
   creating: 'bg-yellow-100 text-yellow-800',
   error: 'bg-red-100 text-red-800'
 }
+
+// A status this table has no entry for would reach clsx as undefined and paint an unstyled badge,
+// which reads as a render that broke rather than as a state nobody has taught the page about.
+const UNKNOWN_STATUS_COLOR = 'bg-gray-100 text-gray-800'
+
+// Which tab bar these tabs belong to. Two tab bars can be on one page, and a tab's id has to be
+// unique for `aria-controls` and `aria-labelledby` to resolve to the right element.
+const TAB_GROUP = 'range'
+
+type RangeTabId = 'builder' | 'training' | 'diagnostics' | 'activity'
 
 // Network Interface Editor for Multi-NIC Support
 interface NetworkInterfaceEditorProps {
@@ -192,9 +216,30 @@ export default function RangeDetail() {
   const [goldenImages, setGoldenImages] = useState<GoldenImageLibrary[]>([])
   const [availableSnapshots, setAvailableSnapshots] = useState<SnapshotWithLineage[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
-  // Tab state
-  const [activeTab, setActiveTab] = useState<'builder' | 'training' | 'diagnostics' | 'activity'>('builder')
+  // What this install offers. A range on the Kubernetes substrate has no Network and no VM rows
+  // -- its machines and networks are declared in the blueprint and live in the cluster -- so
+  // every surface below that composes a range out of those rows belongs to the Docker substrate
+  // alone. Both flags are false until the backend answers, which is why they gate things on
+  // rather than off: a panel that appears a moment late is right, one that appears and then
+  // turns out to be a lie is what this page did.
+  const showComposition = useFeature('range_composition')
+  // Diagnostics is now two tabs behind one name: the Era A panels (a shell into the DinD
+  // container, the docker and iptables actions, the VNC status) and the Era B namespace view
+  // built beside them. Gating the tab on `legacy_range_console` alone hid the namespace view
+  // from the only substrate it describes -- and "there is no namespace view anywhere in the
+  // product" was the finding. The tab appears when either half has something to show; each
+  // panel inside gates itself.
+  const showLegacyDiagnostics = useFeature('legacy_range_console')
+  const showWorkloads = useFeature('workloads')
+  const showDiagnostics = showLegacyDiagnostics || showWorkloads
+
+  // Tab state. The arrow keys move the selection along the bar, and the tab they move to has to
+  // take focus with it: a roving tabindex leaves every unselected tab unreachable by Tab, so focus
+  // left behind on the old one would strand a keyboard user outside the bar they were just using.
+  const [activeTab, setActiveTab] = useState<RangeTabId>('builder')
+  const tabRefs = useRef<Partial<Record<RangeTabId, HTMLButtonElement | null>>>({})
 
   // Network modal state
   const [showNetworkModal, setShowNetworkModal] = useState(false)
@@ -287,6 +332,7 @@ export default function RangeDetail() {
 
   // Save Blueprint modal state
   const [showSaveBlueprintModal, setShowSaveBlueprintModal] = useState(false)
+  const [showVisibilityModal, setShowVisibilityModal] = useState(false)
 
   // Update Blueprint modal state (for ranges created from blueprints)
   const [showUpdateBlueprintModal, setShowUpdateBlueprintModal] = useState(false)
@@ -553,22 +599,21 @@ export default function RangeDetail() {
   const fetchData = async () => {
     if (!id) return
     try {
-      const [rangeRes, networksRes, vmsRes, baseImagesRes, goldenImagesRes, snapshotsRes] = await Promise.all([
+      const [rangeRes, networksRes, vmsRes] = await Promise.all([
         rangesApi.get(id),
         networksApi.list(id),
-        vmsApi.list(id),
-        imagesApi.listBaseImages(),
-        imagesApi.listGoldenImages(),
-        imagesApi.listLibrarySnapshots()  // Fetch all global snapshots for VM creation
+        vmsApi.list(id)
       ])
       setRange(rangeRes.data)
       setNetworks(networksRes.data)
       setVms(vmsRes.data)
-      setBaseImages(baseImagesRes.data)
-      setGoldenImages(goldenImagesRes.data)
-      setAvailableSnapshots(snapshotsRes.data)
+      setLoadError(null)
     } catch (err) {
       console.error('Failed to fetch range:', err)
+      // Without this the page falls through to "Range not found", which is a statement about the
+      // range. A refused request is a statement about the request -- a range someone else owns, a
+      // session that expired, an API that is down -- and the three are acted on differently.
+      setLoadError(actionFailureMessage(err, 'This range could not be loaded.'))
     } finally {
       setLoading(false)
     }
@@ -577,6 +622,38 @@ export default function RangeDetail() {
   useEffect(() => {
     fetchData()
   }, [id])
+
+  // The image library exists to fill in the Add VM form, so it is fetched only where that form
+  // is offered. Two reasons it is not simply part of the fetch above: on the Kubernetes
+  // substrate these endpoints are not part of the install, and a single rejected request inside
+  // that Promise.all left `range` null, which renders "Range not found" about a range that is
+  // running.
+  useEffect(() => {
+    if (!showComposition) {
+      setBaseImages([])
+      setGoldenImages([])
+      setAvailableSnapshots([])
+      return
+    }
+    let cancelled = false
+    const fetchImageLibrary = async () => {
+      try {
+        const [baseImagesRes, goldenImagesRes, snapshotsRes] = await Promise.all([
+          imagesApi.listBaseImages(),
+          imagesApi.listGoldenImages(),
+          imagesApi.listLibrarySnapshots()  // All global snapshots, for VM creation
+        ])
+        if (cancelled) return
+        setBaseImages(baseImagesRes.data)
+        setGoldenImages(goldenImagesRes.data)
+        setAvailableSnapshots(snapshotsRes.data)
+      } catch (err) {
+        console.error('Failed to fetch the image library:', err)
+      }
+    }
+    void fetchImageLibrary()
+    return () => { cancelled = true }
+  }, [showComposition])
 
   // Handle Escape key to close console modal
   useEffect(() => {
@@ -588,6 +665,15 @@ export default function RangeDetail() {
     document.addEventListener('keydown', handleEscape)
     return () => document.removeEventListener('keydown', handleEscape)
   }, [consoleVm])
+
+  // Capabilities arrive after the first paint, so a tab can be selected and only then turn out
+  // not to exist on this install. Without this the Builder tab is restored rather than leaving
+  // the page on a tab that renders nothing.
+  useEffect(() => {
+    if (!showDiagnostics && activeTab === 'diagnostics') {
+      setActiveTab('builder')
+    }
+  }, [showDiagnostics, activeTab])
 
   const handleDeploy = async () => {
     if (!id || !range) return
@@ -601,18 +687,10 @@ export default function RangeDetail() {
       await rangesApi.deploy(id)
       // Don't fetch immediately - let DeploymentProgress poll for status
       // The component will call onDeploymentComplete when done
-    } catch (err: any) {
+    } catch (err) {
       // Revert optimistic update on error
       setRange({ ...range, status: previousStatus })
-      const detail = err.response?.data?.detail
-      // Check if this is a validation error with structured detail
-      if (detail && typeof detail === 'object' && detail.errors) {
-        // Display validation errors clearly
-        const errorList = detail.errors.map((e: string) => `• ${e}`).join('\n')
-        alert(`${detail.message || 'Deployment validation failed'}\n\n${errorList}\n\n${detail.hint || ''}`)
-      } else {
-        alert(typeof detail === 'string' ? detail : 'Failed to deploy range')
-      }
+      toast.error(actionFailureMessage(err, 'Failed to deploy range'), REFUSAL_TOAST_MS)
     }
   }
 
@@ -623,8 +701,8 @@ export default function RangeDetail() {
       await rangesApi.start(id)
       toast.success(`Range "${range.name}" started`)
       fetchData()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to start range')
+    } catch (err) {
+      toast.error(actionFailureMessage(err, 'The range could not be started.'))
     }
   }
 
@@ -636,8 +714,8 @@ export default function RangeDetail() {
       await rangesApi.stop(id)
       toast.success(`Range "${range.name}" stopped`)
       fetchData()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to stop range')
+    } catch (err) {
+      toast.error(actionFailureMessage(err, 'The range could not be stopped.'))
     } finally {
       setStoppingRange(false)
     }
@@ -655,9 +733,9 @@ export default function RangeDetail() {
       await rangesApi.delete((deleteConfirm.item as Range).id)
       toast.success('Range deleted successfully')
       navigate('/ranges')
-    } catch (err: any) {
+    } catch (err) {
       setDeleteConfirm({ type: null, item: null, isLoading: false })
-      toast.error(err.response?.data?.detail || 'Failed to delete range')
+      toast.error(actionFailureMessage(err, 'The range could not be deleted.'))
     }
   }
 
@@ -667,28 +745,20 @@ export default function RangeDetail() {
       const response = await rangesApi.sync(id)
       const result = response.data
       if (result.status === 'no_changes') {
-        alert('All resources already provisioned')
+        toast.info('All resources already provisioned')
       } else {
-        alert(`Synced ${result.networks_synced} networks and ${result.vms_synced} VMs`)
+        toast.success(`Synced ${result.networks_synced} networks and ${result.vms_synced} VMs`)
       }
       fetchData()
-    } catch (err: any) {
-      const detail = err.response?.data?.detail
-      if (detail && typeof detail === 'object' && detail.errors) {
-        const errorList = detail.errors.map((e: string) => `• ${e}`).join('\n')
-        alert(`${detail.message || 'Sync validation failed'}\n\n${errorList}\n\n${detail.hint || ''}`)
-      } else {
-        alert(typeof detail === 'string' ? detail : 'Failed to sync range')
-      }
+    } catch (err) {
+      toast.error(actionFailureMessage(err, 'Failed to sync range'), REFUSAL_TOAST_MS)
     }
   }
 
-  // Check if there are unprovisioned resources that need sync
-  const hasUnprovisionedResources = useMemo(() => {
-    const unprovisionedNetworks = networks.filter(n => !n.docker_network_id).length
-    const unprovisionedVms = vms.filter(v => !v.container_id).length
-    return unprovisionedNetworks > 0 || unprovisionedVms > 0
-  }, [networks, vms])
+  const hasUnprovisionedResources = useMemo(
+    () => needsResourceSync(showComposition, networks, vms),
+    [showComposition, networks, vms]
+  )
 
   // Scenario handlers
   const handleScenarioSelect = (scenario: Scenario) => {
@@ -725,8 +795,8 @@ export default function RangeDetail() {
       setShowNetworkModal(false)
       setNetworkForm({ name: '', subnet: '', gateway: '', dns_servers: '', is_isolated: true })
       fetchData()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to create network')
+    } catch (err) {
+      setError(actionFailureMessage(err, 'The network could not be created.'))
     } finally {
       setSubmitting(false)
     }
@@ -744,22 +814,22 @@ export default function RangeDetail() {
       await networksApi.delete(network.id)
       setDeleteConfirm({ type: null, item: null, isLoading: false })
       fetchData()
-    } catch (err: any) {
+    } catch (err) {
       setDeleteConfirm({ type: null, item: null, isLoading: false })
-      toast.error(err.response?.data?.detail || 'Failed to delete network')
+      toast.error(actionFailureMessage(err, 'The network could not be deleted.'))
     }
   }
 
   const handleToggleIsolation = async (network: Network) => {
     if (!network.docker_network_id) {
-      alert('Network must be provisioned first (deploy the range)')
+      toast.error('Network must be provisioned first (deploy the range)')
       return
     }
     try {
       await networksApi.toggleIsolation(network.id)
       fetchData()
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to toggle isolation')
+    } catch (err) {
+      toast.error(actionFailureMessage(err, "This network's isolation could not be changed."))
     }
   }
 
@@ -767,8 +837,8 @@ export default function RangeDetail() {
     try {
       await networksApi.toggleInternet(network.id)
       fetchData()
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to toggle internet access')
+    } catch (err) {
+      toast.error(actionFailureMessage(err, 'Internet access for this network could not be changed.'))
     }
   }
 
@@ -777,8 +847,13 @@ export default function RangeDetail() {
     try {
       await networksApi.toggleDhcp(network.id)
       fetchData()
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to toggle DHCP. DHCP may not be available with DinD deployment.')
+    } catch (err) {
+      toast.error(
+        actionFailureMessage(
+          err,
+          'DHCP could not be changed. It is not available on a range deployed with DinD.'
+        )
+      )
     }
   }
 
@@ -805,8 +880,8 @@ export default function RangeDetail() {
       })
       setShowEditRangeModal(false)
       fetchData()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to update range')
+    } catch (err) {
+      setError(actionFailureMessage(err, 'The range could not be updated.'))
     } finally {
       setSubmitting(false)
     }
@@ -835,8 +910,8 @@ export default function RangeDetail() {
       setShowEditNetworkModal(false)
       setEditingNetwork(null)
       fetchData()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to update network')
+    } catch (err) {
+      setError(actionFailureMessage(err, 'The network could not be updated.'))
     } finally {
       setSubmitting(false)
     }
@@ -977,29 +1052,29 @@ export default function RangeDetail() {
         // Fire-and-forget: progress shows inline via WebSocket events
         vmsApi.provision(newVm.id).then(() => {
           fetchData()
-        }).catch((provisionErr: any) => {
-          toast.error(provisionErr.response?.data?.detail || `Failed to provision ${vmData.hostname}`)
+        }).catch((provisionErr: unknown) => {
+          toast.error(actionFailureMessage(provisionErr, `${vmData.hostname} could not be provisioned.`))
           fetchData()
         })
       }
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to create VM')
+    } catch (err) {
+      setError(actionFailureMessage(err, 'The VM could not be created.'))
     } finally {
       setSubmitting(false)
     }
   }
 
   const handleVmAction = async (vm: VM, action: 'start' | 'stop' | 'restart') => {
+    const actionLabel = action === 'start' ? 'started' : action === 'stop' ? 'stopped' : 'restarted'
     setVmActionLoading(vm.id)
     try {
       if (action === 'start') await vmsApi.start(vm.id)
       else if (action === 'stop') await vmsApi.stop(vm.id)
       else if (action === 'restart') await vmsApi.restart(vm.id)
-      const actionLabel = action === 'start' ? 'started' : action === 'stop' ? 'stopped' : 'restarted'
       toast.success(`VM ${vm.hostname} ${actionLabel}`)
       fetchData()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || `Failed to ${action} VM`)
+    } catch (err) {
+      toast.error(actionFailureMessage(err, `${vm.hostname} could not be ${actionLabel}.`))
     } finally {
       setVmActionLoading(null)
     }
@@ -1017,9 +1092,9 @@ export default function RangeDetail() {
       await vmsApi.delete(vm.id)
       setDeleteConfirm({ type: null, item: null, isLoading: false })
       fetchData()
-    } catch (err: any) {
+    } catch (err) {
       setDeleteConfirm({ type: null, item: null, isLoading: false })
-      toast.error(err.response?.data?.detail || 'Failed to delete VM')
+      toast.error(actionFailureMessage(err, 'The VM could not be deleted.'))
     }
   }
 
@@ -1034,12 +1109,74 @@ export default function RangeDetail() {
   if (!range) {
     return (
       <div className="text-center py-12">
-        <h3 className="text-lg font-medium text-gray-900">Range not found</h3>
-        <Link to="/ranges" className="mt-4 text-primary-600 hover:text-primary-700">
-          Back to ranges
-        </Link>
+        <h3 className="text-lg font-medium text-gray-900">
+          {loadError ? 'This range could not be opened' : 'Range not found'}
+        </h3>
+        {loadError && (
+          <p className="mx-auto mt-2 max-w-xl text-sm text-red-700">{loadError}</p>
+        )}
+        <div className="mt-4 flex items-center justify-center gap-4">
+          {loadError && (
+            <button
+              onClick={() => { setLoading(true); void fetchData() }}
+              className="inline-flex items-center px-3 py-1.5 border border-gray-300 rounded-md text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+            >
+              <RefreshCw className="h-4 w-4 mr-2" aria-hidden="true" />
+              Try again
+            </button>
+          )}
+          <Link to="/ranges" className="text-primary-600 hover:text-primary-700">
+            Back to ranges
+          </Link>
+        </div>
       </div>
     )
+  }
+
+  // Against the status, not on its own: the stored reason outlives the failure on the Docker
+  // path -- tearing a failed range down leaves it on a Draft row -- and a red paragraph under a
+  // green badge contradicts the badge with no way to tell which of the two is stale.
+  const rangeFailureReason = failureReasonForStatus(range.status, range.error_message)
+
+  /**
+   * The tabs this range actually has. Built as a list rather than written out one by one because
+   * the tab pattern needs to count them and index into them: Left and Right move by position, and
+   * the position of Activity depends on whether this install offers Diagnostics at all.
+   */
+  const rangeTabs: { id: RangeTabId; label: string; icon?: LucideIcon; badge?: number }[] = [
+    // Nothing on this tab is built by hand where a range is not composed from rows; what is left
+    // there is the cluster's view of the blueprint's workloads.
+    { id: 'builder', label: showComposition ? 'Builder' : 'Workloads' },
+    { id: 'training', label: 'Training', icon: BookOpen },
+    // Diagnostics reports on the DinD container behind a range and on the cluster namespace
+    // beside it. An install with neither has nothing to put on the tab.
+    ...(showDiagnostics
+      ? [{ id: 'diagnostics' as const, label: 'Diagnostics', icon: Wrench, badge: errorCount }]
+      : []),
+    { id: 'activity', label: 'Activity', icon: Activity },
+  ]
+
+  // Which tab the bar draws as selected. Capabilities arrive after the first paint, so the tab a
+  // user chose can turn out not to exist on this install; the effect above puts `activeTab` back
+  // to Builder and this covers the render before it runs. It matters more than it looks: a roving
+  // tabindex gives exactly one tab a tabIndex of 0, so a bar with nothing selected is a bar the
+  // Tab key steps straight over.
+  const selectedTabId = rangeTabs.some((tab) => tab.id === activeTab) ? activeTab : 'builder'
+
+  // Selection follows focus, which is the tab pattern's default and matches what a mouse user
+  // gets from clicking along the bar. Only the keys the bar owns are swallowed; everything else,
+  // Tab included, has to keep working or the bar becomes a trap.
+  const handleTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const target = nextTabIndex(
+      event.key,
+      rangeTabs.findIndex((tab) => tab.id === selectedTabId),
+      rangeTabs.length
+    )
+    if (target === null) return
+    event.preventDefault()
+    const next = rangeTabs[target].id
+    setActiveTab(next)
+    tabRefs.current[next]?.focus()
   }
 
   return (
@@ -1063,7 +1200,7 @@ export default function RangeDetail() {
               </button>
               <span className={clsx(
                 "ml-2 px-2.5 py-0.5 text-sm font-medium rounded-full",
-                statusColors[range.status.toLowerCase()]
+                statusColors[range.status.toLowerCase()] ?? UNKNOWN_STATUS_COLOR
               )}>
                 {range.status.toLowerCase()}
               </span>
@@ -1084,6 +1221,16 @@ export default function RangeDetail() {
               )}
             </div>
             <p className="mt-1 text-sm text-gray-500">{range.description || 'No description'}</p>
+            {/* Why the range is in the state it is in. The status badge said "error" and the
+                reason sat in the same payload unread, so the person who pressed Deploy had a red
+                pill and no next step -- on the Kubernetes path this names the step that failed
+                and says whether anything is still on the cluster. Cleared by the backend on the
+                next successful transition, so it is never stale. */}
+            {rangeFailureReason && (
+              <p className="mt-2 max-w-3xl text-sm text-red-700 whitespace-pre-line">
+                {rangeFailureReason}
+              </p>
+            )}
             {/* Lifecycle timestamps */}
             <div className="mt-1 text-sm text-gray-500 flex items-center gap-2">
               <RelativeTime date={range.created_at} prefix="Created " />
@@ -1158,13 +1305,17 @@ export default function RangeDetail() {
                   <BookOpen className="w-4 h-4" />
                   Open Lab
                 </a>
-                <button
-                  onClick={() => setShowScenarioPicker(true)}
-                  className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
-                >
-                  <Play className="h-4 w-4 mr-1" />
-                  Add Scenario
-                </button>
+                {/* A scenario is applied by mapping its roles onto the range's VM rows, so it
+                    has nothing to map on the Kubernetes substrate. */}
+                {showComposition && (
+                  <button
+                    onClick={() => setShowScenarioPicker(true)}
+                    className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+                  >
+                    <Play className="h-4 w-4 mr-1" />
+                    Add Scenario
+                  </button>
+                )}
                 <button
                   onClick={handleStop}
                   disabled={stoppingRange}
@@ -1189,17 +1340,32 @@ export default function RangeDetail() {
                 )}
               </>
             )}
-            {/* Save as Blueprint button - use Blueprint Export for sharing (Issue #131) */}
+            {/* Who can see this range. A range is private unless its owner
+                says otherwise, so this is where that decision is made. */}
             <button
-              onClick={() => setShowSaveBlueprintModal(true)}
+              onClick={() => setShowVisibilityModal(true)}
               className="inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
-              title="Save as reusable blueprint for deploying multiple instances"
+              title="Choose who can see this range"
             >
-              <LayoutTemplate className="h-4 w-4 mr-2" />
-              Save as Blueprint
+              <Users className="h-4 w-4 mr-1" />
+              Sharing
             </button>
-            {/* Update Blueprint button - only shown for ranges created from blueprints */}
-            {range.blueprint_instance && (
+            {/* Both of these read a blueprint back out of the range's Network and VM rows. A
+                Kubernetes range has none, so saving produces an empty blueprint and updating
+                overwrites a working one with an empty one and reports a new version -- the
+                range's own blueprint is the only copy of what it is made of. Era A only until
+                there is an extractor that can describe a Kubernetes range. */}
+            {showComposition && (
+              <button
+                onClick={() => setShowSaveBlueprintModal(true)}
+                className="inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
+                title="Save as reusable blueprint for deploying multiple instances"
+              >
+                <LayoutTemplate className="h-4 w-4 mr-2" />
+                Save as Blueprint
+              </button>
+            )}
+            {showComposition && range.blueprint_instance && (
               <button
                 onClick={() => setShowUpdateBlueprintModal(true)}
                 className="inline-flex items-center px-3 py-1.5 border border-gray-300 rounded-md text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"
@@ -1232,67 +1398,58 @@ export default function RangeDetail() {
         </div>
       )}
 
-      {/* Tab Navigation */}
+      {/* Tab Navigation. A row of buttons in a div is what this was, and a screen reader read it
+          as four unrelated buttons over a region that changed for no stated reason. */}
       <div className="mb-6 border-b border-gray-200">
-        <nav className="-mb-px flex space-x-8">
-          <button
-            onClick={() => setActiveTab('builder')}
-            className={clsx(
-              "py-2 px-1 border-b-2 font-medium text-sm",
-              activeTab === 'builder'
-                ? "border-primary-500 text-primary-600"
-                : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-            )}
-          >
-            Builder
-          </button>
-          <button
-            onClick={() => setActiveTab('training')}
-            className={clsx(
-              "py-2 px-1 border-b-2 font-medium text-sm flex items-center gap-2",
-              activeTab === 'training'
-                ? "border-primary-500 text-primary-600"
-                : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-            )}
-          >
-            <BookOpen className="h-4 w-4" />
-            Training
-          </button>
-          <button
-            onClick={() => setActiveTab('diagnostics')}
-            className={clsx(
-              "py-2 px-1 border-b-2 font-medium text-sm flex items-center gap-2",
-              activeTab === 'diagnostics'
-                ? "border-primary-500 text-primary-600"
-                : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-            )}
-          >
-            <Wrench className="h-4 w-4" />
-            Diagnostics
-            {errorCount > 0 && (
-              <span className="px-1.5 py-0.5 text-xs bg-red-100 text-red-700 rounded-full">
-                {errorCount}
-              </span>
-            )}
-          </button>
-          <button
-            onClick={() => setActiveTab('activity')}
-            className={clsx(
-              "py-2 px-1 border-b-2 font-medium text-sm flex items-center gap-2",
-              activeTab === 'activity'
-                ? "border-primary-500 text-primary-600"
-                : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-            )}
-          >
-            <Activity className="h-4 w-4" />
-            Activity
-          </button>
-        </nav>
+        <div role="tablist" aria-label="Range sections" className="-mb-px flex space-x-8">
+          {rangeTabs.map((tab) => {
+            const Icon = tab.icon
+            const selected = selectedTabId === tab.id
+            return (
+              <button
+                key={tab.id}
+                id={tabId(TAB_GROUP, tab.id)}
+                ref={(node) => { tabRefs.current[tab.id] = node }}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                aria-controls={tabPanelId(TAB_GROUP, tab.id)}
+                tabIndex={selected ? 0 : -1}
+                onClick={() => setActiveTab(tab.id)}
+                onKeyDown={handleTabKeyDown}
+                className={clsx(
+                  "py-2 px-1 border-b-2 font-medium text-sm flex items-center gap-2",
+                  selected
+                    ? "border-primary-500 text-primary-600"
+                    : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
+                )}
+              >
+                {Icon && <Icon className="h-4 w-4" aria-hidden="true" />}
+                {tab.label}
+                {tab.badge ? (
+                  <span className="px-1.5 py-0.5 text-xs bg-red-100 text-red-700 rounded-full">
+                    {tab.badge}
+                    <span className="sr-only"> errors</span>
+                  </span>
+                ) : null}
+              </button>
+            )
+          })}
+        </div>
       </div>
 
       {/* Builder Tab Content */}
       {activeTab === 'builder' && (
-        <>
+        <div id={tabPanelId(TAB_GROUP, 'builder')} role="tabpanel" aria-labelledby={tabId(TAB_GROUP, 'builder')}>
+        {/* Workloads -- only rendered for a range on the Kubernetes substrate (PG-61) */}
+        {range && <KubernetesWorkloads rangeId={range.id} rangeStatus={range.status} />}
+        {/* Networks and Virtual Machines are the Docker path's model of a range: rows a user
+            composes by hand. A Kubernetes range has neither -- its machines and networks come
+            from the blueprint and live in the cluster -- so these sections rendered "No networks
+            configured" and "Add a network before creating VMs" about a range that had two
+            networks and a running machine. The Workloads panel above is that range's truth. */}
+        {showComposition && (
+          <>
         {/* Networks Section */}
       <div className="bg-white shadow rounded-lg mb-6">
         <div className="px-4 py-5 sm:px-6 flex items-center justify-between border-b">
@@ -1447,7 +1604,7 @@ export default function RangeDetail() {
                           <p className="text-sm font-medium text-gray-900">{vm.hostname}</p>
                           <span className={clsx(
                             "ml-2 px-1.5 py-0.5 text-xs font-medium rounded transition-all",
-                            statusColors[vm.status.toLowerCase()],
+                            statusColors[vm.status.toLowerCase()] ?? UNKNOWN_STATUS_COLOR,
                             recentlyChangedVms.has(vm.id) && "animate-pulse-once ring-2 ring-blue-400"
                           )}>
                             {vm.status === 'creating' ? (
@@ -1591,12 +1748,19 @@ export default function RangeDetail() {
           )}
         </div>
       </div>
-        </>
+          </>
+        )}
+        </div>
       )}
 
       {/* Training Tab Content */}
       {activeTab === 'training' && (
-        <div className="bg-white shadow rounded-lg">
+        <div
+          id={tabPanelId(TAB_GROUP, 'training')}
+          role="tabpanel"
+          aria-labelledby={tabId(TAB_GROUP, 'training')}
+          className="bg-white shadow rounded-lg"
+        >
           <TrainingTab
             rangeId={range.id}
             studentGuideId={range.student_guide_id || null}
@@ -1607,17 +1771,28 @@ export default function RangeDetail() {
       )}
 
       {/* Diagnostics Tab Content */}
-      {activeTab === 'diagnostics' && (
-        <DiagnosticsTab
-          range={range}
-          networks={networks}
-          vms={vms}
-        />
+      {activeTab === 'diagnostics' && showDiagnostics && (
+        <div
+          id={tabPanelId(TAB_GROUP, 'diagnostics')}
+          role="tabpanel"
+          aria-labelledby={tabId(TAB_GROUP, 'diagnostics')}
+        >
+          <DiagnosticsTab
+            range={range}
+            networks={networks}
+            vms={vms}
+          />
+        </div>
       )}
 
       {/* Activity Tab Content */}
       {activeTab === 'activity' && (
-        <div className="bg-white shadow rounded-lg">
+        <div
+          id={tabPanelId(TAB_GROUP, 'activity')}
+          role="tabpanel"
+          aria-labelledby={tabId(TAB_GROUP, 'activity')}
+          className="bg-white shadow rounded-lg"
+        >
           <ActivityTab rangeId={range.id} />
         </div>
       )}
@@ -2813,6 +2988,15 @@ export default function RangeDetail() {
       )}
 
       {/* Save Blueprint Modal */}
+      {showVisibilityModal && range && (
+        <RangeVisibilityModal
+          isOpen={showVisibilityModal}
+          onClose={() => setShowVisibilityModal(false)}
+          rangeId={range.id}
+          rangeName={range.name}
+        />
+      )}
+
       {showSaveBlueprintModal && range && (
         <SaveBlueprintModal
           rangeId={range.id}

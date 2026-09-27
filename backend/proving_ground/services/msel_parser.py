@@ -14,6 +14,16 @@ class MSELParser:
     )
     RUN_COMMAND_PATTERN = re.compile(r"-\s+Run command on\s+(\S+):\s+(.+)$", re.MULTILINE)
 
+    # An inject's prose runs from its heading to wherever its actions begin. Authors write that
+    # boundary as "**Actions:**" or plainly as "Actions:", and some write no heading at all and go
+    # straight to the bullets. Only the bold form was recognised, and a section written either of
+    # the other two ways lost its whole description -- the timeline then showed a titled inject
+    # with nothing under it and no sign that anything had been dropped.
+    ACTIONS_HEADING_PATTERN = re.compile(r"^\**Actions:?\**\s*$", re.MULTILINE | re.IGNORECASE)
+    ACTION_BULLET_PATTERN = re.compile(
+        r"^\s*-\s+(?:Place file|Run command)\b", re.MULTILINE | re.IGNORECASE
+    )
+
     def parse(self, content: str) -> List[Dict[str, Any]]:
         """Parse MSEL markdown content into a list of inject definitions."""
         injects = []
@@ -54,12 +64,7 @@ class MSELParser:
         minutes = int(time_match.group(2))
         title = time_match.group(3).strip()
 
-        # Extract description (text between title and Actions)
-        desc_start = section.find("\n", time_match.end())
-        desc_end = section.find("**Actions:**")
-        description = ""
-        if desc_end > desc_start:
-            description = section[desc_start:desc_end].strip()
+        description = self._extract_description(section, time_match.end())
 
         # Parse actions
         actions = []
@@ -92,10 +97,26 @@ class MSELParser:
             "actions": actions,
         }
 
-    def parse_walkthrough(self, content: str) -> Optional[dict]:
-        """Extract walkthrough section from MSEL content.
+    def _extract_description(self, section: str, body_start: int) -> str:
+        """Return the prose between an inject's heading and its first action."""
+        heading = self.ACTIONS_HEADING_PATTERN.search(section, body_start)
+        if heading:
+            return section[body_start : heading.start()].strip()
 
-        Supports both pure YAML format and Markdown with YAML front matter.
+        bullet = self.ACTION_BULLET_PATTERN.search(section, body_start)
+        if bullet:
+            return section[body_start : bullet.start()].strip()
+
+        return section[body_start:].strip()
+
+    def parse_walkthrough(self, content: str) -> Optional[dict]:
+        """Extract the learner's guide from an MSEL document.
+
+        An MSEL may carry the guide its learners read, as a top-level ``walkthrough`` key in a
+        pure-YAML document or in a Markdown document's YAML front matter. The lab shows it when
+        the range has no Student Guide linked from the Content Library, so this is one of the two
+        places a guide can be written -- not a second, separate mechanism, and not dead weight.
+        Removing it silently discards guides that authors have already written inside their MSELs.
         """
         # Try to parse as YAML first
         try:

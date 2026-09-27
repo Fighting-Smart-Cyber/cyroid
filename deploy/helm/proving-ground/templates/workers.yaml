@@ -1,0 +1,89 @@
+{{- /* Two workers, as in Compose: `default` for everything, `deploys pool` for range deploys. */ -}}
+{{- range $w := list
+  (dict "name" "pg-worker" "component" "worker" "queues" "default" "cfg" .Values.worker)
+  (dict "name" "pg-worker-deploy" "component" "worker-deploy" "queues" "deploys pool" "cfg" .Values.workerDeploy) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $w.name }}
+  labels:
+    {{- include "pg.labels" $ | nindent 4 }}
+    {{- include "pg.component" $w.component | nindent 4 }}
+spec:
+  replicas: {{ $w.cfg.replicas }}
+  selector:
+    matchLabels:
+      {{- include "pg.component" $w.component | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.component" $w.component | nindent 8 }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secrets.yaml") $ | sha256sum }}
+    spec:
+      serviceAccountName: pg
+      {{- include "pg.imagePullSecrets" $ | nindent 6 }}
+      containers:
+        - name: worker
+          image: {{ include "pg.image" (dict "Values" $.Values "Chart" $.Chart "name" "pg-worker") }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: ["bash", "-c"]
+          args:
+            - >-
+              {{ include "pg.waitForDb" $ }} &&
+              touch /tmp/pg-worker-started &&
+              exec dramatiq proving_ground.tasks --processes {{ $w.cfg.processes }} --threads {{ $w.cfg.threads }} --queues {{ $w.queues }}
+          env:
+            {{- include "pg.appEnv" $ | nindent 12 }}
+          # Ready means this container got past the wait for the database and reached the exec --
+          # written by the shell one command before it, and gone again on a restart because a
+          # restarted container starts from the image. Without it a worker is Ready the instant
+          # the shell starts, so a rolling update retires the running worker while its replacement
+          # is still waiting for Postgres and the deploy queue has no consumer at all.
+          #
+          # Not the /proc check the liveness probe uses: `bash -c` carries the whole script in its
+          # own cmdline, dramatiq's name included, so that check is already true while the wait
+          # loop is still spinning. It stays on liveness, where being generous is right -- a
+          # precise one would restart a worker every 60s for as long as the database was down.
+          #
+          # This needs /tmp writable, which it is in the image. Giving the container
+          # readOnlyRootFilesystem later means mounting an emptyDir at /tmp in the same change, or
+          # no worker ever reports Ready and every rollout times out.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/pg-worker-started"]
+            periodSeconds: 5
+          # python:3.11-slim has no pgrep; this is the Compose stack's healthcheck.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os; exit(0 if any('dramatiq' in open(f'/proc/{p}/cmdline').read() for p in os.listdir('/proc') if p.isdigit()) else 1)"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            {{- toYaml $w.cfg.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "pg.appVolumeMounts" $ | nindent 12 }}
+      volumes:
+        {{- include "pg.appVolumes" $ | nindent 8 }}
+{{- if and $.Values.podDisruptionBudget.enabled (gt (int $w.cfg.replicas) 1) }}
+---
+# Only at two replicas or more: over a single-replica worker this would refuse every eviction and
+# block the node drain outright rather than sequencing it.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $w.name }}
+  labels:
+    {{- include "pg.labels" $ | nindent 4 }}
+    {{- include "pg.component" $w.component | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "pg.component" $w.component | nindent 6 }}
+{{- end }}
+{{- end }}

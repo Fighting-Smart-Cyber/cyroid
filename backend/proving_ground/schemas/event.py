@@ -1,24 +1,58 @@
 # backend/proving_ground/schemas/event.py
 """Pydantic schemas for Training Events API."""
 from datetime import datetime
+from enum import StrEnum
 from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from proving_ground.capability import Delivery
 from proving_ground.models.event import EventStatus
 
 
 # ============ Event Participant Schemas ============
 
 
+class ParticipantRole(StrEnum):
+    """What a person does in one event -- a different vocabulary from the platform roles.
+
+    `TrainingEvent.allowed_roles` holds *platform* roles (student, engineer, evaluator, admin):
+    what a user is on this install, and therefore whether they may see the event at all. This is
+    what they are *in* the event, and the two sets do not match. Rendering both as "roles" in the
+    same form is what made an instructor's choice here look arbitrary.
+
+    Each of these four changes something, which is why the set is these four and no more:
+
+        student     one lab of their own, and the student briefing
+        instructor  no lab; the whole briefing, instructor notes included
+        evaluator   no lab; the briefing except the instructor notes
+        observer    no lab; only the student guide and reference material
+
+    Enumerated rather than left a free string because the column is one: `role` reached the
+    database unvalidated, and the briefing reads it back to decide what a person may see. Anyone
+    who could open an event could self-register into it as an instructor and be served the
+    instructor notes -- `join_event` guards that separately now, and this stops the vocabulary
+    itself from being an input.
+    """
+
+    STUDENT = "student"
+    INSTRUCTOR = "instructor"
+    EVALUATOR = "evaluator"
+    OBSERVER = "observer"
+
+
 class EventParticipantBase(BaseModel):
     user_id: UUID
-    role: str = "student"
+    # Deliberately a plain string on the way *out*. The column predates the enum above, so an
+    # install may hold a role no longer offered; validating responses would turn one such row
+    # into a 500 for the whole participant list rather than a label nobody picks any more.
+    role: str = ParticipantRole.STUDENT.value
 
 
-class EventParticipantCreate(EventParticipantBase):
-    pass
+class EventParticipantCreate(BaseModel):
+    user_id: UUID
+    role: ParticipantRole = ParticipantRole.STUDENT
 
 
 class EventParticipantResponse(EventParticipantBase):
@@ -89,6 +123,17 @@ class EventResponse(EventBase):
     participant_count: int = 0
     blueprint_name: Optional[str] = None
     created_by_username: Optional[str] = None
+
+    # How this cohort is being delivered. Derived, not stored: a team exercise is exactly an
+    # event that owns a range nobody is assigned to, which is the same predicate the placement
+    # policy reads to resolve that range to a vcluster. Deriving it from the range rather than
+    # from a column of its own is what keeps the API's answer and the substrate's behaviour from
+    # being able to disagree. Self-paced until such a range exists, because that is what the
+    # start control does by default.
+    delivery: Delivery = Delivery.SELF_PACED
+    team_range_id: Optional[UUID] = None
+    team_range_status: Optional[str] = None
+    team_range_name: Optional[str] = None
 
     class Config:
         from_attributes = True

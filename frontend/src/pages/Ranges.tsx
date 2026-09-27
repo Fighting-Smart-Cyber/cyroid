@@ -3,11 +3,15 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { rangesApi, RangeCreate } from '../services/api'
 import type { Range } from '../types'
-import { Plus, Loader2, Network, X, Play, Square, Trash2, Wand2 } from 'lucide-react'
+import { Plus, Loader2, Network, X, Play, Square, Trash2, Wand2, LayoutTemplate, AlertTriangle, RefreshCw } from 'lucide-react'
 import clsx from 'clsx'
 // ImportRangeWizard removed - use Blueprint Import instead (Issue #131)
 import { ConfirmDialog } from '../components/common/ConfirmDialog'
 import { toast } from '../stores/toastStore'
+import { useCapabilitiesStore, useFeature } from '../stores/capabilitiesStore'
+import { apiErrorDetail } from '../lib/apiError'
+import { failureReasonForStatus } from '../lib/failureText'
+import { machineNoun, pluralise } from '../lib/blueprints'
 
 const statusColors: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-800',
@@ -18,6 +22,40 @@ const statusColors: Record<string, string> = {
   error: 'bg-red-100 text-red-800'
 }
 
+// A status the backend has and this table does not would otherwise reach clsx as undefined and
+// paint an unstyled badge -- grey-on-white text with no pill, which reads as a render that broke
+// rather than as a state nobody has taught the page about yet.
+const UNKNOWN_STATUS_COLOR = 'bg-gray-100 text-gray-800'
+
+/**
+ * Why a range is in the state it is in, when it recorded one.
+ *
+ * The status badge alone says a range failed and not one word about why, although the reason
+ * travelled in the same payload: a user reading "error" had to open the range, and on the
+ * Kubernetes path the reason names the step that failed and whether anything is still in the
+ * cluster. Clamped to two lines because a recorded reason can run to a thousand characters and
+ * this is one row of a list; the whole of it is in the title attribute and on the range's page.
+ *
+ * Shown only against a status the reason still belongs to: the stored field outlives the failure
+ * on the Docker path, so a reason printed under whatever badge the row carries turns up on draft
+ * and running ranges that are fine.
+ */
+function FailureReason({
+  status,
+  message,
+}: {
+  status: string | null | undefined
+  message: string | null | undefined
+}) {
+  const reason = failureReasonForStatus(status, message)
+  if (!reason) return null
+  return (
+    <p className="mt-1 text-sm text-red-600 line-clamp-2" title={reason}>
+      {reason}
+    </p>
+  )
+}
+
 export default function Ranges() {
   const [ranges, setRanges] = useState<Range[]>([])
   const [loading, setLoading] = useState(true)
@@ -25,20 +63,39 @@ export default function Ranges() {
   const [formData, setFormData] = useState<RangeCreate>({ name: '', description: '' })
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [deleteConfirm, setDeleteConfirm] = useState<{
     range: Range | null
     isLoading: boolean
   }>({ range: null, isLoading: false })
 
+  // Assembling a range here from Network and VM rows is an Era A idea. On Kubernetes the range is
+  // whatever its blueprint declares, so both entry points below would create something that
+  // cannot be deployed -- and, before the wizard learned to clean up after itself, could not be
+  // got rid of either.
+  const canComposeRange = useFeature('range_composition')
+  const substrateLabel = useCapabilitiesStore((state) => state.substrateLabel)
+
   const fetchRanges = async () => {
     try {
       const response = await rangesApi.list()
       setRanges(response.data)
+      setLoadError(null)
     } catch (err) {
       console.error('Failed to fetch ranges:', err)
+      // A listing that failed must not fall through to the empty state. "No ranges" and its
+      // invitation to create one is a claim about the install, and after a failed request it is
+      // a claim this page cannot make -- an operator whose token had expired was told their
+      // ranges were gone.
+      setLoadError(apiErrorDetail(err, 'The range list could not be loaded.'))
     } finally {
       setLoading(false)
     }
+  }
+
+  const retryFetchRanges = () => {
+    setLoading(true)
+    void fetchRanges()
   }
 
   useEffect(() => {
@@ -55,8 +112,8 @@ export default function Ranges() {
       setShowModal(false)
       setFormData({ name: '', description: '' })
       fetchRanges()
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to create range')
+    } catch (err) {
+      setError(apiErrorDetail(err, 'The range could not be created. Check the name and try again.'))
     } finally {
       setSubmitting(false)
     }
@@ -68,8 +125,8 @@ export default function Ranges() {
       await rangesApi.start(range.id)
       toast.success(`Range "${range.name}" started`)
       fetchRanges()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to start range')
+    } catch (err) {
+      toast.error(apiErrorDetail(err, `"${range.name}" could not be started.`))
     }
   }
 
@@ -79,8 +136,8 @@ export default function Ranges() {
       await rangesApi.stop(range.id)
       toast.success(`Range "${range.name}" stopped`)
       fetchRanges()
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to stop range')
+    } catch (err) {
+      toast.error(apiErrorDetail(err, `"${range.name}" could not be stopped.`))
     }
   }
 
@@ -90,14 +147,15 @@ export default function Ranges() {
 
   const confirmDelete = async () => {
     if (!deleteConfirm.range) return
+    const name = deleteConfirm.range.name
     setDeleteConfirm(prev => ({ ...prev, isLoading: true }))
     try {
       await rangesApi.delete(deleteConfirm.range.id)
       setDeleteConfirm({ range: null, isLoading: false })
       fetchRanges()
-    } catch (err: any) {
+    } catch (err) {
       setDeleteConfirm({ range: null, isLoading: false })
-      toast.error(err.response?.data?.detail || 'Failed to delete range')
+      toast.error(apiErrorDetail(err, `"${name}" could not be deleted.`))
     }
   }
 
@@ -118,33 +176,8 @@ export default function Ranges() {
             Create and manage your cyber training environments
           </p>
         </div>
-        <div className="mt-4 sm:mt-0 flex space-x-3">
-          <Link
-            to="/ranges/new"
-            className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-          >
-            <Wand2 className="h-4 w-4 mr-2" />
-            Range Wizard
-          </Link>
-          {/* Import Range button removed - use Blueprint Import instead (Issue #131) */}
-          <button
-            onClick={() => setShowModal(true)}
-            className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
-          >
-            <Plus className="h-4 w-4 mr-2" />
-            New Range
-          </button>
-        </div>
-      </div>
-
-      {ranges.length === 0 ? (
-        <div className="mt-8 text-center">
-          <Network className="mx-auto h-12 w-12 text-gray-400" />
-          <h3 className="mt-2 text-sm font-medium text-gray-900">No ranges</h3>
-          <p className="mt-1 text-sm text-gray-500">
-            Get started quickly with a preset scenario or create a custom range from scratch.
-          </p>
-          <div className="mt-6 flex flex-col sm:flex-row items-center justify-center gap-3">
+        {canComposeRange ? (
+          <div className="mt-4 sm:mt-0 flex space-x-3">
             <Link
               to="/ranges/new"
               className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
@@ -152,14 +185,88 @@ export default function Ranges() {
               <Wand2 className="h-4 w-4 mr-2" />
               Range Wizard
             </Link>
+            {/* Import Range button removed - use Blueprint Import instead (Issue #131) */}
             <button
               onClick={() => setShowModal(true)}
-              className="inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+              className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
             >
               <Plus className="h-4 w-4 mr-2" />
-              Empty Range
+              New Range
             </button>
           </div>
+        ) : (
+          <div className="mt-4 sm:mt-0 flex space-x-3">
+            <Link
+              to="/blueprints"
+              className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+            >
+              <LayoutTemplate className="h-4 w-4 mr-2" />
+              Deploy a Blueprint
+            </Link>
+          </div>
+        )}
+      </div>
+
+      {loadError ? (
+        <div role="alert" className="mt-8 rounded-md border border-red-200 bg-red-50 p-4">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="h-5 w-5 flex-shrink-0 text-red-400" aria-hidden="true" />
+            <div className="flex-1">
+              <h3 className="text-sm font-medium text-red-800">Your ranges could not be loaded</h3>
+              <p className="mt-1 text-sm text-red-700">{loadError}</p>
+            </div>
+            <button
+              onClick={retryFetchRanges}
+              className="inline-flex flex-shrink-0 items-center px-3 py-1.5 border border-red-300 rounded-md text-sm font-medium text-red-700 bg-white hover:bg-red-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500"
+            >
+              <RefreshCw className="h-4 w-4 mr-2" aria-hidden="true" />
+              Try again
+            </button>
+          </div>
+        </div>
+      ) : ranges.length === 0 ? (
+        <div className="mt-8 text-center">
+          <Network className="mx-auto h-12 w-12 text-gray-400" />
+          <h3 className="mt-2 text-sm font-medium text-gray-900">No ranges</h3>
+          {canComposeRange ? (
+            <>
+              <p className="mt-1 text-sm text-gray-500">
+                Get started quickly with a preset scenario or create a custom range from scratch.
+              </p>
+              <div className="mt-6 flex flex-col sm:flex-row items-center justify-center gap-3">
+                <Link
+                  to="/ranges/new"
+                  className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                >
+                  <Wand2 className="h-4 w-4 mr-2" />
+                  Range Wizard
+                </Link>
+                <button
+                  onClick={() => setShowModal(true)}
+                  className="inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+                >
+                  <Plus className="h-4 w-4 mr-2" />
+                  Empty Range
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="mt-1 text-sm text-gray-500">
+                On {substrateLabel ?? 'this substrate'} a range is deployed from a blueprint, which
+                declares its networks, machines and capabilities together.
+              </p>
+              <div className="mt-6 flex justify-center">
+                <Link
+                  to="/blueprints"
+                  className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+                >
+                  <LayoutTemplate className="h-4 w-4 mr-2" />
+                  Browse Blueprints
+                </Link>
+              </div>
+            </>
+          )}
         </div>
       ) : (
         <div className="mt-8 bg-white shadow overflow-hidden sm:rounded-md">
@@ -185,7 +292,7 @@ export default function Ranges() {
                           <p className="text-sm font-medium text-gray-900 truncate">{range.name}</p>
                           <span className={clsx(
                             "ml-2 px-2 py-0.5 text-xs font-medium rounded-full",
-                            statusColors[range.status.toLowerCase()]
+                            statusColors[range.status.toLowerCase()] ?? UNKNOWN_STATUS_COLOR
                           )}>
                             {range.status}
                           </span>
@@ -193,10 +300,17 @@ export default function Ranges() {
                         <p className="mt-1 text-sm text-gray-500 truncate">
                           {range.description || 'No description'}
                         </p>
+                        <FailureReason status={range.status} message={range.error_message} />
                         <div className="mt-1 flex items-center text-xs text-gray-400">
-                          <span>{range.network_count} networks</span>
+                          <span>{pluralise(range.network_count, 'network')}</span>
                           <span className="mx-2">•</span>
-                          <span>{range.vm_count} VMs</span>
+                          {/* Per range, not per install: a listing can hold both eras at once
+                              while a Docker install is being migrated, and the count comes back
+                              from the row rather than from the install. */}
+                          <span>
+                            {range.vm_count}{' '}
+                            {machineNoun(null, range.substrate === 'kubernetes', range.vm_count)}
+                          </span>
                         </div>
                       </div>
                     </div>

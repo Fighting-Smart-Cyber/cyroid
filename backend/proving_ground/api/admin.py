@@ -27,6 +27,8 @@ from proving_ground.models.vm import VM, VMStatus
 from proving_ground.models.network import Network
 from proving_ground.models.blueprint import RangeInstance
 from proving_ground.services.docker_service import get_docker_service
+from proving_ground.api import kubernetes_ranges, kubernetes_update
+from proving_ground.utils.versions import is_newer, latest_release, parse_version
 from proving_ground.services.dind_service import get_dind_service
 from proving_ground.services import platform_secret_service
 from proving_ground.models.platform_secret import GIT_CREDENTIAL_KEY
@@ -60,6 +62,18 @@ DBSession = Annotated[Session, Depends(get_db)]
 AdminUser = Annotated[User, Depends(require_admin())]
 
 
+class RangeTeardownFailure(BaseModel):
+    """A range the cluster would not fully release, and what it kept.
+
+    Reported rather than counted because the operator has to act on it by hand: the range's row
+    is deliberately left in place, and it is the only thing that still names the namespace.
+    """
+
+    range_id: str
+    range_name: str
+    reason: str
+
+
 class CleanupResult(BaseModel):
     """Result of a cleanup operation."""
 
@@ -71,6 +85,10 @@ class CleanupResult(BaseModel):
     database_records_deleted: int
     errors: List[str]
     orphaned_resources_cleaned: int
+    # Era B. Both stay at their defaults on Docker, where a range is a container and neither
+    # means anything.
+    namespaces_removed: int = 0
+    residue: List[RangeTeardownFailure] = []
 
 
 class CleanupMode(str):
@@ -109,11 +127,22 @@ def cleanup_all_resources(
     if options is None:
         options = CleanupRequest()
 
-    # Handle legacy options
-    if options.delete_database_records:
-        options.mode = CleanupMode.PURGE_RANGES
-    elif options.clean_database:
-        options.mode = CleanupMode.RESET_TO_DRAFT
+    # Handle legacy options. An explicit mode wins: `clean_database` defaults to true, so a
+    # request that named purge_ranges and left the legacy fields alone was turned straight back
+    # into a reset -- which is why Purge All Ranges has been resetting ranges to draft and
+    # reporting them purged.
+    if "mode" not in options.model_fields_set:
+        if options.delete_database_records:
+            options.mode = CleanupMode.PURGE_RANGES
+        elif options.clean_database:
+            options.mode = CleanupMode.RESET_TO_DRAFT
+
+    if kubernetes_ranges.is_kubernetes():
+        logger.info(
+            f"Admin cleanup initiated by user {admin_user.email}, "
+            f"mode={options.mode}, substrate=kubernetes"
+        )
+        return _cleanup_all_on_kubernetes(db, options)
 
     docker = get_docker_service()
     dind = get_dind_service()
@@ -292,6 +321,85 @@ def cleanup_all_resources(
         f"{result.networks_removed} networks"
     )
 
+    return result
+
+
+def _delete_range_rows(db: Session, range_obj: Range) -> int:
+    """Drop a range and everything that references it. Returns how many rows went."""
+    deleted = 0
+    for instance in db.query(RangeInstance).filter(RangeInstance.range_id == range_obj.id).all():
+        db.delete(instance)
+        deleted += 1
+    for vm in range_obj.vms:
+        db.delete(vm)
+        deleted += 1
+    for network in range_obj.networks:
+        db.delete(network)
+        deleted += 1
+    if range_obj.router:
+        db.delete(range_obj.router)
+        deleted += 1
+    db.delete(range_obj)
+    return deleted + 1
+
+
+def _cleanup_all_on_kubernetes(db: Session, options: CleanupRequest) -> CleanupResult:
+    """The same two modes against a cluster, where a range is a namespace.
+
+    The Docker path can afford to shrug off a failed container removal, because the container is
+    named after the range id and a later pass finds it again. A namespace cannot: placement is
+    re-derived from the range row, so dropping a row whose namespace is still up strands the
+    KubeVirt VMs, PVCs, network attachments and Helm releases inside it with nothing left in the
+    product that can name them. A range whose teardown was not proven clean therefore keeps its
+    row and is named in the result instead of being counted as cleaned.
+    """
+    result = CleanupResult(
+        ranges_cleaned=0,
+        dind_containers_removed=0,
+        containers_removed=0,
+        networks_removed=0,
+        database_records_updated=0,
+        database_records_deleted=0,
+        errors=[],
+        orphaned_resources_cleaned=0,
+    )
+
+    for range_obj in db.query(Range).all():
+        reason = kubernetes_ranges.destroy_for_cleanup(db, range_obj)
+        if reason is not None:
+            result.residue.append(
+                RangeTeardownFailure(
+                    range_id=str(range_obj.id), range_name=range_obj.name, reason=reason
+                )
+            )
+            result.errors.append(f"Range '{range_obj.name}' was not torn down: {reason}")
+            continue
+
+        result.namespaces_removed += 1
+        result.ranges_cleaned += 1
+
+        if options.mode == CleanupMode.PURGE_RANGES:
+            result.database_records_deleted += _delete_range_rows(db, range_obj)
+        else:
+            range_obj.status = RangeStatus.DRAFT
+            range_obj.error_message = None
+            range_obj.deployed_at = None
+            range_obj.started_at = None
+            range_obj.stopped_at = None
+            result.database_records_updated += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        error_msg = f"Failed to commit database changes: {e}"
+        logger.error(error_msg)
+        result.errors.append(error_msg)
+        db.rollback()
+
+    logger.info(
+        f"Admin cleanup complete: {result.ranges_cleaned} ranges, "
+        f"{result.namespaces_removed} namespaces, {len(result.residue)} left behind"
+    )
     return result
 
 
@@ -1069,14 +1177,9 @@ def get_infrastructure_metrics(admin_user: AdminUser, db: DBSession):
 
     # MinIO metrics
     try:
-        from minio import Minio
+        from proving_ground.services.object_store import object_client
 
-        minio_client = Minio(
-            settings.minio_endpoint,
-            access_key=settings.minio_access_key,
-            secret_key=settings.minio_secret_key,
-            secure=settings.minio_secure,
-        )
+        minio_client = object_client()
         buckets = list(minio_client.list_buckets())
         storage_metrics.minio_bucket_count = len(buckets)
 
@@ -1367,6 +1470,11 @@ class UpdateCheckResponse(BaseModel):
     current_sha: Optional[str] = None
     current_version: Optional[str] = None
     latest_tag: Optional[str] = None
+    # Which remote state this host follows: "release" (highest semver tag) or
+    # "branch" (tip of the current branch). Surfaced so the UI can say what
+    # "up to date" is measured against -- the same words mean different things
+    # on the two channels.
+    channel: Optional[str] = None
     detail: Optional[str] = None
 
 
@@ -1382,6 +1490,75 @@ _GIT_SETUP = (
     "'!f() { echo username=$GIT_ASKPASS_USER; echo password=$GIT_ASKPASS_TOKEN; }; f'\n"
     "fi\n"
 )
+
+# The exact shape scripts/tag-release.sh produces, and the only thing the CI
+# release rule matches. Used both to pick a target and to re-validate it before
+# it is interpolated into a shell script.
+_RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+
+_LS_REMOTE_TAGS = (
+    "git ls-remote --tags origin 'v*' 2>/dev/null "
+    "| sed -e 's|.*refs/tags/||' -e '/\\^{}$/d' | tr '\\n' ' '"
+)
+
+
+def _resolve_release_target(docker, spec, current_version: str) -> str:
+    """The release tag this host should move to, read from the remote.
+
+    Deliberately not a parameter of the update request. start_platform_update
+    refuses a caller-supplied ref because that would be arbitrary code
+    execution on a host of the caller's choosing; resolving the target here,
+    from the remote's own tag list, keeps that property while still letting the
+    host land on a real release rather than a moving branch tip.
+    """
+    container = None
+    try:
+        container = docker.client.containers.run(
+            UPDATE_IMAGE,
+            command=["sh", "-c", "set -eu\n" + _GIT_SETUP + f'echo "TAGS=$({_LS_REMOTE_TAGS})"\n'],
+            detach=True,
+            labels={CHECK_LABEL: "1"},
+            **spec,
+        )
+        container.wait(timeout=CHECK_TIMEOUT_SECONDS)
+        output = container.logs().decode("utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001 - surfaced to the admin
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not read release tags from the remote: {e}",
+        ) from e
+    finally:
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+
+    tags: List[str] = []
+    for line in output.splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key == "TAGS":
+            tags = value.split()
+
+    target = latest_release(tags)
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This host follows the release channel but the remote has no "
+                "vX.Y.Z tags. Cut a release, or set UPDATE_CHANNEL=branch to "
+                "follow the branch instead."
+            ),
+        )
+    if not is_newer(target, current_version):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Already on the newest release: this host reports "
+                f"{current_version}, the remote's latest tag is {target}."
+            ),
+        )
+    return target
 
 
 def _repo_container_spec(docker, db) -> tuple[dict, str]:
@@ -1498,6 +1675,9 @@ def set_update_credential(body: GitCredentialRequest, admin_user: AdminUser, db:
     Compose also loads .env into every container, so a token there would be
     readable from any service, not only the one that needs it.
     """
+    if kubernetes_update.is_kubernetes():
+        kubernetes_update.refuse_credential_change()
+
     if not body.token.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1520,6 +1700,9 @@ def set_update_credential(body: GitCredentialRequest, admin_user: AdminUser, db:
 @router.get("/infrastructure/update/credential", response_model=GitCredentialStatus)
 def get_update_credential(admin_user: AdminUser, db: DBSession):
     """Whether an update credential is set. Never returns the token itself."""
+    if kubernetes_update.is_kubernetes():
+        return GitCredentialStatus(**kubernetes_update.credential())
+
     value, row = platform_secret_service.get_secret(db, GIT_CREDENTIAL_KEY)
     if row is None:
         return GitCredentialStatus(configured=False)
@@ -1537,6 +1720,9 @@ def get_update_credential(admin_user: AdminUser, db: DBSession):
 @router.delete("/infrastructure/update/credential", status_code=status.HTTP_204_NO_CONTENT)
 def delete_update_credential(admin_user: AdminUser, db: DBSession):
     """Remove the stored update credential. **Requires admin privileges.**"""
+    if kubernetes_update.is_kubernetes():
+        kubernetes_update.refuse_credential_change()
+
     platform_secret_service.delete_secret(db, GIT_CREDENTIAL_KEY)
 
 
@@ -1553,6 +1739,20 @@ def start_platform_update(admin_user: AdminUser, db: DBSession):
     fast-forwards the branch the host is already on; changing branches remains
     a deliberate act at a shell.
     """
+    if kubernetes_update.is_kubernetes():
+        deploying = db.query(Range).filter(Range.status == RangeStatus.DEPLOYING).count()
+        if deploying:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"{deploying} range(s) are deploying; updating now would restart the "
+                    "deploy worker under them."
+                ),
+            )
+        return UpdateStartResponse(
+            **kubernetes_update.start(get_settings().app_version, admin_user.username)
+        )
+
     docker = get_docker_service()
 
     # A deploy in flight would be killed mid-way by the worker restart, leaving
@@ -1595,12 +1795,36 @@ def start_platform_update(admin_user: AdminUser, db: DBSession):
         except Exception:
             pass
 
+    channel = get_settings().update_channel
+    if channel == "release":
+        target = _resolve_release_target(docker, spec, get_settings().app_version)
+        # Belt and braces. `target` came from the remote's own tag list and was
+        # picked by latest_release(), but it is about to be interpolated into a
+        # shell script, so it is re-checked against the literal release shape
+        # here. Nothing that is not vX.Y.Z can reach the shell.
+        if not _RELEASE_TAG_RE.match(target):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Refusing to update to a tag that is not vX.Y.Z: {target!r}",
+            )
+        advance = (
+            f'echo "==> updating to {target}"\n'
+            "git fetch --prune origin\n"
+            # Just this tag. --no-tags keeps the "would clobber existing tag"
+            # failure that broke the check endpoint out of the update path too.
+            f"git fetch origin tag {target} --no-tags\n"
+            f"git merge --ff-only {target}\n"
+        )
+    else:
+        advance = (
+            'branch="$(git rev-parse --abbrev-ref HEAD)"\n'
+            'echo "==> updating $branch"\n'
+            "git fetch --prune origin\n"
+            'git pull --ff-only origin "$branch"\n'
+        )
+
     script = (
-        "set -eu\n" + _GIT_SETUP + 'branch="$(git rev-parse --abbrev-ref HEAD)"\n'
-        'echo "==> updating $branch"\n'
-        "git fetch --prune origin\n"
-        'git pull --ff-only origin "$branch"\n'
-        'echo "    now at $(git rev-parse --short HEAD)"\n'
+        "set -eu\n" + _GIT_SETUP + advance + 'echo "    now at $(git rev-parse --short HEAD)"\n'
         'echo "==> redeploying"\n'
         # scripts/compose.sh is the single definition of the overlay chain.
         # Spelling it out here again is how the two paths drifted before.
@@ -1661,6 +1885,9 @@ def check_for_platform_update(admin_user: AdminUser, db: DBSession):
     not look" and "there is nothing to pull" must not render the same, or the
     update goes quiet exactly when something is wrong.
     """
+    if kubernetes_update.is_kubernetes():
+        return UpdateCheckResponse(**kubernetes_update.check(get_settings().app_version))
+
     docker = get_docker_service()
     current_version = get_settings().app_version
 
@@ -1686,13 +1913,21 @@ def check_for_platform_update(admin_user: AdminUser, db: DBSession):
         # Whether this host is behind is a question about commits. A tag
         # disagreement must not be able to answer it "I do not know".
         "git fetch --prune origin\n"
-        # The latest tag is a nicety on top of the commit count, so fetching
-        # tags is best effort and explicitly never fatal.
-        "git fetch --tags origin >/dev/null 2>&1 || true\n"
+        # Release tags are read with ls-remote, not fetched.
+        #
+        # `git fetch --tags` is what broke this endpoint before: it force-updates
+        # every tag and fails the whole fetch with "would clobber existing tag"
+        # when any local tag disagrees with the remote's, which is the standing
+        # state of this repository. ls-remote asks the remote what tags it has
+        # and writes nothing locally, so no local tag state can break it.
+        #
+        # The ^{} rows are annotated tags dereferenced to their commit; the tag
+        # name is already on the preceding row, so they are dropped.
+        "echo \"TAGS=$(git ls-remote --tags origin 'v*' 2>/dev/null "
+        "| sed -e 's|.*refs/tags/||' -e '/\\^{}$/d' | tr '\\n' ' ')\"\n"
         'echo "BRANCH=$branch"\n'
         'echo "SHA=$(git rev-parse --short HEAD)"\n'
         'echo "BEHIND=$(git rev-list --count HEAD..origin/$branch)"\n'
-        'echo "TAG=$(git describe --tags --abbrev=0 origin/$branch 2>/dev/null || echo none)"\n'
     )
 
     container = None
@@ -1748,15 +1983,38 @@ def check_for_platform_update(admin_user: AdminUser, db: DBSession):
             detail=f"Unexpected output from the check: {output.strip()[-200:]}",
         )
 
-    tag = fields.get("TAG")
+    channel = get_settings().update_channel
+    latest_tag = latest_release(fields.get("TAGS", "").split())
+
+    if channel == "release":
+        available = is_newer(latest_tag, current_version)
+        # "Nothing released yet" and "you have the newest release" both render
+        # as update_available=false, so say which one this is. Otherwise a host
+        # pointed at a remote with no tags reports a reassuring "up to date"
+        # forever.
+        detail = None
+        if latest_tag is None:
+            detail = "No vX.Y.Z release tags on the remote yet."
+        elif parse_version(current_version) is None:
+            detail = (
+                f"This host reports version {current_version!r}, which is not a "
+                f"release. The newest release is {latest_tag}; move it onto a "
+                f"release deliberately rather than through this button."
+            )
+    else:
+        available = behind > 0
+        detail = None
+
     return UpdateCheckResponse(
         checked=True,
-        update_available=behind > 0,
+        channel=channel,
+        update_available=available,
         behind=behind,
         branch=fields.get("BRANCH"),
         current_sha=fields.get("SHA"),
         current_version=current_version,
-        latest_tag=None if tag in (None, "none", "") else tag,
+        latest_tag=latest_tag,
+        detail=detail,
     )
 
 
@@ -1767,6 +2025,9 @@ def get_platform_update_status(admin_user: AdminUser):
     **Requires admin privileges.** Safe to poll across the restart: the update
     container is outside the compose project, so its logs survive it.
     """
+    if kubernetes_update.is_kubernetes():
+        return UpdateStatusResponse(**kubernetes_update.status_of())
+
     docker = get_docker_service()
     job = _find_update_job(docker)
     if job is None:

@@ -16,9 +16,26 @@ import {
 import { ConfirmDialog } from '../components/common/ConfirmDialog';
 import { toast } from '../stores/toastStore';
 import DeployInstanceModal from '../components/blueprints/DeployInstanceModal';
-import { ImportBlueprintModal, VisualBlueprintEditor } from '../components/blueprints';
+import {
+  EditBlueprintModal,
+  ImportBlueprintModal,
+  VisualBlueprintEditor,
+} from '../components/blueprints';
+import { useSubstrate } from '../stores/capabilitiesStore';
+import { apiErrorDetail, machineNoun, pluralise, usesVisualEditor } from '../lib/blueprints';
+
+/**
+ * The list endpoint answers counts, not config, so a card cannot read `schemaVersion` itself. It
+ * carries `schema_version` when the backend reports one; without it the substrate this install
+ * runs on is the best available answer for what to call a machine.
+ */
+function listedSchemaVersion(blueprint: Blueprint): number | null {
+  const declared = (blueprint as Blueprint & { schema_version?: unknown }).schema_version;
+  return typeof declared === 'number' ? declared : null;
+}
 
 export default function Blueprints() {
+  const { substrate, isKubernetes } = useSubstrate();
   const [blueprints, setBlueprints] = useState<Blueprint[]>([]);
   const [loading, setLoading] = useState(true);
   const [deleteConfirm, setDeleteConfirm] = useState<{
@@ -58,9 +75,9 @@ export default function Blueprints() {
       setDeleteConfirm({ blueprint: null, isLoading: false });
       fetchBlueprints();
       toast.success('Blueprint deleted');
-    } catch (err: any) {
+    } catch (err: unknown) {
       setDeleteConfirm({ blueprint: null, isLoading: false });
-      toast.error(err.response?.data?.detail || 'Failed to delete blueprint');
+      toast.error(apiErrorDetail(err, 'Failed to delete blueprint'));
     }
   };
 
@@ -71,8 +88,8 @@ export default function Blueprints() {
       toast.success(`Instance "${response.data.name}" created`);
       setDeployModal(null);
       fetchBlueprints();
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to deploy instance');
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to deploy instance'));
     }
   };
 
@@ -81,8 +98,8 @@ export default function Blueprints() {
     try {
       const response = await blueprintsApi.get(blueprint.id);
       setEditModal(response.data);
-    } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Failed to load blueprint');
+    } catch (err: unknown) {
+      toast.error(apiErrorDetail(err, 'Failed to load blueprint'));
     } finally {
       setLoadingEdit(null);
     }
@@ -120,9 +137,18 @@ export default function Blueprints() {
         <div className="mt-8 text-center">
           <LayoutTemplate className="mx-auto h-12 w-12 text-gray-400" />
           <h3 className="mt-2 text-sm font-medium text-gray-900">No blueprints</h3>
-          <p className="mt-1 text-sm text-gray-500">
-            Create a range first, then save it as a blueprint from the range detail page.
-          </p>
+          {/* Withheld until the substrate is known rather than defaulted: saving a range as a
+              blueprint reads network and VM rows, so on Kubernetes the server refuses it and
+              following this instruction is a dead end. The Kubernetes wording names only routes
+              that exist today -- there is no editor for a new one yet, and pointing at a button
+              that is not on this page would be the same dead end wearing different words. */}
+          {substrate !== null && (
+            <p className="mt-1 text-sm text-gray-500">
+              {isKubernetes
+                ? 'A blueprint for this substrate declares workloads and capabilities rather than networks and VMs, so it cannot be saved from a range. Import one, or post its config to the API; from then on it is edited from its own page.'
+                : 'Create a range first, then save it as a blueprint from the range detail page.'}
+            </p>
+          )}
         </div>
       ) : (
         <div className="mt-8 grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
@@ -158,15 +184,16 @@ export default function Blueprints() {
                 <div className="mt-4 flex items-center text-xs text-gray-500 space-x-4">
                   <span className="flex items-center">
                     <Network className="h-3.5 w-3.5 mr-1" />
-                    {blueprint.network_count} networks
+                    {pluralise(blueprint.network_count, 'network')}
                   </span>
                   <span className="flex items-center">
                     <Server className="h-3.5 w-3.5 mr-1" />
-                    {blueprint.vm_count} VMs
+                    {blueprint.vm_count}{' '}
+                    {machineNoun(listedSchemaVersion(blueprint), isKubernetes, blueprint.vm_count)}
                   </span>
                   <span className="flex items-center">
                     <Users className="h-3.5 w-3.5 mr-1" />
-                    {blueprint.instance_count} instances
+                    {pluralise(blueprint.instance_count, 'instance')}
                   </span>
                 </div>
               </div>
@@ -252,15 +279,25 @@ export default function Blueprints() {
         />
       )}
 
-      {/* Visual Blueprint Editor */}
-      {editModal && (
-        <VisualBlueprintEditor
-          blueprint={editModal}
-          isOpen={true}
-          onClose={() => setEditModal(null)}
-          onSaved={fetchBlueprints}
-        />
-      )}
+      {/* The visual editor speaks networks and VMs, which a v2 blueprint does not have; opening
+          one in it would save back a config stripped of the workloads and capabilities it never
+          read. Those are edited as JSON until a structured editor exists for them. */}
+      {editModal &&
+        (usesVisualEditor(editModal.config) ? (
+          <VisualBlueprintEditor
+            blueprint={editModal}
+            isOpen={true}
+            onClose={() => setEditModal(null)}
+            onSaved={fetchBlueprints}
+          />
+        ) : (
+          <EditBlueprintModal
+            blueprint={editModal}
+            isOpen={true}
+            onClose={() => setEditModal(null)}
+            onSaved={fetchBlueprints}
+          />
+        ))}
     </div>
   );
 }

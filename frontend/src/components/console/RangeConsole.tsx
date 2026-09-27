@@ -1,4 +1,14 @@
 // frontend/src/components/console/RangeConsole.tsx
+/**
+ * A shell inside the Docker host a range runs on, and the diagnostics that only exist there.
+ *
+ * Everything below -- the websocket, the six quick actions, the help -- talks to the range's
+ * DinD container. On the Kubernetes substrate there is no such container: the websocket closes
+ * 4000 and every action answers 400, which the console rendered as a connection timeout and an
+ * error inside the terminal, as though the range were broken rather than the console being the
+ * wrong tool. There it says so instead of connecting -- hiding the button that opens it does not
+ * make this component unreachable.
+ */
 import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -9,10 +19,18 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 import { rangesApi } from '../../services/api'
+import { requestWebSocketTicket } from '../../hooks/useRealtimeRange'
+import { useCapabilitiesStore } from '../../stores/capabilitiesStore'
 
 interface RangeConsoleProps {
   rangeId: string
   rangeName: string
+  /**
+   * The session, kept as a prop so that a sign-out or a token refresh
+   * reconnects the console. It is no longer put in the socket URL: the
+   * handshake carries an HttpOnly ticket cookie instead. See
+   * requestWebSocketTicket.
+   */
   token: string
   onClose?: () => void
 }
@@ -27,6 +45,12 @@ export function RangeConsole({ rangeId, rangeName, token, onClose }: RangeConsol
   const fitAddon = useRef<FitAddon | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Bumped on every effect run AND on every cleanup. Fetching the ticket is
+  // asynchronous, so the terminal this connect was started for can be disposed
+  // while the request is in flight -- a fast unmount, or React 18's double
+  // mount in development. Without the check the connect writes to a destroyed
+  // terminal and leaves a socket nobody will ever close.
+  const generationRef = useRef(0)
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting')
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -34,8 +58,13 @@ export function RangeConsole({ rangeId, rangeName, token, onClose }: RangeConsol
   const [reconnectCount, setReconnectCount] = useState(0)
   const [quickActionLoading, setQuickActionLoading] = useState<string | null>(null)
 
+  // Null until /system/capabilities answers. Connecting on an unknown substrate is what produced
+  // the misleading timeout, so the socket waits for the answer.
+  const features = useCapabilitiesStore((s) => s.features)
+  const isDockerHost = features?.legacy_range_console === true
+
   useEffect(() => {
-    if (!terminalRef.current) return
+    if (!isDockerHost || !terminalRef.current) return
 
     const terminal = new Terminal({
       cursorBlink: true,
@@ -57,7 +86,8 @@ export function RangeConsole({ rangeId, rangeName, token, onClose }: RangeConsol
     terminalInstance.current = terminal
     fitAddon.current = fit
 
-    connectWebSocket(terminal)
+    generationRef.current += 1
+    void connectWebSocket(terminal, generationRef.current)
 
     const handleResize = () => {
       fit.fit()
@@ -65,6 +95,7 @@ export function RangeConsole({ rangeId, rangeName, token, onClose }: RangeConsol
     window.addEventListener('resize', handleResize)
 
     return () => {
+      generationRef.current += 1
       window.removeEventListener('resize', handleResize)
       terminal.dispose()
       if (wsRef.current) {
@@ -74,9 +105,9 @@ export function RangeConsole({ rangeId, rangeName, token, onClose }: RangeConsol
         clearTimeout(timeoutRef.current)
       }
     }
-  }, [rangeId, token, reconnectCount])
+  }, [rangeId, token, reconnectCount, isDockerHost])
 
-  const connectWebSocket = (terminal: Terminal) => {
+  const connectWebSocket = async (terminal: Terminal, generation: number) => {
     setConnectionStatus('connecting')
     setError(null)
 
@@ -90,11 +121,32 @@ export function RangeConsole({ rangeId, rangeName, token, onClose }: RangeConsol
       }
     }, CONNECTION_TIMEOUT_MS)
 
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${wsProtocol}//${window.location.host}/api/v1/ws/range-console/${rangeId}?token=${token}`
-
     terminal.writeln('\x1b[90mConnecting to range console...\x1b[0m')
     terminal.writeln('\x1b[90mRange: ' + rangeName + '\x1b[0m')
+
+    // The session is not put in the socket URL. This trades it for an HttpOnly
+    // cookie scoped to this one range console's path, which the handshake
+    // sends by itself -- see requestWebSocketTicket.
+    try {
+      await requestWebSocketTicket('range-console', rangeId)
+    } catch {
+      if (generationRef.current !== generation) return
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current)
+      }
+      setConnectionStatus('error')
+      setError('Range console ticket refused')
+      terminal.writeln('\r\n\x1b[31mRange console ticket refused\x1b[0m')
+      terminal.writeln('\x1b[33mThis console is administrator-only, and the session may have expired.\x1b[0m')
+      terminal.writeln('\x1b[33mSign in again, then use Reconnect.\x1b[0m')
+      return
+    }
+
+    // The terminal was disposed while the ticket was in flight.
+    if (generationRef.current !== generation) return
+
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsUrl = `${wsProtocol}//${window.location.host}/api/v1/ws/range-console/${rangeId}`
 
     const ws = new WebSocket(wsUrl)
 
@@ -243,6 +295,39 @@ export function RangeConsole({ rangeId, rangeName, token, onClose }: RangeConsol
       case 'disconnected': return 'Disconnected'
       case 'error': return 'Error'
     }
+  }
+
+  if (!isDockerHost) {
+    return (
+      <div className="flex flex-col items-start gap-2 h-full bg-gray-900 rounded-lg p-6 text-sm">
+        <div className="flex items-center gap-2 text-gray-200">
+          <AlertTriangle className="w-4 h-4 text-yellow-500" />
+          <span className="font-medium">
+            {features ? 'There is no range console on this install' : 'Checking this install...'}
+          </span>
+        </div>
+        {features && (
+          <>
+            <p className="text-gray-400">
+              A range here is placed in a namespace on the cluster. There is no host underneath it
+              to open a shell on, so this console has nothing to connect to.
+            </p>
+            <p className="text-gray-400">
+              Open a machine&apos;s console for a session on that machine, and Diagnostics for what
+              the range consists of on the cluster.
+            </p>
+          </>
+        )}
+        {onClose && (
+          <button
+            onClick={onClose}
+            className="mt-2 px-3 py-1.5 text-xs text-gray-200 bg-gray-700 hover:bg-gray-600 rounded"
+          >
+            Close
+          </button>
+        )}
+      </div>
+    )
   }
 
   return (

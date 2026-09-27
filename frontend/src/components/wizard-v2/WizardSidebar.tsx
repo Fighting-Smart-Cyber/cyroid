@@ -3,12 +3,17 @@ import { CheckCircle, Circle } from 'lucide-react';
 import clsx from 'clsx';
 import { useWizardStore } from '../../stores/wizardStore';
 
+// The nav is read before the click, so it has to promise what the step delivers. Steps 3 and 4
+// used to collect team head counts, access rules, vulnerability profiles and an attack narrative,
+// none of which the deploy call has ever sent anywhere; their controls are gone and what is left
+// summarises what the deploy really does. "Configure user groups" and "Set attack surface" were
+// the last places still offering the features that were removed for not existing.
 const STEPS = [
   { id: 0, title: 'Environment', description: 'Select environment type' },
   { id: 1, title: 'Services', description: 'Choose systems & services' },
   { id: 2, title: 'Networks', description: 'Design network topology' },
-  { id: 3, title: 'Users', description: 'Configure user groups' },
-  { id: 4, title: 'Vulnerabilities', description: 'Set attack surface' },
+  { id: 3, title: 'Logins', description: 'Review the accounts on each machine' },
+  { id: 4, title: 'Attack Surface', description: 'Review what this range exposes' },
   { id: 5, title: 'Review', description: 'Review & deploy' },
 ];
 

@@ -5,10 +5,22 @@ Blueprint export/import service.
 Exports blueprints as portable packages that can be imported into separate PROVING GROUND instances,
 including all dependencies needed for successful deployment.
 
+A blueprint describes a range in one of two eras, and this service handles both. The package
+carries the stored config document as written -- see `BlueprintExportData.config` -- so a
+Kubernetes blueprint's workloads, capability packages and their scopes leave the install intact
+instead of being validated away by an Era A model that has no field for them.
+
+Everything Docker-shaped here is Era A: Dockerfile projects under /data/images and image tarballs
+saved from a daemon. A Kubernetes install has neither, so those steps are skipped rather than
+attempted, and an import that would have built an image says so instead of failing on a socket
+that is not there.
+
 Version History:
 - 1.0: Original export format with templates
 - 2.0: Image Library IDs (templates deprecated)
 - 3.0: Includes Dockerfiles and Content Library items
+- 4.0: Unified Range Blueprints: MSEL and artifact options
+- 5.0: Era B (Kubernetes) blueprints
 """
 import asyncio
 import hashlib
@@ -24,10 +36,16 @@ from typing import Optional, Dict, List, Tuple, Set, Any, Callable
 from uuid import UUID
 
 import docker
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from .registry_service import get_registry_service, RegistryPushError
 
+from proving_ground.capability.blueprint import (
+    SCHEMA_VERSION_K8S,
+    SCHEMA_VERSION_LEGACY,
+    read_blueprint,
+)
 from proving_ground.models.blueprint import RangeBlueprint
 from proving_ground.models.base_image import BaseImage
 from proving_ground.models.golden_image import GoldenImage
@@ -38,6 +56,9 @@ from proving_ground.models.user import User
 from proving_ground.config import get_settings
 from proving_ground.schemas.blueprint import BlueprintConfig
 from proving_ground.schemas.blueprint_export import (
+    PACKAGE_FORMAT_KUBERNETES,
+    PACKAGE_FORMAT_LEGACY,
+    SUPPORTED_PACKAGE_FORMATS,
     BlueprintExportManifest,
     BlueprintExportFull,
     BlueprintExportData,
@@ -54,7 +75,59 @@ from proving_ground.schemas.blueprint_export import (
 # Directory where Dockerfiles are stored
 IMAGES_DIR = "/data/images"
 
+KUBERNETES_SUBSTRATE = "kubernetes"
+
 logger = logging.getLogger(__name__)
+
+
+def _schema_version(config: Optional[Dict[str, Any]]) -> int:
+    """The era a stored config declares.
+
+    Absence is v1 by definition -- that is what every blueprint written before Era B is -- and
+    the version is read rather than guessed from shape, because a v2 blueprint that declares no
+    workloads looks exactly like an empty Era A one.
+    """
+    declared = (config or {}).get("schemaVersion", SCHEMA_VERSION_LEGACY)
+    if isinstance(declared, bool) or not isinstance(declared, int):
+        return SCHEMA_VERSION_LEGACY
+    return declared
+
+
+def _entries(config: Optional[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    """The objects a config lists under `key`, ignoring anything that is not one.
+
+    Nothing here trusts a key to be present or well-shaped: a config is hand-edited as often as
+    it is generated, and counting a package's contents must not be the thing that raises.
+    """
+    value = (config or {}).get(key)
+    if not isinstance(value, list):
+        return []
+    return [entry for entry in value if isinstance(entry, dict)]
+
+
+def _names(config: Optional[Dict[str, Any]], key: str) -> List[str]:
+    return [str(entry.get("name") or "unnamed") for entry in _entries(config, key)]
+
+
+def _capability_labels(config: Optional[Dict[str, Any]]) -> List[str]:
+    """Each capability as "name (scope)".
+
+    Scope is required on every capability and has no default, so it travels beside the name: an
+    importer who cannot see it does not know whether a reset here touches one learner or all of
+    them.
+    """
+    labels = []
+    for entry in _entries(config, "capabilities"):
+        name = str(entry.get("name") or "unnamed")
+        scope = entry.get("scope")
+        labels.append(f"{name} ({scope})" if scope else f"{name} (no scope declared)")
+    return labels
+
+
+def _is_kubernetes_install() -> bool:
+    """Whether ranges here run on Kubernetes -- which is the same question as whether a Docker
+    daemon exists for the Era A steps to reach."""
+    return get_settings().range_substrate == KUBERNETES_SUBSTRATE
 
 
 class BlueprintExportService:
@@ -70,6 +143,28 @@ class BlueprintExportService:
     def _compute_file_checksum(self, content: bytes) -> str:
         """Compute SHA256 checksum of file content."""
         return hashlib.sha256(content).hexdigest()
+
+    def _as_legacy_config(self, config: Dict[str, Any]) -> Optional[BlueprintConfig]:
+        """The Era A view of a config, or None when the stored document is not one.
+
+        Only the Dockerfile and image-tarball collectors need it -- they walk `vms`, which a v2
+        config does not have. Returning None rather than raising keeps the blueprint exportable:
+        the definition is what has to travel, and a bug travels between the platform author and
+        the content author as an export, so losing the whole package because an optional extra
+        could not be gathered loses the bug report with it.
+
+        The reason goes to the log and never to the caller. A pydantic message quotes the input
+        back, and the input is the blueprint's own capability values.
+        """
+        try:
+            return BlueprintConfig.model_validate(config)
+        except ValidationError:
+            logger.warning(
+                "Blueprint config is not readable as an Era A config; exporting the document "
+                "without Dockerfiles or image tarballs",
+                exc_info=True,
+            )
+            return None
 
     # =========================================================================
     # Dockerfile Collection Methods (v3.0)
@@ -821,7 +916,7 @@ class BlueprintExportService:
         if not blueprint:
             raise ValueError(f"Blueprint {blueprint_id} not found")
 
-        config = BlueprintConfig.model_validate(blueprint.config)
+        config = dict(blueprint.config or {})
 
         result = {
             "blueprint_id": str(blueprint_id),
@@ -832,8 +927,18 @@ class BlueprintExportService:
             "total_bytes": 10000,
         }
 
-        if include_docker_images:
-            image_tags = self._collect_image_tags_from_config(config, db)
+        # A v2 blueprint carries no image tarballs to weigh: its images are digest-pinned
+        # references the cluster resolves for itself (ADR-0007). Asking a daemon about them
+        # would be asking the wrong host about images it has never held -- and on a Kubernetes
+        # install there is no daemon to ask, which is how this answered 404 for every one.
+        legacy_config = (
+            self._as_legacy_config(config)
+            if include_docker_images and _schema_version(config) == SCHEMA_VERSION_LEGACY
+            else None
+        )
+
+        if legacy_config is not None:
+            image_tags = self._collect_image_tags_from_config(legacy_config, db)
 
             try:
                 client = docker.from_env()
@@ -924,7 +1029,21 @@ class BlueprintExportService:
         if not blueprint:
             raise ValueError(f"Blueprint {blueprint_id} not found")
 
-        config = BlueprintConfig.model_validate(blueprint.config)
+        # The stored document, as written. Validating it against the Era A model here is what
+        # made export answer 404 -- "not found" -- for every Kubernetes blueprint, about a
+        # blueprint sitting in front of the user.
+        config = dict(blueprint.config or {})
+        schema_version = _schema_version(config)
+        legacy_config = (
+            self._as_legacy_config(config) if schema_version == SCHEMA_VERSION_LEGACY else None
+        )
+
+        if legacy_config is None and (options.include_dockerfiles or options.include_docker_images):
+            logger.info(
+                "Blueprint '%s' has no Era A build inputs to carry: its images are referenced by "
+                "digest and are resolved by the cluster, not shipped in the package",
+                blueprint.name,
+            )
 
         # Create temporary directory for export
         temp_dir = tempfile.mkdtemp(prefix="proving-ground-blueprint-export-")
@@ -934,17 +1053,14 @@ class BlueprintExportService:
             # ============================================================
             # Handle MSEL option (v4.0)
             # ============================================================
-            export_config = config
+            export_config = dict(config)
             msel_included = False
 
-            if hasattr(config, "msel") and config.msel:
+            if export_config.get("msel"):
                 if options.include_msel:
                     msel_included = True
                 else:
-                    # Create a copy of config without MSEL
-                    config_dict = config.model_dump()
-                    config_dict["msel"] = None
-                    export_config = BlueprintConfig.model_validate(config_dict)
+                    export_config["msel"] = None
                     logger.info("MSEL excluded from export per options")
 
             # ============================================================
@@ -954,27 +1070,24 @@ class BlueprintExportService:
             artifact_files: List[str] = []
 
             if options.include_artifacts:
-                # Get artifact IDs from blueprint config if available
-                artifact_ids = []
-                if hasattr(config, "artifact_ids") and config.artifact_ids:
-                    artifact_ids = config.artifact_ids
-                elif hasattr(blueprint, "artifact_ids") and blueprint.artifact_ids:
-                    artifact_ids = blueprint.artifact_ids
-
-                if artifact_ids:
+                # Declared by the config, which is the only place anything can declare them.
+                # Reading it off the model was reading a field that model does not have, so this
+                # collected nothing however the option was set.
+                artifact_ids = config.get("artifact_ids")
+                if isinstance(artifact_ids, list) and artifact_ids:
                     artifacts_data, artifact_files = self._collect_artifacts(
-                        artifact_ids, temp_path, db
+                        [str(a) for a in artifact_ids], temp_path, db
                     )
                     logger.info(f"Collected {len(artifacts_data)} artifacts for export")
 
             # ============================================================
-            # Collect Dockerfiles (v3.0)
+            # Collect Dockerfiles (v3.0) -- Era A only
             # ============================================================
             dockerfiles: List[DockerfileProjectData] = []
 
-            if options.include_dockerfiles:
+            if options.include_dockerfiles and legacy_config is not None:
                 # Get project names from VM references
-                project_map = self._collect_referenced_image_projects(config, db)
+                project_map = self._collect_referenced_image_projects(legacy_config, db)
 
                 if project_map:
                     # Collect Dockerfile projects (pass full map for correct image tags)
@@ -1030,9 +1143,9 @@ class BlueprintExportService:
             exported_images: List[str] = []
             image_export_errors: List[str] = []
 
-            if options.include_docker_images:
+            if options.include_docker_images and legacy_config is not None:
                 # Collect all image tags from config
-                image_tags = self._collect_image_tags_from_config(config, db)
+                image_tags = self._collect_image_tags_from_config(legacy_config, db)
 
                 if image_tags:
                     logger.info(f"Exporting {len(image_tags)} Docker images...")
@@ -1066,15 +1179,26 @@ class BlueprintExportService:
             except Exception:
                 proving_ground_version = None
 
-            # Build export structure (v4.0)
+            # The format a reader must understand to read this package, not the newest this
+            # engine can write: an Era A blueprint needs nothing 5.0 added, and stamping it 5.0
+            # would make every install that has not upgraded refuse a package it could have read.
+            package_format = (
+                PACKAGE_FORMAT_LEGACY
+                if schema_version == SCHEMA_VERSION_LEGACY
+                else PACKAGE_FORMAT_KUBERNETES
+            )
+
             export_data = BlueprintExportFull(
                 manifest=BlueprintExportManifest(
-                    version="4.0",  # v4.0: Unified Range Blueprints
+                    version=package_format,
                     export_type="blueprint",
                     created_at=datetime.utcnow(),
                     created_by=user.username,
                     proving_ground_version=proving_ground_version,
                     blueprint_name=blueprint.name,
+                    blueprint_schema_version=schema_version,
+                    workload_count=len(_entries(config, "workloads")),
+                    capability_count=len(_entries(config, "capabilities")),
                     msel_included=msel_included,
                     dockerfile_count=len(dockerfiles),
                     content_included=content_data is not None,
@@ -1132,12 +1256,15 @@ class BlueprintExportService:
                         zf.write(file_path, arcname)
 
             logger.info(
-                f"Created blueprint export v4.0: {archive_path} "
-                f"(msel={'yes' if msel_included else 'no'}, "
+                f"Created blueprint export v{package_format}: {archive_path} "
+                f"(schemaVersion={schema_version}, "
+                f"workloads={len(_entries(config, 'workloads'))}, "
+                f"capabilities={len(_entries(config, 'capabilities'))}, "
+                f"msel={'yes' if msel_included else 'no'}, "
                 f"dockerfiles={len(dockerfiles)}, "
                 f"content={'yes' if content_data else 'no'}, "
                 f"artifacts={len(artifacts_data)}, "
-                f"docker_images={len(exported_images)})"
+                f"image_tarballs={len(exported_images)})"
             )
             return Path(archive_path), filename
 
@@ -1154,9 +1281,13 @@ class BlueprintExportService:
         Extract and parse a blueprint export archive.
 
         Supports multiple formats:
+        - v5.0: Kubernetes (v2) blueprints (blueprint.json with version "5.0")
         - v4.0: Unified Range Blueprints (blueprint.json with version "4.0")
         - v3.0: Blueprint Export (blueprint.json with version "3.0")
         - v2.0: Range Export (range.json) - converted to blueprint format
+
+        Anything outside that list is refused by name rather than read as far as it happens to
+        parse -- see `_require_supported_package`.
 
         Returns:
             Tuple of (export_data, temp_dir_path)
@@ -1190,7 +1321,32 @@ class BlueprintExportService:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise ValueError("Archive missing blueprint.json or range.json")
 
+        self._require_supported_package(data, temp_dir)
+
         return BlueprintExportFull.model_validate(data), Path(temp_dir)
+
+    def _require_supported_package(self, data: Dict[str, Any], temp_dir: str) -> None:
+        """Refuse a package format this install has no code for, naming what wrote it.
+
+        A newer writer declares fields this reader does not read. Pydantic ignores them, so the
+        import would succeed and produce a blueprint missing whatever they said -- and report
+        success, which is the worst of the three outcomes. Naming the version that wrote it
+        turns "this did not work" into "upgrade that host or this one".
+        """
+        manifest = data.get("manifest") if isinstance(data, dict) else None
+        version = str((manifest or {}).get("version") or "").strip()
+        if not version or version in SUPPORTED_PACKAGE_FORMATS:
+            return
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        written_by = (manifest or {}).get("proving_ground_version")
+        origin = f"PROVING GROUND {written_by}" if written_by else "an unknown version"
+        raise ValueError(
+            f"Blueprint package format {version} is not one this install can read "
+            f"(it reads {', '.join(SUPPORTED_PACKAGE_FORMATS)}). The package was written by "
+            f"{origin}. Upgrade this install to read it -- importing it here would drop "
+            "whatever the newer format declares and report success."
+        )
 
     def _convert_range_export_to_blueprint(self, range_json_path: str) -> dict:
         """
@@ -1316,7 +1472,7 @@ class BlueprintExportService:
             )
         elif manifest_version == "3.0":
             warnings.append(
-                "This is a v3.0 Blueprint format - consider re-exporting as v4.0 for full feature support"
+                "This is a v3.0 Blueprint format - consider re-exporting for full feature support"
             )
 
         # Check blueprint name conflict
@@ -1324,19 +1480,43 @@ class BlueprintExportService:
         if existing:
             conflicts.append(f"Blueprint name '{blueprint_name}' already exists")
 
-        # Validate that VMs have image library sources or fallback fields
         config = export_data.blueprint.config
-        for vm in config.vms:
-            has_source = (
-                (hasattr(vm, "base_image_id") and vm.base_image_id)
-                or (hasattr(vm, "golden_image_id") and vm.golden_image_id)
-                or (hasattr(vm, "snapshot_id") and vm.snapshot_id)
+        schema_version = _schema_version(config)
+        included_networks = _names(config, "networks")
+        included_workloads = _names(config, "workloads")
+        included_capabilities = _capability_labels(config)
+
+        # The one authority on what a config means in either era. Its refusals name the workload,
+        # the capability and the field, and the chart-repository refusal names the setting that
+        # would permit it -- all of which the importer needs and a generic "invalid blueprint"
+        # throws away.
+        try:
+            read_blueprint(config)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+        if schema_version == SCHEMA_VERSION_LEGACY:
+            # Validate that VMs have image library sources or fallback fields
+            for index, vm in enumerate(_entries(config, "vms")):
+                hostname = vm.get("hostname") or f"vms[{index}]"
+                has_source = any(
+                    vm.get(key) for key in ("base_image_id", "golden_image_id", "snapshot_id")
+                )
+                has_fallback = any(vm.get(key) for key in ("base_image_tag", "template_name"))
+                if not has_source and not has_fallback:
+                    errors.append(f"VM '{hostname}' has no image source or fallback")
+            if _is_kubernetes_install():
+                warnings.append(
+                    "This package describes a Docker-era range. It will import and can be "
+                    "edited here, but this install deploys ranges on Kubernetes and cannot "
+                    "deploy it until it is rewritten as a Kubernetes blueprint."
+                )
+        elif schema_version == SCHEMA_VERSION_K8S and not _is_kubernetes_install():
+            warnings.append(
+                "This package describes a Kubernetes range -- workloads and capability "
+                "packages. It will import and can be edited here, but this install deploys "
+                "ranges on Docker and cannot deploy it."
             )
-            has_fallback = (hasattr(vm, "base_image_tag") and vm.base_image_tag) or (
-                hasattr(vm, "template_name") and vm.template_name
-            )
-            if not has_source and not has_fallback:
-                errors.append(f"VM '{vm.hostname}' has no image source or fallback")
 
         # ============================================================
         # Validate Dockerfiles (v3.0)
@@ -1375,10 +1555,7 @@ class BlueprintExportService:
         # ============================================================
         # Validate MSEL (v4.0)
         # ============================================================
-        if hasattr(export_data.manifest, "msel_included"):
-            msel_included = export_data.manifest.msel_included
-        elif hasattr(config, "msel") and config.msel:
-            msel_included = True
+        msel_included = bool(export_data.manifest.msel_included or config.get("msel"))
 
         # ============================================================
         # Validate Artifacts (v4.0)
@@ -1414,6 +1591,10 @@ class BlueprintExportService:
             msel_included=msel_included,
             included_artifacts=included_artifacts,
             artifact_conflicts=artifact_conflicts,
+            blueprint_schema_version=schema_version,
+            included_networks=included_networks,
+            included_workloads=included_workloads,
+            included_capabilities=included_capabilities,
         )
 
     # =========================================================================
@@ -1721,9 +1902,12 @@ class BlueprintExportService:
             )
 
         try:
-            # Validate first
+            # Validate first. A rename is not a waiver: a name conflict is reported as a conflict
+            # and never as an error, so `new_name` answered nothing that lands in this list, and
+            # letting it through meant a renamed import skipped every real refusal -- a VM with
+            # no image, a capability with no scope -- and created the blueprint anyway.
             validation = self.validate_import(archive_path, db)
-            if not validation.valid and not options.new_name:
+            if not validation.valid:
                 return BlueprintImportResult(
                     success=False,
                     errors=validation.errors,
@@ -1744,10 +1928,23 @@ class BlueprintExportService:
                     images_built=images_built,
                 )
 
+            # Everything below that unpacks a Dockerfile, builds an image or loads a tarball
+            # needs a Docker daemon. A Kubernetes install has none for the worker to reach, so
+            # those steps are refused by name here rather than attempted and failed inside the
+            # SDK -- and the blueprint itself still imports, which is the part that matters.
+            era_a_host = not _is_kubernetes_install()
+
             # ============================================================
-            # Extract Dockerfiles (v3.0)
+            # Extract Dockerfiles (v3.0) -- Era A only
             # ============================================================
-            if hasattr(export_data, "dockerfiles") and export_data.dockerfiles:
+            if export_data.dockerfiles and not era_a_host:
+                warnings.append(
+                    f"Skipped {len(export_data.dockerfiles)} Dockerfile project(s) and any "
+                    "images they build: this install runs ranges on Kubernetes, where a range's "
+                    "images are digest-pinned references the cluster resolves and there is no "
+                    "Docker daemon to build them with."
+                )
+            elif export_data.dockerfiles:
                 extracted, skipped, extract_errors = self._extract_dockerfiles(
                     export_data.dockerfiles,
                     options.dockerfile_conflict_strategy,
@@ -1766,7 +1963,7 @@ class BlueprintExportService:
                     )
 
                 # Build images if requested
-                if options.build_images and export_data.dockerfiles:
+                if options.build_images:
                     built, build_errors = self._build_and_register_images(
                         export_data.dockerfiles,
                         user,
@@ -1777,12 +1974,11 @@ class BlueprintExportService:
                         warnings.append(err)  # Build failures are warnings, not errors
 
             # ============================================================
-            # Load Docker Images from Tarballs (v4.0)
+            # Load Docker Images from Tarballs (v4.0) -- Era A only
             # ============================================================
             if (
-                hasattr(export_data.manifest, "docker_images_included")
+                era_a_host
                 and export_data.manifest.docker_images_included
-                and hasattr(export_data.manifest, "docker_images")
                 and export_data.manifest.docker_images
             ):
 
@@ -1805,6 +2001,17 @@ class BlueprintExportService:
                     logger.info(f"Loaded and pushed {len(images_loaded)} images to registry")
                 if images_skipped:
                     logger.info(f"Skipped {len(images_skipped)} images (already in registry)")
+
+            elif export_data.manifest.docker_images and not era_a_host:
+                # Gated on the host as well as on the manifest. An Era A host reaches this branch
+                # whenever a package lists tarballs without claiming to include them, and telling
+                # its operator that "this install runs ranges on Kubernetes" would be inventing a
+                # substrate to explain a package it read wrong.
+                warnings.append(
+                    f"Skipped {len(export_data.manifest.docker_images)} image tarball(s): "
+                    "loading one needs a Docker daemon, and this install runs ranges on "
+                    "Kubernetes. Mirror the images into a registry the cluster can reach."
+                )
 
             # ============================================================
             # Import Content (v3.0)
@@ -1829,8 +2036,12 @@ class BlueprintExportService:
             if content_id:
                 blueprint_content_ids.append(str(content_id))
 
-            # Also update config's content_ids so deploy uses the static reference
-            config_dict = export_data.blueprint.config.model_dump()
+            # The document as the package carried it. Re-validating it through the Era A model
+            # here is what emptied a Kubernetes blueprint on the way in: the workloads and the
+            # capability packages have no field on that model to survive in.
+            config_dict = dict(export_data.blueprint.config)
+            # Content keeps its identity on this install, not the one that exported it, so the
+            # ids the package carried are replaced rather than merged.
             if content_id:
                 config_dict["content_ids"] = blueprint_content_ids
 
@@ -1850,6 +2061,7 @@ class BlueprintExportService:
 
             logger.info(
                 f"Imported blueprint: {blueprint.name} (id={blueprint.id}) "
+                f"schemaVersion={_schema_version(config_dict)}, "
                 f"dockerfiles={len(dockerfiles_extracted)}, "
                 f"images_built={len(images_built)}, "
                 f"images_loaded={len(images_loaded)}, "
@@ -1860,6 +2072,7 @@ class BlueprintExportService:
                 success=True,
                 blueprint_id=blueprint.id,
                 blueprint_name=blueprint.name,
+                blueprint_schema_version=_schema_version(config_dict),
                 templates_created=templates_created,
                 templates_skipped=templates_skipped,
                 images_built=images_built,
