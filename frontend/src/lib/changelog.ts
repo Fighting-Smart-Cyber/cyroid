@@ -48,6 +48,21 @@ export interface Release {
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.55.1',
+    date: '2026-09-27',
+    // Build and supply-chain metadata. Nothing an operator or a learner sees changes, so no
+    // modal -- but the images themselves are now labelled truthfully, which matters to whoever
+    // audits them.
+    userFacing: false,
+    title: 'Truthful image metadata',
+    highlights: [
+      {
+        kind: 'fix',
+        text: 'Container images now carry the correct licence and version. They previously claimed MIT and a version of "dev".',
+      },
+    ],
+  },
+  {
     version: '0.55.0',
     date: '2026-09-27',
     title: 'Certificates that browsers trust',

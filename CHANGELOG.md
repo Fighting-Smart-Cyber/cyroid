@@ -10,6 +10,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `backend/tests/unit/test_changelog_agrees.py` fails if the two disagree about which versions
 > exist. That file is the one to write carefully — it is what operators actually read.
 
+## [0.55.1] - 2026-09-27
+
+Groundwork for building CYROID's containers the way a DoD environment expects, and three
+defects found by doing it. Nothing in the running product changes.
+
+### Added
+
+- **`ironbank/*/hardening_manifest.yaml`** and the build arguments they depend on. Iron Bank
+  builds the image itself, from our Dockerfile, against a base it controls, passing
+  `args: {BASE_IMAGE, BASE_TAG}` in -- a Dockerfile with a hardcoded `FROM` ignores them
+  silently and is hardened against a base nobody chose. Both Dockerfiles take them now,
+  defaulting to the current public base so every build is byte-identical.
+
+  `BASE_IMAGE` is deliberately **empty**. The first draft said `redhat/ubi/ubi9` while
+  `backend/Dockerfile` installs with `apt-get`; UBI has no apt, so that build would have failed
+  on its first `RUN` -- against a base that was a guess, because reading the Iron Bank catalogue
+  needs a repo1 account. A guard now refuses a base whose package manager the Dockerfile does
+  not use, so the next guess fails in CI rather than at submission.
+
+  This is the container supply chain, not an ATO. Iron Bank states that it "does not authorize
+  or approve containers at this time" -- evidence and reciprocity only.
+
+### Fixed
+
+- **The frontend image claimed `org.opencontainers.image.licenses=MIT`.** It is AGPL-3.0
+  (ADR-0008). Its `image.source` also pointed at `JongoDB/CYROID`, archived when `MIG-8` moved
+  the engine (ADR-0011).
+- **Every image published so far is labelled `org.opencontainers.image.version=dev`**, the
+  Dockerfile default: `APP_VERSION` was never passed as a build argument.
+- **Image builds did not run on a merge request that changes a Dockerfile** -- only on master,
+  on a tag, or on a `feat/substrate-` branch. Editing one produced a green pipeline that never
+  ran `docker build` once, and the first attempt was the release.
+
 ## [0.55.0] - 2026-09-27
 
 A minor rather than a patch: `image.registry` becomes a **required** value. An install

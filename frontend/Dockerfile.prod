@@ -1,8 +1,16 @@
 # frontend/Dockerfile.prod
 # Multi-stage production build for the PROVING GROUND frontend
 
+# BASE_IMAGE/BASE_TAG name the RUNTIME base, because that is the one Iron Bank hardens and the
+# one that ships. The builder is a throwaway stage whose output is a directory of static files,
+# so it has its own pair. Defaults reproduce the previous build exactly.
+ARG BUILDER_IMAGE=docker.io/library/node
+ARG BUILDER_TAG=20-alpine
+ARG BASE_IMAGE=docker.io/library/nginx
+ARG BASE_TAG=alpine
+
 # Stage 1: Build the React application
-FROM node:20-alpine AS builder
+FROM ${BUILDER_IMAGE}:${BUILDER_TAG} AS builder
 
 WORKDIR /app
 
@@ -25,12 +33,18 @@ COPY . .
 RUN npm run build
 
 # Stage 2: Serve with nginx
-FROM nginx:alpine
+FROM ${BASE_IMAGE}:${BASE_TAG}
+ARG APP_VERSION=dev
 
-# Add labels for container registry
-LABEL org.opencontainers.image.source=https://github.com/JongoDB/CYROID
-LABEL org.opencontainers.image.description="PROVING GROUND Frontend"
-LABEL org.opencontainers.image.licenses=MIT
+# These were wrong in two ways that Iron Bank would have caught and a licence audit would have
+# caught harder: the licence said MIT while the project is AGPL-3.0 (ADR-0008), and the source
+# pointed at JongoDB/CYROID, which was archived when MIG-8 moved the engine (ADR-0011).
+LABEL org.opencontainers.image.title="cyroid-frontend" \
+      org.opencontainers.image.description="CYROID web interface" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.vendor="Fighting Smart Cyber" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.source="https://github.com/Fighting-Smart-Cyber/cyroid"
 
 # Copy custom nginx configuration
 COPY nginx.conf /etc/nginx/nginx.conf

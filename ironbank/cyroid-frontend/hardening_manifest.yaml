@@ -1,0 +1,52 @@
+---
+# Iron Bank submission metadata for the CYROID frontend image.
+#
+# Iron Bank builds this itself, from our Dockerfile, against a base it controls -- it does not
+# pull the image we publish. BASE_IMAGE/BASE_TAG below are what it passes in, which is why
+# frontend/Dockerfile.prod takes them as build arguments.
+#
+# WHAT THIS DOES AND DOES NOT BUY. Iron Bank states plainly that it "does not authorize or
+# approve containers at this time" -- it produces hardening evidence and enables reciprocity.
+# It is necessary for a DoD environment that mandates registry1 images, and it is not an ATO.
+# See docs/research/2026-08-10-substrate-and-market-research.md section 7.
+apiVersion: v1
+
+name: fighting-smart-cyber/cyroid/cyroid-frontend
+
+# Non-latest, per the schema. Kept in step with VERSION; the release pipeline is what advances it.
+tags:
+  - "0.55.1"
+
+args:
+  # DELIBERATELY EMPTY, and the schema allows it ("May be an empty string if the Dockerfile does
+  # not use this variable").
+  #
+  # The first draft of this file said `redhat/ubi/ubi9`, which was a guess and a wrong one: this
+  # image's Dockerfile installs with `apk`, and UBI has no apt. Iron Bank would have failed on the
+  # first RUN. Naming a base we have not verified is worse than naming none, so these stay empty
+  # until two things are settled:
+  #
+  #   1. a repo1 account, so the Iron Bank catalogue can be read rather than guessed at
+  #   2. whether this image ports to a UBI base, which means rewriting the package installs and
+  #      revalidating every native dependency (libpq, genisoimage, p7zip, iptables)
+  #
+  # test_ironbank_manifests.py refuses a base whose package manager the Dockerfile does not use,
+  # so the next guess fails in CI rather than at submission.
+  BASE_IMAGE: ""
+  BASE_TAG: ""
+
+labels:
+  org.opencontainers.image.title: "cyroid-frontend"
+  org.opencontainers.image.description: "CYROID web interface, served by nginx."
+  org.opencontainers.image.licenses: "AGPL-3.0-only"
+  org.opencontainers.image.url: "https://github.com/Fighting-Smart-Cyber/cyroid"
+  org.opencontainers.image.vendor: "Fighting Smart Cyber"
+  org.opencontainers.image.version: "0.55.1"
+  mil.dso.ironbank.image.keywords: "cyber range,training,kubevirt,kubernetes,devsecops"
+  mil.dso.ironbank.image.type: "opensource"
+  mil.dso.ironbank.product.name: "CYROID"
+
+maintainers:
+  - name: "Jonathan Rannabargar"
+    username: "JongoDB"
+    email: "security@fightingsmartcyber.com"
