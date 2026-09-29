@@ -1,5 +1,6 @@
 # proving_ground/tasks/__init__.py
 """Dramatiq task definitions for async operations."""
+
 import dramatiq
 from dramatiq.brokers.redis import RedisBroker
 from proving_ground.config import get_settings

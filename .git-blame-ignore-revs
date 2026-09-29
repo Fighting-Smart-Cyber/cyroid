@@ -7,3 +7,6 @@
 
 # style: format the backend with black (2026-08-27)
 3bfcb094def5df5d65f659cef1e0377e35570b35
+
+# style: black 26.3.1 reformat, taken for GHSA-3936-cmfr-pm3m (2026-09-28)
+6694785a1815da0ec955d4238d1c57c51134527a

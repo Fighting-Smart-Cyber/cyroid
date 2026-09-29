@@ -12,6 +12,18 @@ image:
   # the chart -- so advancing the chart advances the images, and one number names both. Set
   # only to run a different build than the chart was published for (a rehearsal at a sha).
   tag: ""
+  # Prepended to the component name to form each image's repository: `api`, `worker` and
+  # `frontend` become `<registry>/<namePrefix>api` and so on.
+  #
+  # `pg-` is what CI has always pushed to the private registry, so it stays the default and no
+  # existing install changes. The PUBLISHED release images on ghcr.io are `cyroid-*` instead --
+  # the engine is CYROID (ADR-0011) and a public artifact should not be named after the
+  # distribution built on top of it. scripts/quickstart.sh sets this to `cyroid-`.
+  #
+  # Renaming these is allowed where renaming the catalog-facing identifiers is not: nothing
+  # outside this repository resolves a platform image name. `image_namespace`, the environment
+  # variable keys and the database name are a different matter and are deliberately untouched.
+  namePrefix: pg-
   pullPolicy: IfNotPresent
 
 # The GitLab registry is private. With credentials given, the chart renders the pull secret

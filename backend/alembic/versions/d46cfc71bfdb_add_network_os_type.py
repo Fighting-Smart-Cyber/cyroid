@@ -6,10 +6,10 @@ Revises: 2ad21707424c
 Create Date: 2026-01-18 14:05:55.182405
 
 """
+
 from typing import Sequence, Union
 
 from alembic import op
-
 
 # revision identifiers, used by Alembic.
 revision: str = "d46cfc71bfdb"

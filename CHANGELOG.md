@@ -10,6 +10,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `backend/tests/unit/test_changelog_agrees.py` fails if the two disagree about which versions
 > exist. That file is the one to write carefully — it is what operators actually read.
 
+## [0.56.0] - 2026-09-28
+
+Anyone can now install CYROID from a clone, and the release images are public. Also the
+in-cluster frontend, which had been serving a 404 since it was made unprivileged.
+
+### Added
+
+- **`scripts/quickstart.sh`** — a k3d cluster, the chart, and a URL, in one command. k3s runs
+  inside Docker so nobody has to stand up Kubernetes first, and `--delete` leaves nothing
+  behind. The k3s version is pinned: unpinned, k3d hands a different Kubernetes to every user,
+  and k3d 5.9.0's own default (k3s v1.35.5) shut itself down during startup while this was
+  being written, leaving a cluster that reported `1/1` servers and refused every connection.
+
+  It does not install KubeVirt, CDI or Multus. A VM wants `/dev/kvm`, which a container on a
+  laptop does not have, and the fallback is emulation that boots in minutes. Without them the
+  platform, the learner record and capability-based ranges all work.
+
+- **`publish-images-ghcr`** — release images at `ghcr.io/fighting-smart-cyber` as `cyroid-api`,
+  `cyroid-worker`, `cyroid-frontend` and `cyroid-storage`. A `crane copy` of the manifest that
+  was already built, scanned and signed, so the public image is the same bytes as the audited
+  one. Manual, because a public registry cannot be un-published.
+
+  `cyroid-storage` is a mirror of MinIO, and it is not optional: no anonymously pullable MinIO
+  image remains — `docker.io/minio/minio` is gone and `quay.io` answers 401 — so without it a
+  public install has no object store and the chart refuses to render.
+
+- **`image.namePrefix`** on the chart, so one chart serves both audiences. `pg-` stays the
+  default and no existing install changes; the published images are `cyroid-*`.
+
+### Fixed
+
+- **The in-cluster frontend was never ready.** `nginx` moved to port 8080 when it was made
+  unprivileged, but the chart still declared `containerPort: 80`, so both probes got
+  `connection refused`, the Service had no endpoints, and the ingress answered every request
+  for the UI with its own 404. `/api` kept working, which is why it looked half-alive. The
+  Compose path was unaffected, which is why nothing caught it.
+
+- **`app_name` said PROVING GROUND.** It reaches a downloader in the OpenAPI title, at
+  `/api/v1/version` and in the health response; the engine's default is now CYROID. A
+  distribution sets `APP_NAME`.
+
+- **The High-severity dependency CVEs** the shared DevSecOps pipeline found: `axios`, `jspdf`,
+  `python-multipart`, `form-data`, `@tiptap/core`, `js-yaml`, `picomatch` and `black`.
+
+- **Archive extraction** in the two export services no longer trusts the archive. A `.tar.gz`
+  member named `../owned` wrote outside the destination; the guard that `image_import_service`
+  already had is now shared by all three.
+
+### Security
+
+- The shared DevSecOps pipeline from `ci-templates` runs as a child pipeline on every master
+  commit and tag — secrets over the full git history, SAST, dependency CVEs, end-of-life
+  inventory, IaC, malware, and the ASD STIG checklist. It reports rather than blocks while the
+  findings it opened are worked through.
+
 ## [0.55.1] - 2026-09-27
 
 Groundwork for building CYROID's containers the way a DoD environment expects, and three

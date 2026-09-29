@@ -6,7 +6,12 @@ from proving_ground.api.deps import DBSession, CurrentUser
 from proving_ground.models.user import User, UserRole, UserAttribute
 from proving_ground.schemas.auth import LoginRequest, TokenResponse, PasswordChangeResponse
 from proving_ground.schemas.user import UserCreate, UserResponse, PasswordChangeRequest
-from proving_ground.utils.security import verify_password, get_password_hash, create_access_token
+from proving_ground.utils.security import (
+    verify_password,
+    get_password_hash,
+    create_access_token,
+    password_policy_error,
+)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -27,6 +32,14 @@ def register(user_data: UserCreate, db: DBSession):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered",
+        )
+
+    # Password policy applies at registration too, not only when changing one.
+    policy_error = password_policy_error(user_data.password)
+    if policy_error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=policy_error,
         )
 
     # First user becomes admin automatically and is auto-approved
@@ -129,10 +142,11 @@ def change_password(password_data: PasswordChangeRequest, db: DBSession, current
         )
 
     # Validate new password length
-    if len(password_data.new_password) < 8:
+    policy_error = password_policy_error(password_data.new_password)
+    if policy_error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New password must be at least 8 characters",
+            detail=policy_error,
         )
 
     # Update password and clear reset flag

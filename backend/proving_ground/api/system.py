@@ -5,6 +5,7 @@ System information API endpoints.
 Provides endpoints for retrieving host system information including
 architecture details for frontend emulation warnings.
 """
+
 from fastapi import APIRouter
 
 from proving_ground.utils.arch import get_system_info, HOST_ARCH, IS_ARM

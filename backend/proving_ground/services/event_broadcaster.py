@@ -5,6 +5,7 @@ Real-time event broadcasting via Redis pub/sub.
 This service enables real-time UI updates by broadcasting events
 to connected WebSocket clients through Redis pub/sub.
 """
+
 import asyncio
 import json
 import logging

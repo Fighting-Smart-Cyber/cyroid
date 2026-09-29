@@ -11,7 +11,6 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-
 # revision identifiers, used by Alembic.
 revision: str = "c7d9a3b2e4f1"
 down_revision: Union[str, None] = "55ac0fc66160"
@@ -77,13 +76,11 @@ def upgrade() -> None:
 
     # Migrate existing user roles to user_attributes
     # This creates a role attribute for each existing user based on their role column
-    op.execute(
-        """
+    op.execute("""
         INSERT INTO user_attributes (id, user_id, attribute_type, attribute_value, created_at, updated_at)
         SELECT gen_random_uuid(), id, 'role', role, created_at, NOW()
         FROM users
-    """
-    )
+    """)
 
 
 def downgrade() -> None:

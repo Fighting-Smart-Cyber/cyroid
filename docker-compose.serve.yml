@@ -33,10 +33,11 @@ services:
     # nginx serves the built assets from /usr/share/nginx/html; no source, no
     # watcher, no module transformation at request time.
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/"]
       interval: 10s
       timeout: 5s
       retries: 3
     labels:
       - "traefik.enable=true"
-      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+      # 8080: the image runs nginx as the unprivileged nginx user, which cannot bind port 80.
+      - "traefik.http.services.frontend.loadbalancer.server.port=8080"

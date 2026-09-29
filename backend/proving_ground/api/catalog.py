@@ -1,5 +1,6 @@
 # backend/proving_ground/api/catalog.py
 """Catalog API endpoints for browsing, installing, and managing catalog sources."""
+
 import logging
 from typing import List, Optional
 from uuid import UUID

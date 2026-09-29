@@ -21,10 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from proving_ground.services.image_import_service import (
-    ImageImportService,
-    _reject_unsafe_members,
-)
+from proving_ground.services.image_import_service import ImageImportService
+from proving_ground.utils.safe_archive import reject_unsafe_tar_members
 
 
 def _archive(path: Path, *members) -> Path:
@@ -151,7 +149,7 @@ class TestTheExtractionRefusesAnEscape:
     def test_a_hard_link_member_is_refused(self, tmp_path):
         ova = _archive(tmp_path / "hardlink.ova", _file("vm.ovf", b"<Envelope/>"))
         with tarfile.open(ova, "r") as tar:
-            _reject_unsafe_members(tar, tmp_path)
+            reject_unsafe_tar_members(tar, tmp_path)
 
         info = tarfile.TarInfo("vm-disk1.vmdk")
         info.type = tarfile.LNKTYPE
@@ -160,7 +158,7 @@ class TestTheExtractionRefusesAnEscape:
 
         with tarfile.open(linked, "r") as tar:
             with pytest.raises(ValueError) as e:
-                _reject_unsafe_members(tar, tmp_path)
+                reject_unsafe_tar_members(tar, tmp_path)
         assert "vm-disk1.vmdk" in str(e.value)
 
     def test_a_device_member_is_refused(self, tmp_path):
@@ -168,7 +166,7 @@ class TestTheExtractionRefusesAnEscape:
 
         with tarfile.open(ova, "r") as tar:
             with pytest.raises(ValueError) as e:
-                _reject_unsafe_members(tar, tmp_path)
+                reject_unsafe_tar_members(tar, tmp_path)
 
         assert "vm-disk1.vmdk" in str(e.value)
 
@@ -179,7 +177,7 @@ class TestTheExtractionRefusesAnEscape:
         ova = _archive(tmp_path / "odd.ova", _file("./disks/vm-disk1.vmdk", b"disk"))
 
         with tarfile.open(ova, "r") as tar:
-            _reject_unsafe_members(tar, tmp_path)
+            reject_unsafe_tar_members(tar, tmp_path)
 
 
 class TestAWellFormedOVAStillImports:

@@ -1,5 +1,6 @@
 # backend/proving_ground/services/image_import_service.py
 """Service for importing VM images (OVA, QCOW2, VMDK, VDI) as GoldenImages."""
+
 import asyncio
 import logging
 import os
@@ -15,51 +16,10 @@ from sqlalchemy.orm import Session
 
 from proving_ground.config import get_settings
 from proving_ground.models.golden_image import GoldenImage
+from proving_ground.utils.safe_archive import safe_extract_tar
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
-
-# tarfile grew a "data" extraction filter in 3.11.4 and it becomes the default
-# in 3.14; on anything older, passing filter= is a TypeError. Detect it the way
-# PEP 706 prescribes rather than by version number, so this keeps working on
-# whichever interpreter the image lands on.
-_HAS_DATA_FILTER = hasattr(tarfile, "data_filter")
-
-
-def _reject_unsafe_members(tar: tarfile.TarFile, extract_dir: Path) -> None:
-    """Refuse an archive that would write anywhere but the directory we chose.
-
-    An OVA is an upload from whoever can reach the import endpoint, and this
-    runs in the API container, so a member named ``../../etc/cron.d/x``, or a
-    symlink aimed at the shared data volume, is a write to anywhere the API can
-    reach -- which is most of the install.
-
-    tarfile's own "data" filter refuses the same things and is applied as well,
-    but only where the interpreter has it, and its rules have moved between
-    point releases. The archive is therefore inspected here first, before a
-    single member is written, and the answer does not depend on which Python
-    this is running under.
-    """
-    root = os.path.realpath(extract_dir)
-    for member in tar.getmembers():
-        if member.issym() or member.islnk():
-            raise ValueError(
-                f"OVA rejected: '{member.name}' is a link, which can redirect a "
-                f"write outside the archive"
-            )
-        if not (member.isfile() or member.isdir()):
-            raise ValueError(
-                f"OVA rejected: '{member.name}' is neither a regular file nor a directory"
-            )
-        if os.path.isabs(member.name) or member.name.startswith("/"):
-            raise ValueError(f"OVA rejected: '{member.name}' is an absolute path")
-        if ".." in Path(member.name).parts:
-            raise ValueError(f"OVA rejected: '{member.name}' traverses out of the archive")
-        target = os.path.realpath(os.path.join(root, member.name))
-        if target != root and not target.startswith(root + os.sep):
-            raise ValueError(
-                f"OVA rejected: '{member.name}' resolves outside the extraction directory"
-            )
 
 
 class ImageImportService:
@@ -196,11 +156,7 @@ class ImageImportService:
         extract_dir.mkdir()
 
         with tarfile.open(ova_path, "r") as tar:
-            _reject_unsafe_members(tar, extract_dir)
-            if _HAS_DATA_FILTER:
-                tar.extractall(extract_dir, filter="data")
-            else:
-                tar.extractall(extract_dir)
+            safe_extract_tar(tar, extract_dir, label="OVA")
 
         # Find VMDK file(s)
         vmdk_files = list(extract_dir.glob("*.vmdk"))

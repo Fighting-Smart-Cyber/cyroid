@@ -26,6 +26,11 @@ from proving_ground.schemas.catalog_contribution import BlueprintContributionReq
 from proving_ground.services.catalog_service import CatalogService
 
 
+def k(*segments: str) -> str:
+    """Stable change key matching FieldChange.key (JSON array of segments)."""
+    return json.dumps(list(segments), ensure_ascii=False, separators=(",", ":"))
+
+
 BLUEPRINT_DOC = {
     "name": "Red Team Training Lab",
     "description": "A small lab.",
@@ -128,7 +133,7 @@ def test_local_edit_shows_up_as_a_named_field_change(db_session, installed_bluep
     assert result.has_changes is True
     assert len(result.changes) == 1
     change = result.changes[0]
-    assert change.key == "vms/dc-01/cpu"
+    assert change.key == k("vms", "dc-01", "cpu")
     assert change.path == ["vms", "dc-01", "cpu"]
     assert (change.before, change.after) == (4, 8)
     assert change.label == "VM 'dc-01' cpu"
@@ -140,9 +145,9 @@ def test_contribution_returns_an_applicable_patch(db_session, installed_blueprin
         config["vms"][0]["ram_mb"] = 16384
 
     edit(db_session, installed_blueprint, bump)
-    result = contribute(db_session, installed_blueprint, ["vms/dc-01/cpu"])
+    result = contribute(db_session, installed_blueprint, [k("vms", "dc-01", "cpu")])
 
-    assert result.applied == ["vms/dc-01/cpu"]
+    assert result.applied == [k("vms", "dc-01", "cpu")]
     assert result.applies_to_source is True
     assert "-  cpu: 4" in result.patch and "+  cpu: 8" in result.patch
     assert "blueprints/red-team/blueprint.yaml" in result.patch
@@ -162,16 +167,19 @@ def test_omitting_the_selection_contributes_everything(db_session, installed_blu
 
     edit(db_session, installed_blueprint, bump)
     result = contribute(db_session, installed_blueprint, None)
-    assert sorted(result.applied) == ["networks/corp/internet_enabled", "vms/dc-01/cpu"]
+    assert sorted(result.applied) == [
+        k("networks", "corp", "internet_enabled"),
+        k("vms", "dc-01", "cpu"),
+    ]
 
 
 def test_selecting_a_stale_change_is_refused(db_session, installed_blueprint):
     edit(db_session, installed_blueprint, lambda c: c["vms"][0].update(cpu=8))
 
     with pytest.raises(HTTPException) as exc:
-        contribute(db_session, installed_blueprint, ["vms/dc-01/ram_mb"])
+        contribute(db_session, installed_blueprint, [k("vms", "dc-01", "ram_mb")])
     assert exc.value.status_code == 400
-    assert "vms/dc-01/ram_mb" in exc.value.detail
+    assert k("vms", "dc-01", "ram_mb") in exc.value.detail
 
 
 def test_contributing_nothing_is_refused(db_session, installed_blueprint):
@@ -222,3 +230,47 @@ def test_a_catalog_whose_blueprint_file_vanished_is_a_409(db_session, catalog, i
         diff_of(db_session, installed_blueprint)
     assert exc.value.status_code == 409
     assert "missing" in exc.value.detail
+
+
+def test_index_path_with_dotdot_exports_sandbox_relative_item_path(
+    db_session, catalog, installed_blueprint
+):
+    """Raw index path may contain `..` but item_path must be the resolved relative."""
+    root, _ = catalog
+    # Still resolves inside the catalog root to the same blueprint.yaml.
+    index = json.loads((root / "index.json").read_text())
+    index["items"][0]["path"] = "blueprints/public/../../blueprints/red-team"
+    (root / "index.json").write_text(json.dumps(index), encoding="utf-8")
+
+    result = diff_of(db_session, installed_blueprint)
+    assert result.origin.item_path == "blueprints/red-team/blueprint.yaml"
+    assert ".." not in result.origin.item_path
+    assert not result.origin.item_path.startswith("/")
+
+
+def test_a_non_string_catalog_path_is_refused(db_session, catalog, installed_blueprint):
+    """JSON null / non-string path must be a 409, not an unhandled 500."""
+    root, _ = catalog
+    index = json.loads((root / "index.json").read_text())
+    index["items"][0]["path"] = None
+    (root / "index.json").write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(HTTPException) as exc:
+        diff_of(db_session, installed_blueprint)
+    assert exc.value.status_code == 409
+    assert "non-string" in exc.value.detail
+
+
+def test_missing_blueprint_detail_does_not_leak_absolute_paths(
+    db_session, catalog, installed_blueprint
+):
+    root, _ = catalog
+    (root / "blueprints/red-team/blueprint.yaml").unlink()
+
+    with pytest.raises(HTTPException) as exc:
+        diff_of(db_session, installed_blueprint)
+    assert exc.value.status_code == 409
+    assert "missing" in exc.value.detail
+    # Should-fix: 409 detail must not expose absolute server paths.
+    assert str(root) not in exc.value.detail
+    assert "blueprints/red-team/blueprint.yaml" in exc.value.detail

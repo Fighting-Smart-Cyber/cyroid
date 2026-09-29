@@ -1,5 +1,6 @@
 # backend/proving_ground/schemas/base_image.py
 """Pydantic schemas for BaseImage model."""
+
 from datetime import datetime
 from typing import Optional, List, Literal
 from uuid import UUID

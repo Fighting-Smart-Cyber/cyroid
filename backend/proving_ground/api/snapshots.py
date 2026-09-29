@@ -11,6 +11,7 @@ than to "any authenticated user", which is all these routes required until now
 -- restore in particular stopped and force-removed the target container and
 rebuilt it, on nothing more than a valid login.
 """
+
 import asyncio
 from typing import List, Union
 from uuid import UUID

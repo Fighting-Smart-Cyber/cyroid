@@ -7,6 +7,7 @@ Image Library sources: `base_image_id`, `golden_image_id` or `snapshot_id`. The
 tests below exercise that contract instead; the schema was not changed to suit
 them, because the three-way union is the deliberate design.
 """
+
 import pytest
 from pydantic import ValidationError
 

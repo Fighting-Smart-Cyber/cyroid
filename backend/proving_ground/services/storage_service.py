@@ -1,5 +1,6 @@
 # proving_ground/services/storage_service.py
 """MinIO storage service for artifact management."""
+
 import hashlib
 import io
 import logging

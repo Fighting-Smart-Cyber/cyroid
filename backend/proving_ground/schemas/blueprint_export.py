@@ -18,6 +18,7 @@ stamping it 5.0 would strand it on every install that has not upgraded yet. A bu
 the platform author and the content author as a blueprint export, so a package that an older host
 refuses to read is a bug report that does not arrive.
 """
+
 from typing import Optional, List, Dict, Any
 from uuid import UUID
 from datetime import datetime
@@ -169,9 +170,6 @@ class BlueprintExportData(BaseModel):
     name: str
     description: Optional[str] = None
     version: int = 1
-    # DEPRECATED: No longer used with DinD isolation - kept for backward compatibility
-    base_subnet_prefix: Optional[str] = None
-    next_offset: Optional[int] = 0
     # The stored document, as written, for the same reason `BlueprintDetailResponse.config` is:
     # typing this as the Era A model means a v2 config either fails validation outright or is
     # accepted with its workloads and capabilities dropped on the way into the package. A

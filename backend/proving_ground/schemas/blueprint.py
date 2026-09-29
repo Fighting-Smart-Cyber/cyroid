@@ -4,7 +4,6 @@ from uuid import UUID
 from datetime import datetime
 from pydantic import BaseModel, Field, model_validator
 
-
 # ============ Config Sub-schemas ============
 
 
@@ -102,10 +101,6 @@ class BlueprintCreate(BaseModel):
     # Free-form on purpose: the era the config declares decides how it is read, and the API
     # validates it with `capability.blueprint.read_blueprint` rather than with the v1 model above.
     config: Optional[dict[str, Any]] = None
-    # DEPRECATED: No longer used with DinD isolation - kept for backward compatibility
-    base_subnet_prefix: Optional[str] = Field(
-        default=None, pattern=r"^\d{1,3}\.\d{1,3}(\.\d{1,3}\.\d{1,3}/\d{1,2})?$"
-    )
 
     @model_validator(mode="after")
     def _one_source(self) -> "BlueprintCreate":
@@ -130,9 +125,6 @@ class BlueprintResponse(BaseModel):
     name: str
     description: Optional[str]
     version: int
-    # DEPRECATED: No longer used with DinD isolation - kept for backward compatibility
-    base_subnet_prefix: Optional[str] = None
-    next_offset: Optional[int] = 0
     content_ids: List[str] = []  # Linked content for training events
     created_by: Optional[UUID] = None  # Nullable for seed blueprints
     created_at: datetime

@@ -15,6 +15,8 @@ import {
   Ban,
   Key,
   RefreshCw,
+  Eye,
+  EyeOff,
   Server,
   Network,
   AlertTriangle,
@@ -299,6 +301,10 @@ export default function Admin() {
 
   // Create user modal state
   const [showCreateModal, setShowCreateModal] = useState(false)
+  // ASD STIG APSC-DV-001850: a password must not be DISPLAYED as clear text. An admin still
+  // needs to read the one they generate in order to hand it over, so the field is masked by
+  // default and revealed only on an explicit click, rather than being a plain text input.
+  const [showNewUserPassword, setShowNewUserPassword] = useState(false)
   const [createForm, setCreateForm] = useState<AdminCreateUser>({
     username: '',
     email: '',
@@ -1223,12 +1229,21 @@ export default function Admin() {
                         <label className="block text-sm font-medium text-gray-700">Password</label>
                         <div className="mt-1 flex gap-2">
                           <input
-                            type="text"
+                            type={showNewUserPassword ? 'text' : 'password'}
                             value={createForm.password}
                             onChange={(e) => setCreateForm({ ...createForm, password: e.target.value })}
                             className="block flex-1 border border-gray-300 rounded-md shadow-sm px-3 py-2 focus:ring-primary-500 focus:border-primary-500 sm:text-sm"
                             placeholder="Enter or generate password"
                           />
+                          <button
+                            type="button"
+                            onClick={() => setShowNewUserPassword((shown) => !shown)}
+                            className="px-3 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:bg-gray-50"
+                            title={showNewUserPassword ? 'Hide password' : 'Show password'}
+                            aria-label={showNewUserPassword ? 'Hide password' : 'Show password'}
+                          >
+                            {showNewUserPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                          </button>
                           <button
                             type="button"
                             onClick={generateRandomPassword}

@@ -1235,8 +1235,6 @@ export interface Blueprint {
   description?: string;
   version: number;
   // Deprecated: No longer used with DinD isolation
-  base_subnet_prefix?: string;
-  next_offset?: number;
   content_ids: string[];
   created_by?: string;  // Nullable for seed blueprints
   created_at: string;
@@ -1266,7 +1264,6 @@ export interface BlueprintCreate {
   config?: Record<string, unknown>;
   description?: string;
   // DEPRECATED: No longer used with DinD isolation - kept for backward compatibility
-  base_subnet_prefix?: string;
 }
 
 export interface Instance {

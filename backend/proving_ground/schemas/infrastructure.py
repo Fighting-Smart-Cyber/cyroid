@@ -1,5 +1,6 @@
 # backend/proving_ground/schemas/infrastructure.py
 """Pydantic schemas for infrastructure observability."""
+
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 

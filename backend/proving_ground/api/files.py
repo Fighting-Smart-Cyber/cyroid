@@ -1,5 +1,6 @@
 # backend/proving_ground/api/files.py
 """File editor API - CRUD operations for text files."""
+
 import os
 import shutil
 from datetime import datetime, timedelta

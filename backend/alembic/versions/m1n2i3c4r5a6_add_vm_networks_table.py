@@ -11,7 +11,6 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-
 # revision identifiers, used by Alembic.
 revision: str = "m1n2i3c4r5a6"
 down_revision: Union[str, None] = "847984248700"
@@ -43,14 +42,12 @@ def upgrade() -> None:
 
     # Migrate existing VM network assignments
     # Copy each VM's network_id and ip_address into vm_networks as primary interface
-    op.execute(
-        """
+    op.execute("""
         INSERT INTO vm_networks (id, vm_id, network_id, ip_address, is_primary, created_at)
         SELECT gen_random_uuid(), id, network_id, ip_address, true, created_at
         FROM vms
         WHERE network_id IS NOT NULL AND ip_address IS NOT NULL
-    """
-    )
+    """)
 
 
 def downgrade() -> None:

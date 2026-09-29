@@ -7,6 +7,7 @@ an index.json describing available blueprints, scenarios, images, and base image
 The service handles syncing sources, browsing their indexes, and installing items
 into the local PROVING GROUND instance.
 """
+
 import asyncio
 import json
 import logging
@@ -1087,10 +1088,8 @@ class CatalogService:
         blueprint = RangeBlueprint(
             name=blueprint_data.get("name", detail.name),
             description=blueprint_data.get("description", detail.description),
-            base_subnet_prefix=blueprint_data.get("base_subnet_prefix", "10.0.0.0/8"),
             config=config,
             version=1,
-            next_offset=0,
             is_seed=bool(seed_id),
             seed_id=seed_id,
             created_by=user_id,
@@ -1791,17 +1790,38 @@ class CatalogService:
 
         item_dir = item_data.get("path", "")
         # index.json is catalog-supplied content, so its paths are not trusted:
-        # a '../..' would read outside the catalog root.
+        # a '../..' would read outside the catalog root. Non-strings (JSON null,
+        # numbers, lists) are rejected rather than coerced: resolve_declared_path
+        # would stringify them into a path that simply does not exist, and the
+        # error a caller then sees names a file instead of the bad index entry.
+        if not isinstance(item_dir, str):
+            raise ValueError(
+                f"catalog item '{installed.catalog_item_id}' declares a non-string "
+                f"path: {item_dir!r}"
+            )
         item_root = resolve_declared_path(
             catalog_root,
             item_dir,
             what=f"catalog item '{installed.catalog_item_id}' path",
         )
         yaml_path = self._file_in(item_root, "blueprint.yaml")
+        # Export only the sandbox-resolved relative path (never the raw index
+        # string): patch headers, API item_path, and modal copy all use this.
+        root = catalog_root.resolve()
+        relative_item_path = yaml_path.relative_to(root).as_posix()
+        if (
+            Path(relative_item_path).is_absolute()
+            or ".." in Path(relative_item_path).parts
+            or any(ch in relative_item_path for ch in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError(
+                f"catalog item '{installed.catalog_item_id}' resolves to an unsafe "
+                f"relative path: {relative_item_path!r}"
+            )
         if not yaml_path.exists():
             raise ValueError(
                 f"catalog item '{installed.catalog_item_id}' is indexed but its "
-                f"blueprint.yaml is missing at {yaml_path}"
+                f"blueprint.yaml is missing at {relative_item_path}"
             )
 
         text = yaml_path.read_text(encoding="utf-8")
@@ -1825,7 +1845,7 @@ class CatalogService:
             item_id=installed.catalog_item_id,
             item_name=installed.item_name,
             installed_version=installed.installed_version,
-            item_path=str(Path(item_dir) / "blueprint.yaml"),
+            item_path=relative_item_path,
             yaml_path=yaml_path,
             document=document,
             text=text,

@@ -1,5 +1,6 @@
 # tests/unit/test_docker_service.py
 """Unit tests for Docker service using mocks."""
+
 import pytest
 from unittest.mock import MagicMock, patch
 

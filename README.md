@@ -39,11 +39,31 @@ without modification.
 
 ## Quick Install
 
+One command, on one machine, on a throwaway Kubernetes cluster:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Fighting-Smart-Cyber/cyroid/main/scripts/deploy.sh -o deploy.sh
-chmod +x deploy.sh
-./deploy.sh
+git clone https://github.com/Fighting-Smart-Cyber/cyroid.git
+cd cyroid
+./scripts/quickstart.sh
 ```
+
+Then open **https://cyroid.localhost:8443/** and register — the first account becomes the
+administrator. `./scripts/quickstart.sh --delete` removes the cluster and everything in it.
+
+Needs `docker`, [`k3d`](https://k3d.io), `kubectl` and `helm`; the script checks and tells you
+what is missing. It creates a [k3s](https://k3s.io) cluster inside Docker, so you do not have to
+stand up Kubernetes yourself, and pins the Kubernetes version so every run is the same one.
+
+> **Why Kubernetes and not Docker Compose.** CYROID runs *in* a cluster — a range is a namespace,
+> a capability is a Helm release, and placement is a scheduling decision
+> ([ADR-0012](docs/adr/)). The Compose path ran an earlier design and is being removed, so the
+> sections further down that use it are kept for existing installs, not recommended for new ones.
+
+> **What the quickstart does not install:** KubeVirt, CDI and Multus, which ranges need only when
+> their machines are full VMs. A VM wants `/dev/kvm`, which a container on a laptop does not have,
+> and the fallback is software emulation that boots in minutes. Without them the platform, the
+> learner record, and ranges built from capability packages all work. Add them on a host with
+> nested virtualisation.
 
 ---
 
@@ -359,81 +379,83 @@ Each range runs inside a DinD container with iptables-based routing (VyOS option
 
 ## Quick Start
 
-### Easy Install (3 Commands)
+### One machine (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Fighting-Smart-Cyber/cyroid/main/scripts/deploy.sh -o deploy.sh
-chmod +x deploy.sh
-./deploy.sh
+./scripts/quickstart.sh
 ```
 
-The deploy script provides a TUI-based installation wizard that handles everything automatically.
+Creates a k3d cluster, installs the chart, and prints the URL. See **Quick Install** above for
+what it does and does not include. Options:
 
-### Prerequisites
+| Flag / variable | Meaning |
+|---|---|
+| `--version X.Y.Z` | Install a specific release instead of the one in `VERSION` |
+| `--host NAME` | The name the ingress answers to (default `cyroid.localhost`) |
+| `--delete` | Delete the cluster and everything in it |
+| `CYROID_HTTPS_PORT` | Published HTTPS port (default `8443`, so no root and no clash with 443) |
+| `CYROID_K3S_IMAGE` | Pin a different k3s version |
 
-- Docker Engine 24.0+ (or Docker Desktop on macOS)
-- Docker Compose 2.20+
-- KVM support (for Windows VMs on Linux): `lsmod | grep kvm`
-- Minimum resources: 16 CPU cores, 32GB RAM, 500GB disk
+`cyroid.localhost` resolves to `127.0.0.1` with no `/etc/hosts` entry — `.localhost` is reserved
+for this ([RFC 6761](https://www.rfc-editor.org/rfc/rfc6761)). The certificate is self-signed, so
+the browser warns once.
 
-### Installation Options
-
-#### Option 1: Deploy Script (Recommended)
-
-**Interactive mode (with TUI wizard):**
-```bash
-curl -fsSL https://raw.githubusercontent.com/Fighting-Smart-Cyber/cyroid/main/scripts/deploy.sh -o deploy.sh
-chmod +x deploy.sh
-./deploy.sh
-```
-
-**Non-interactive mode (for CI/CD or scripted deployments):**
-```bash
-./deploy.sh -y --ip 192.168.1.100 --ssl selfsigned --admin-user admin --admin-password admin123
-```
-
-**Deploy Script Options:**
-| Flag | Description |
-|------|-------------|
-| `-y`, `--yes` | Non-interactive mode (use defaults) |
-| `--ip IP` | Server IP address |
-| `--domain DOMAIN` | Domain name (for Let's Encrypt) |
-| `--ssl MODE` | SSL mode: `letsencrypt`, `selfsigned`, `manual` |
-| `--admin-user USER` | Admin username (default: admin) |
-| `--admin-password PASS` | Admin password (default: admin123) |
-| `--admin-email EMAIL` | Admin email (default: admin@proving_ground.local) |
-| `--version VER` | CYROID version to deploy |
-| `--backup [NAME]` | Backup Docker images to disk |
-| `--restore [NAME]` | Restore Docker images from backup |
-
-#### Option 2: Manual Installation
+### An existing cluster
 
 ```bash
-# Clone the repository
-git clone https://github.com/Fighting-Smart-Cyber/cyroid.git
-cd cyroid
-
-# Copy environment template
-cp .env.example .env
-
-# Generate secure secrets (Linux)
-sed -i "s/your-secret-key-here/$(openssl rand -hex 32)/" .env
-
-# macOS: Generate secure secrets
-sed -i '' "s/your-secret-key-here/$(openssl rand -hex 32)/" .env
-
-# Initialize CYROID networks
-./scripts/init-networks.sh
-
-# Start all services (pulls pre-built images from GHCR)
-docker-compose up -d
-
-# Verify services are running
-docker-compose ps
-
-# Check API health
-curl http://localhost/api/v1/version
+./scripts/install-k8s.sh --host cyroid.example.org
 ```
+
+Installs as a Flux `HelmRelease`. Run `--help` for the full set; the ones that matter most are
+`--postgres-url` to use a database the environment supplies rather than the bundled pod, and
+`--apps-host` for the separate hostname a range's own applications answer on. That separation is
+not cosmetic: an application served from the platform's own hostname is same-origin with the
+console, so the software a learner is being trained against could read the operator's session out
+of the browser.
+
+For a real certificate, `./scripts/setup-cert-manager-dns01.sh` issues a wildcard over DNS-01,
+which covers the platform and every range application with one certificate — and works on a
+private address no public CA can reach.
+
+### Requirements
+
+The engine asks the cluster for a named set of capabilities rather than a named platform
+([ADR-0012](docs/adr/)): an ingress controller, `ReadWriteOnce` storage, an S3-compatible object
+store, PostgreSQL, and an OIDC issuer. The chart can supply Postgres, Redis and object storage
+itself as pods, which is what the quickstart uses; in production the environment should supply
+them.
+
+For the quickstart: Docker, and enough headroom for a small cluster — roughly 4 CPUs and 8 GB.
+The 16-core / 32 GB figures quoted further down are for a host running Windows VM ranges on the
+Compose path, not for this.
+
+### Container images
+
+Release images are published to `ghcr.io/fighting-smart-cyber` as `cyroid-api`, `cyroid-worker`
+and `cyroid-frontend`, plus `cyroid-storage` (a mirror of MinIO, because no anonymously pullable
+MinIO image remains). The quickstart uses them; `install-k8s.sh` is pointed
+elsewhere with the `PG_IMAGE_REPO` environment variable, or `scripts/registry.env` if you keep
+one.
+
+To build your own instead:
+
+```bash
+docker build -t myreg/cyroid-api:dev      -f backend/Dockerfile  ./backend
+docker build -t myreg/cyroid-worker:dev   -f backend/Dockerfile  ./backend
+docker build -t myreg/cyroid-frontend:dev -f frontend/Dockerfile.prod ./frontend
+
+helm upgrade --install cyroid deploy/helm/proving-ground -n pg-system --create-namespace \
+  --set image.registry=myreg --set image.namePrefix=cyroid- --set image.tag=dev \
+  --set minio.image=<an S3-compatible image you can pull>
+```
+
+---
+
+## Docker Compose (Era A, legacy)
+
+Everything below this point describes the Compose deployment. It still works and existing installs
+still run on it, but it is the earlier design and is being removed — new installs should use the
+Kubernetes path above. It is documented here rather than deleted because people are running it.
 
 ### Development Setup
 

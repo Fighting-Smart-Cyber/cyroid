@@ -5,6 +5,7 @@ Architecture detection utilities for multi-platform support.
 Provides detection of host CPU architecture and emulation requirements
 for running x86 VMs on ARM hosts and vice versa.
 """
+
 import platform
 from typing import Literal
 

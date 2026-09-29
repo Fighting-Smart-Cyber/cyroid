@@ -1,5 +1,6 @@
 # backend/proving_ground/api/notifications.py
 """API endpoints for user-scoped notifications."""
+
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status

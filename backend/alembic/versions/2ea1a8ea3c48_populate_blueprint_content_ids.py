@@ -10,6 +10,7 @@ Revises: 3ab6da971c60
 Create Date: 2026-01-26 17:08:45.821695
 
 """
+
 from typing import Sequence, Union
 import json
 import uuid
@@ -17,7 +18,6 @@ import uuid
 from alembic import op
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-
 
 # revision identifiers, used by Alembic.
 revision: str = "2ea1a8ea3c48"
@@ -47,15 +47,11 @@ def upgrade() -> None:
         return
 
     # Find blueprints with MSEL walkthrough but no content_ids
-    result = session.execute(
-        text(
-            """
+    result = session.execute(text("""
         SELECT id, name, config, content_ids, created_by
         FROM range_blueprints
         WHERE config::text LIKE '%walkthrough%'
-    """
-        )
-    )
+    """))
 
     for row in result:
         bp_id = row[0]
@@ -81,14 +77,12 @@ def upgrade() -> None:
         tags_json = json.dumps(["migrated", "blueprint-walkthrough"])
 
         session.execute(
-            text(
-                """
+            text("""
             INSERT INTO content (id, title, description, content_type, body_markdown, walkthrough_data,
                                  version, created_by_id, tags, is_published, created_at, updated_at)
             VALUES (:id, :title, :description, 'STUDENT_GUIDE', '', CAST(:walkthrough_data AS jsonb),
                     '1.0', :created_by, CAST(:tags AS jsonb), true, NOW(), NOW())
-        """
-            ),
+        """),
             {
                 "id": content_id,
                 "title": walkthrough_title,
@@ -106,14 +100,12 @@ def upgrade() -> None:
         content_ids_json = json.dumps(new_content_ids)
 
         session.execute(
-            text(
-                """
+            text("""
             UPDATE range_blueprints
             SET content_ids = CAST(:content_ids AS jsonb),
                 config = CAST(:config AS jsonb)
             WHERE id = :bp_id
-        """
-            ),
+        """),
             {
                 "content_ids": content_ids_json,
                 "config": config_json,
@@ -132,25 +124,17 @@ def downgrade() -> None:
     session = Session(bind=bind)
 
     # Delete content with 'migrated' tag
-    session.execute(
-        text(
-            """
+    session.execute(text("""
         DELETE FROM content
         WHERE tags::text LIKE '%migrated%'
         AND tags::text LIKE '%blueprint-walkthrough%'
-    """
-        )
-    )
+    """))
 
     # Clear content_ids from blueprints (can't fully restore original config)
-    session.execute(
-        text(
-            """
+    session.execute(text("""
         UPDATE range_blueprints
         SET content_ids = '[]'::jsonb
         WHERE content_ids IS NOT NULL AND content_ids != '[]'::jsonb
-    """
-        )
-    )
+    """))
 
     session.commit()

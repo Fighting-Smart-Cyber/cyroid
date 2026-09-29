@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # api/ranges.py: delete_range (~line 387)
 # ---------------------------------------------------------------------------

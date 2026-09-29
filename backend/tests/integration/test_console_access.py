@@ -7,6 +7,7 @@ Tests cover:
 - Container shell access
 - Range console access (DinD diagnostics)
 """
+
 import pytest
 from unittest.mock import patch
 from uuid import uuid4
@@ -182,7 +183,11 @@ def auth_headers(client):
     # Register admin user
     client.post(
         "/api/v1/auth/register",
-        json={"username": "testadmin", "email": "testadmin@test.com", "password": "testpass123"},
+        json={
+            "username": "testadmin",
+            "email": "testadmin@test.com",
+            "password": "testpassword123",
+        },
     )
 
     # Login. Note `json=`, not `data=` — the endpoint takes a JSON body, and the
@@ -191,7 +196,7 @@ def auth_headers(client):
     # erroring, every test using it got a silent 401 and looked like a broken
     # endpoint. Fail loudly instead.
     response = client.post(
-        "/api/v1/auth/login", json={"username": "testadmin", "password": "testpass123"}
+        "/api/v1/auth/login", json={"username": "testadmin", "password": "testpassword123"}
     )
     assert response.status_code == 200, f"login failed: {response.status_code} {response.text}"
     return {"Authorization": f"Bearer {response.json()['access_token']}"}

@@ -7,6 +7,7 @@ GoldenImages are created from:
 
 They track lineage back to the original BaseImage when applicable.
 """
+
 from enum import Enum
 from typing import Optional, List, TYPE_CHECKING
 from uuid import UUID

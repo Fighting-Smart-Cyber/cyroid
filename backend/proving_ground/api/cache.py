@@ -1,5 +1,6 @@
 # backend/proving_ground/api/cache.py
 """API endpoints for image caching and golden image management."""
+
 import ipaddress
 import os
 import logging

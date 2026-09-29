@@ -16,66 +16,56 @@ def _first(content: str) -> dict:
 
 
 def test_bold_actions_heading_bounds_the_description():
-    inject = _first(
-        """# MSEL
+    inject = _first("""# MSEL
 
 ## T+0:00 - Convoy Departs
 The convoy leaves the staging area.
 
 **Actions:**
 - Run command on WS-01: whoami
-"""
-    )
+""")
     assert inject["description"] == "The convoy leaves the staging area."
 
 
 def test_plain_actions_heading_bounds_the_description():
-    inject = _first(
-        """# MSEL
+    inject = _first("""# MSEL
 
 ## T+0:00 - Convoy Departs
 The convoy leaves the staging area.
 
 Actions:
 - Run command on WS-01: whoami
-"""
-    )
+""")
     assert inject["description"] == "The convoy leaves the staging area."
 
 
 def test_description_stops_at_the_first_action_when_there_is_no_heading():
-    inject = _first(
-        """# MSEL
+    inject = _first("""# MSEL
 
 ## T+0:00 - Convoy Departs
 The convoy leaves the staging area.
 
 - Run command on WS-01: whoami
-"""
-    )
+""")
     assert inject["description"] == "The convoy leaves the staging area."
     assert len(inject["actions"]) == 1
 
 
 def test_a_section_with_no_actions_keeps_its_whole_body():
-    inject = _first(
-        """# MSEL
+    inject = _first("""# MSEL
 
 ## T+0:15 - Situation Report
 No system action. The instructor briefs the team.
-"""
-    )
+""")
     assert inject["description"] == "No system action. The instructor briefs the team."
     assert inject["actions"] == []
 
 
 def test_a_section_with_no_body_has_an_empty_description():
-    inject = _first(
-        """# MSEL
+    inject = _first("""# MSEL
 
 ## T+0:00 - Exercise Start
 **Actions:**
 - Run command on WS-01: date
-"""
-    )
+""")
     assert inject["description"] == ""

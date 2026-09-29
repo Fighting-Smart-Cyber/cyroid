@@ -18,6 +18,7 @@ Before this, every route stopped at CurrentUser, which is a login and not a
 permission: any authenticated account, a student included, could delete a base
 image out from under every range using it, or import one.
 """
+
 from typing import List, Optional
 from uuid import UUID
 import logging

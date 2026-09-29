@@ -165,9 +165,7 @@ def _concepts(kubernetes: bool) -> str:
     return _CONCEPTS_KUBERNETES if kubernetes else _CONCEPTS_DOCKER
 
 
-API_DESCRIPTION = (
-    _concepts(_KUBERNETES)
-    + """
+API_DESCRIPTION = _concepts(_KUBERNETES) + """
 ## Authentication
 
 All endpoints (except `/health` and `/api/v1/auth/*`) require a JWT token.
@@ -186,7 +184,6 @@ Include it in the `Authorization` header: `Bearer <token>`
 - `/api/health` - API health check (alias)
 - `/api/v1/health` - Versioned health check (alias)
 """
-)
 
 app = FastAPI(
     title=settings.app_name,
@@ -397,9 +394,7 @@ def _ai_overview(kubernetes: bool) -> str:
     return _AI_OVERVIEW_KUBERNETES if kubernetes else _AI_OVERVIEW_DOCKER
 
 
-AI_CONTEXT = (
-    _ai_overview(_KUBERNETES)
-    + """
+AI_CONTEXT = _ai_overview(_KUBERNETES) + """
 ## Key Endpoints
 
 ### Ranges
@@ -496,7 +491,6 @@ Get token via: POST /api/v1/auth/login {"username": "x", "password": "y"}
 - VMs can have multiple network interfaces via POST /vms/{id}/networks/{network_id}
 - Use Blueprints for reusable range configurations
 """
-)
 
 
 @app.get("/api/v1/schema/ai-context", tags=["system"])

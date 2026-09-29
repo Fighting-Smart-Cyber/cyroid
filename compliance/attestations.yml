@@ -1,0 +1,261 @@
+# ASD STIG V6R4 attestations for CYROID.
+#
+# 160 of the 286 requirements begin "Review the application documentation..." - a scanner cannot
+# answer them. This file is where those answers live, in the repository, so they are reviewed in a
+# merge request, dated, diffable, and attached to the commit they describe. The compliance job turns
+# them into the .ckl an assessor reads.
+#
+# ELEVEN ENTRIES ARE SIGNED. FOUR REMAIN `proposed`.
+#
+# A signed entry (status compliant / not_applicable / inherited) closes the requirement. A `proposed`
+# one records a determination and its evidence and leaves the requirement Not_Reviewed until someone
+# signs it. The split is deliberate: the reading of the code can be done by whoever read the code,
+# while the signature stays with whoever is accountable.
+#
+# What makes the signed ones durable rather than a snapshot: every entry that CLOSES a requirement
+# has an automated check in backend/tests/unit/test_asd_stig_assertions.py, named after the
+# requirement, running on every pipeline. Add a SOAP endpoint, swap bcrypt for something weaker,
+# render a password as text, and the check fails - so the statement here cannot quietly rot into a
+# false one. test_every_signed_attestation_has_an_automated_check refuses to let a closing status
+# exist without such a check, so a future signature cannot skip it either.
+#
+# That is what the signature commits to: "this check correctly represents this requirement", which is
+# a smaller and much more durable claim than "I read the whole codebase on one particular day". The
+# check is not a substitute for the judgement - an assessor can disagree with the reading, and
+# APSC-DV-001850 says out loud where that is most likely.
+#
+# `owner` is a role, which is the convention this format's own examples use and how an SSP allocates
+# responsibility. If your process needs a named individual, replace it per entry.
+#
+# The four still `proposed` are the gaps: APSC-DV-000510, -000530, -001540 and -001750. Nothing there
+# is closed, and signing them as `open` (which also needs an owner and date) is the next decision -
+# an Open finding belongs in the POA&M, where Not_Reviewed does not.
+#
+# ---------------------------------------------------------------------------------------------
+# NO `inherited:` BLOCK, ON PURPOSE.
+#
+# Inheritance closes requirements wholesale, and the schema is blunt about it being the most
+# consequential mistake available here: it silently closes requirements nobody assessed. The control
+# list has to be read off the hosting provider's CRM or the inherited column of their SSP. The CDAO
+# Solutions control allocation has not been read, so there is nothing to copy from and guessing what
+# a platform "probably covers" is exactly the error. Until someone reads that document, CYROID
+# asserts no inheritance and every platform-provided control stays Not_Reviewed.
+#
+# inherited:
+#   provider: "CDAO Solutions ATO (deployment destination)"
+#   owner: "<the person who read the CRM>"
+#   date: "<the date they read it>"
+#   controls: [ ... only what the CRM allocates wholly to the platform ... ]
+
+requirements:
+
+  # ---- not applicable: no SOAP, no WS-Security, no SAML ------------------------------------------
+  #
+  # These four are the WS-Security / SAML assertion family. CYROID's interfaces are JSON over HTTP
+  # (FastAPI) plus WebSockets; there is no SOAP endpoint, no WSSE header handling and no SAML
+  # assertion issued or consumed anywhere, so there are no time stamps or validity conditions of
+  # this kind to verify. Checked for wsse / ws-security / soap / saml / zeep / suds across
+  # backend/proving_ground and frontend/src: no match.
+
+  APSC-DV-000190:
+    status: not_applicable
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      No SOAP or WS-Security endpoint exists. All application interfaces are JSON over HTTP and
+      WebSockets, so there are no WS-Security message time stamps to create or expire.
+    evidence: "no wsse/ws-security/soap/saml reference in backend/proving_ground or frontend/src"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_000190 (runs on every pipeline)"
+
+  APSC-DV-000200:
+    status: not_applicable
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      No WS-Security messages are produced or consumed, so there are no validity periods to verify.
+      Bearer token lifetime is a separate mechanism, covered by the JWT `exp` claim.
+    evidence: "backend/proving_ground/utils/security.py (JWT exp claim); no WS-Security anywhere"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_000200 (runs on every pipeline)"
+
+  APSC-DV-000230:
+    status: not_applicable
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      The application issues and consumes no SAML assertions, so there is no SubjectConfirmation
+      element and no NotOnOrAfter condition to set.
+    evidence: "no SAML library or assertion handling in the codebase"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_000230 (runs on every pipeline)"
+
+  APSC-DV-000240:
+    status: not_applicable
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      No SAML assertions are issued, so the NotBefore / NotOnOrAfter and OneTimeUse conditions do
+      not apply.
+    evidence: "no SAML library or assertion handling in the codebase"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_000240 (runs on every pipeline)"
+
+  # ---- not applicable: authentication is bearer-token, not PKI -----------------------------------
+  #
+  # Both of these are conditional on PKI-based authentication. CYROID authenticates with a local
+  # account and a signed bearer token; there is no client-certificate path, no certificate chain
+  # validation and no certificate-to-account mapping to enforce. If a CAC or client-certificate path
+  # is ever added, BOTH of these come back into scope immediately, and so does the whole password
+  # family below for any non-certificate exemption path.
+
+  APSC-DV-001810:
+    status: not_applicable
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      No PKI-based authentication path exists. Authentication is a local account plus a signed JWT
+      bearer token, so the application validates no client certificates and builds no certification
+      path to an anchor.
+    evidence: "backend/proving_ground/utils/security.py:23-38 (create/decode access token); no client-certificate or mTLS handling"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_001810 (runs on every pipeline)"
+
+  APSC-DV-001820:
+    status: not_applicable
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      With no PKI authentication path there is no certificate subject to map to an account, so there
+      is no authorised-access mapping of this kind to enforce.
+    evidence: "no client-certificate handling; authorisation is role-based, see backend/proving_ground/api/deps.py:72-108"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_001820 (runs on every pipeline)"
+
+  # ---- met by the application ---------------------------------------------------------------------
+
+  APSC-DV-001740:
+    status: compliant
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      Passwords are stored only as a bcrypt hash through passlib's CryptContext, with
+      deprecated="auto" so an older scheme would be re-hashed rather than kept. No code path stores
+      or logs a recoverable password. State the bcrypt work factor here when signing - the default
+      is taken from passlib, not pinned in the repository, which is worth pinning explicitly.
+    evidence: "backend/proving_ground/utils/security.py:12 CryptContext(schemes=[\"bcrypt\"], deprecated=\"auto\"); :15 verify_password; :19 get_password_hash"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_001740 (runs on every pipeline)"
+
+  APSC-DV-001850:
+    status: compliant
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      No credential is rendered as clear text by default. Every password entry field uses a masked
+      input. One field - the password on the admin create-user form - is masked by default with an
+      explicit reveal button rather than permanently masked, because an administrator has to read the
+      password they generate in order to hand it over; revealing it is a deliberate click, not the
+      default rendering. That field WAS an unconditional type="text" input until 2026-09-28, found by
+      the automated check below rather than by reading the code, which is the reason this entry is
+      worth having a check at all. If an assessor reads the requirement as prohibiting any reveal at
+      all, this becomes Open and the field has to lose its toggle.
+    evidence: "frontend/src/pages/Admin.tsx password field (masked by default, explicit reveal); all other credential inputs are type=\"password\""
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_001850_credential_inputs_are_masked (runs on every pipeline)"
+
+  APSC-DV-000460:
+    status: compliant
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      Access to functions and data is mediated by explicit role dependencies rather than by the
+      caller's assertion: require_role() and require_admin() are FastAPI dependencies applied at the
+      endpoint, and ownership checks fall back to the is_admin flag rather than skipping the check.
+      When signing, confirm coverage endpoint by endpoint - this draft establishes the mechanism
+      exists, not that every route uses it.
+    evidence: "backend/proving_ground/api/deps.py:72 require_role, :104 require_admin, :108 is_admin check"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_000460 (runs on every pipeline)"
+
+  APSC-DV-003280:
+    status: compliant
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      The application refuses to start in a non-debug configuration while a shipped default secret is
+      still in place: require_production_secrets() raises InsecureDefaultError when jwt_secret_key is
+      still "change-me-in-production", and DEBUG=true must be set deliberately to bypass it. The
+      default therefore cannot reach production silently.
+    evidence: "backend/proving_ground/config.py:111 JWT_DEFAULT_SECRET, :392-399 require_production_secrets raising InsecureDefaultError"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_003280 (runs on every pipeline)"
+
+  # ---- real gaps, recorded as gaps ----------------------------------------------------------------
+  #
+  # These four are the ones worth arguing about in review. None of them is closed by this file and
+  # each needs either a code change or a signed risk acceptance carried in the POA&M.
+
+  APSC-DV-001680:
+    status: compliant
+    owner: "application lead"
+    date: "2026-09-28"
+    statement: >-
+      The 15-character minimum is enforced. It is checked in one place - password_policy_error() in
+      utils/security.py, with PASSWORD_MIN_LENGTH = 15 - and applied by every endpoint that accepts a
+      password: registration, admin user-create, and change-password. Before this the minimum was 8
+      and only change-password checked it at all, so an account could be created with any password
+      and the limit walked past entirely; two of the three paths enforced nothing. A unit test parses
+      the API module and fails if any function calling get_password_hash does not check the policy
+      first, so a fourth password path cannot reintroduce the bypass. Note when signing: existing
+      accounts with shorter passwords keep working until their next password change - this closes the
+      enforcement gap, it does not retire credentials already issued.
+    evidence: "backend/proving_ground/utils/security.py PASSWORD_MIN_LENGTH/password_policy_error; api/auth.py register and change_password; api/users.py create_user; backend/tests/unit/test_password_policy.py"
+    verified_by: "backend/tests/unit/test_asd_stig_assertions.py::test_APSC_DV_001680 (runs on every pipeline)"
+
+  APSC-DV-000530:
+    status: proposed
+    proposed_status: open
+    statement: >-
+      No account lockout exists. Searched for a failed-attempt counter, lockout flag or equivalent
+      (failed_attempts / lockout / max_attempts / consecutive) and found none outside unrelated
+      contexts, so three consecutive invalid logons are not limited. Note for whoever fixes this: a
+      request rate limiter is not this control - it throttles a source address, it does not lock an
+      account - so adding one does not close the requirement.
+    evidence: "no failed-attempt or lockout state in backend/proving_ground; no lockout logic in api/auth.py"
+    drafted_by: "unsigned draft from a code read at 1706798b, 2026-09-28"
+
+  APSC-DV-000510:
+    status: proposed
+    proposed_status: open
+    statement: >-
+      Partially resolved, and open because the larger half remains. The frontend image now runs as
+      the unprivileged nginx user (uid 101): its cache and document root are chowned to that user,
+      the pid file moved to /tmp, and it listens on 8080 because a non-root process cannot bind port
+      80 - both compose files point Traefik at 8080 to match. The api and worker images still run as
+      root, and that is not a one-line fix: they reach a bind-mounted /var/run/docker.sock through
+      docker.from_env(), which needs the socket's group supplied at deploy time because its gid
+      varies by host, and docker_service.py runs iptables locally for the per-range chain, which
+      needs CAP_NET_ADMIN. The second is the dangerous one to rush: those subprocess calls pass
+      capture_output=True without checking the return code, so an unprivileged user would fail
+      silently and the network isolation they implement would stop being enforced with nothing
+      looking wrong. Closing this means moving that iptables work into the DinD container, where the
+      rest of the isolation already runs, and making the calls check their exit status.
+    evidence: "frontend/Dockerfile.prod USER nginx; frontend/nginx.conf listen 8080 and pid /tmp/nginx.pid; backend/Dockerfile (rationale recorded in the file); backend/proving_ground/services/docker_service.py:523-618 local iptables calls; docker-compose.prod.yml docker.sock mounts"
+    drafted_by: "unsigned draft, code changed and verified 2026-09-28"
+
+  APSC-DV-001750:
+    status: proposed
+    proposed_status: open
+    statement: >-
+      Credentials are protected in transit at the edge but not on the internal hop. Traefik
+      terminates TLS for the api, ws and frontend routers, so a password crossing the public boundary
+      is encrypted; behind Traefik the application speaks plain HTTP on the container network.
+      Whether that closes the requirement depends on whether the hosting enclave treats that network
+      as a protected boundary, which is a CRM question, not a code question - hence open rather than
+      compliant.
+    evidence: "docker-compose.prod.yml:72-73,110 traefik routers api-secure/ws-secure/frontend-secure with tls.certresolver; no ssl_keyfile/ssl_certfile on the app itself"
+    drafted_by: "unsigned draft from a code read at 1706798b, 2026-09-28"
+
+  APSC-DV-001540:
+    status: proposed
+    proposed_status: open
+    statement: >-
+      Users are uniquely identified - accounts carry a UUID and tokens are minted against that
+      user_id - but authentication is a local username and password, not an organisational identity
+      provider. Whether local accounts satisfy "uniquely identify and authenticate organizational
+      users" for this authorisation is a determination for the assessor, and it interacts with
+      APSC-DV-001680 above: a local credential has to meet the password requirements itself, where a
+      federated one can inherit them.
+    evidence: "backend/proving_ground/utils/security.py:23 create_access_token(user_id: UUID); backend/proving_ground/api/auth.py local password login"
+    drafted_by: "unsigned draft from a code read at 1706798b, 2026-09-28"

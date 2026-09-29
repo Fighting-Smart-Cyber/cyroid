@@ -24,13 +24,15 @@ Two asymmetries drive most of the code here:
   compared once and written back to whichever key the original used. Migrating
   the catalog's schema is a bigger change than the user asked to contribute.
 
-Paths are tuples, not dotted strings: a hostname may legitimately contain a
-dot, and an escaping scheme is a bug waiting to happen.
+Paths are tuples, not dotted or slash-joined strings: a hostname may
+legitimately contain a dot or a slash. ``FieldChange.key`` is a JSON encoding
+of those segments for the API; the server never re-parses a joined string.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import difflib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -76,7 +78,7 @@ VM_SCALAR_FIELDS: Tuple[str, ...] = (
 )
 VM_LEGACY_NIC_FIELDS: Tuple[str, ...] = ("ip_address", "network_name")
 
-METADATA_FIELDS: Tuple[str, ...] = ("name", "description", "base_subnet_prefix")
+METADATA_FIELDS: Tuple[str, ...] = ("name", "description")
 
 
 @dataclass(frozen=True)
@@ -91,8 +93,14 @@ class FieldChange:
 
     @property
     def key(self) -> str:
-        """Stable identifier a client can send back to select this change."""
-        return "/".join(self.path)
+        """Opaque, unambiguous identifier a client can send back to select this change.
+
+        Encoded as a JSON array of path segments so a segment that contains ``/``
+        cannot collide with a longer path (e.g. ``("vms", "a", "cpu")`` vs
+        ``("vms", "a/cpu")``). Clients must treat the string as opaque and never
+        re-parse it into a path; the server keeps ``path`` as the tuple.
+        """
+        return json.dumps(list(self.path), ensure_ascii=False, separators=(",", ":"))
 
 
 @dataclass

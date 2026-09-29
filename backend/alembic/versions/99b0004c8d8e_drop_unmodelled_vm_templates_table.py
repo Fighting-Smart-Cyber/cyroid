@@ -25,11 +25,11 @@ drift between those models and the live schema that has nothing to do with
 vm_templates. Those lines were deliberately removed from the generated
 output rather than applied here.
 """
+
 from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
-
 
 # revision identifiers, used by Alembic.
 revision: str = "99b0004c8d8e"

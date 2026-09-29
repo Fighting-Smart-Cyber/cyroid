@@ -7,6 +7,7 @@ VMs are created from:
 - GoldenImage (pre-configured snapshots or imports)
 - Snapshot (point-in-time forks)
 """
+
 from enum import Enum
 
 

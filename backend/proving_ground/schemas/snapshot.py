@@ -1,5 +1,6 @@
 # proving_ground/schemas/snapshot.py
 """Pydantic schemas for Snapshot model (forks in the Image Library)."""
+
 from typing import Optional, List
 from datetime import datetime
 from pydantic import BaseModel, Field

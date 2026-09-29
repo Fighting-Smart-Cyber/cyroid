@@ -1,5 +1,6 @@
 # backend/proving_ground/models/notification.py
 """User-scoped notification model for targeted alerts."""
+
 from datetime import datetime
 from enum import Enum
 from typing import Optional

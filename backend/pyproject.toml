@@ -31,7 +31,4 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Two files under tests/ are `print()`-driven __main__ scripts against a live
-# server rather than pytest modules. They are excluded until rewritten.
-addopts = "--ignore=tests/test_live_multi_range.py --ignore=tests/test_multi_range_isolation.py"
 asyncio_mode = "auto"

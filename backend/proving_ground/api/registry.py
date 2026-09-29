@@ -1,5 +1,6 @@
 # backend/proving_ground/api/registry.py
 """API endpoints for local Docker registry management."""
+
 import logging
 import threading
 import uuid

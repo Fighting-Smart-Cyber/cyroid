@@ -8,6 +8,7 @@ In the three-tier image system:
 
 Snapshots track lineage to their parent GoldenImage.
 """
+
 from typing import Optional, List, TYPE_CHECKING
 from uuid import UUID
 from sqlalchemy import String, Text, ForeignKey, Integer, Boolean, JSON

@@ -15,8 +15,8 @@ app.kubernetes.io/part-of: proving-ground
 {{- define "pg.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- if or (not $tag) (eq $tag "0.0.0") }}{{ fail "no image tag: set image.tag, or package the chart with --app-version (scripts/install-k8s.sh and CI both do)" }}{{ end -}}
-{{- if not .Values.image.registry }}{{ fail "no image registry: set image.registry to a registry this cluster can pull from. CYROID publishes no images -- build them and name where they live (scripts/install-k8s.sh does this from scripts/registry.env or PG_IMAGE_REPO)" }}{{ end -}}
-{{ .Values.image.registry }}/{{ .name }}:{{ $tag }}
+{{- if not .Values.image.registry }}{{ fail "no image registry: set image.registry to a registry this cluster can pull from -- ghcr.io/fighting-smart-cyber for the published release images, or your own if you build them (scripts/install-k8s.sh reads scripts/registry.env or PG_IMAGE_REPO; scripts/quickstart.sh uses the published ones)" }}{{ end -}}
+{{ .Values.image.registry }}/{{ .Values.image.namePrefix }}{{ .name }}:{{ $tag }}
 {{- end }}
 
 {{- define "pg.imageTag" -}}

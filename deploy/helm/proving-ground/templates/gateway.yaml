@@ -103,7 +103,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: gateway
-          image: {{ include "pg.image" (dict "Values" .Values "Chart" .Chart "name" "pg-api") }}
+          image: {{ include "pg.image" (dict "Values" .Values "Chart" .Chart "name" "api") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # The same image as the API, a different entrypoint. What separates them is what the
           # pod is GIVEN, not what its filesystem contains.

@@ -1,5 +1,6 @@
 # backend/proving_ground/schemas/notification.py
 """Schemas for user notifications."""
+
 from datetime import datetime
 from typing import Optional, List
 from uuid import UUID

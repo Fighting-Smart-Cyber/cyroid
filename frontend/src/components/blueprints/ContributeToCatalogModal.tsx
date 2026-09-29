@@ -203,6 +203,28 @@ export default function ContributeToCatalogModal({
                   </div>
                 </div>
 
+
+                {diff.changes.some((c) => {
+                  if (!selected.has(c.key)) return false;
+                  if (c.path.includes('environment')) return true;
+                  return [c.before, c.after].some(
+                    (v) =>
+                      !!v &&
+                      typeof v === 'object' &&
+                      !Array.isArray(v) &&
+                      'environment' in (v as Record<string, unknown>)
+                  );
+                }) && (
+                  <div className="flex items-start p-3 rounded-lg bg-amber-50 text-amber-800">
+                    <AlertCircle className="h-4 w-4 mr-2 flex-shrink-0 mt-0.5" />
+                    <p className="text-xs">
+                      Selected changes include VM environment variables. Those values
+                      leave the platform boundary when you copy or download the
+                      contribution — review them before sharing the patch.
+                    </p>
+                  </div>
+                )}
+
                 <div className="space-y-2 max-h-80 overflow-y-auto">
                   {diff.changes.map((change) => (
                     <label
@@ -256,34 +278,49 @@ export default function ContributeToCatalogModal({
               </div>
             )}
 
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <p className="text-sm font-medium text-gray-900">
-                  Patch · {contribution.origin.item_path}
-                </p>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleCopy(contribution.patch, 'Patch')}
-                    className="inline-flex items-center px-2 py-1 text-xs border rounded hover:bg-gray-50"
-                  >
-                    <Copy className="h-3 w-3 mr-1" /> Copy
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleDownload(contribution.patch, contribution.suggested_filename)
-                    }
-                    className="inline-flex items-center px-2 py-1 text-xs border rounded hover:bg-gray-50"
-                  >
-                    <Download className="h-3 w-3 mr-1" /> Download
-                  </button>
+            {contribution.applies_to_source ? (
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-sm font-medium text-gray-900">
+                    Patch · {contribution.origin.item_path}
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(contribution.patch, 'Patch')}
+                      className="inline-flex items-center px-2 py-1 text-xs border rounded hover:bg-gray-50"
+                    >
+                      <Copy className="h-3 w-3 mr-1" /> Copy
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleDownload(
+                          contribution.patch,
+                          contribution.suggested_filename
+                        )
+                      }
+                      className="inline-flex items-center px-2 py-1 text-xs border rounded hover:bg-gray-50"
+                    >
+                      <Download className="h-3 w-3 mr-1" /> Download
+                    </button>
+                  </div>
                 </div>
+                <pre className="bg-gray-900 text-gray-100 text-xs p-3 rounded-lg overflow-auto max-h-72">
+                  {contribution.patch}
+                </pre>
               </div>
-              <pre className="bg-gray-900 text-gray-100 text-xs p-3 rounded-lg overflow-auto max-h-72">
-                {contribution.patch}
-              </pre>
-            </div>
+            ) : (
+              <div className="bg-gray-50 rounded-lg p-3 text-sm text-gray-700">
+                <p className="font-medium text-gray-900 mb-1">Use the full blueprint.yaml</p>
+                <p className="text-xs text-gray-600">
+                  Patch copy/download is hidden because this contribution will not apply
+                  cleanly with <code>git apply</code>. Replace{' '}
+                  <code className="font-mono">{contribution.origin.item_path}</code> with
+                  the file below.
+                </p>
+              </div>
+            )}
 
             <div className="bg-gray-50 rounded-lg p-3 space-y-2">
               <p className="text-sm font-medium text-gray-900">Next steps</p>

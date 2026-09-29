@@ -18,6 +18,7 @@ When DIND_ISOLATION_ENABLED=true, each range deploys inside its own DinD
 container, providing complete network namespace isolation. This eliminates
 IP conflicts between concurrent range instances using identical blueprint IPs.
 """
+
 import docker
 from docker.errors import APIError, NotFound, ImageNotFound, DockerException
 from typing import Optional, Dict, List, Any, Callable, TYPE_CHECKING
@@ -481,6 +482,45 @@ class DockerService:
             logger.warning(f"Failed to disconnect traefik from network: {e}")
             return False
 
+    def _iptables(self, args: list, *, required: bool, tolerate: tuple = ()) -> int:
+        """Run one iptables command, and never let its failure pass unnoticed.
+
+        Every rule here implements network isolation for a range, so a rule that does not get applied
+        is a range that can reach something it should not. The calls used to be a mix of check=True
+        and bare capture_output=True, and the unchecked ones included the DROP rules for the host's
+        own interfaces - so a failure there left the host reachable from inside a range while
+        setup_network_isolation still returned True.
+
+        Args:
+            args: the iptables arguments, without the "iptables" binary itself.
+            required: True when the isolation depends on this rule. A failure raises.
+            tolerate: substrings of stderr that are expected and not a problem (for example
+                "Chain already exists" when re-creating a chain).
+
+        Returns:
+            The process return code.
+
+        Raises:
+            RuntimeError: when a required rule could not be applied.
+        """
+        import subprocess
+
+        result = subprocess.run(["iptables", *args], capture_output=True, text=True)
+        if result.returncode == 0:
+            return 0
+
+        stderr = (result.stderr or "").strip()
+        printable = " ".join(args)
+        if any(token in stderr for token in tolerate):
+            logger.debug(f"iptables {printable}: {stderr} (expected, continuing)")
+            return result.returncode
+
+        message = f"iptables {printable} failed (exit {result.returncode}): {stderr or 'no stderr'}"
+        if required:
+            raise RuntimeError(message)
+        logger.warning(message)
+        return result.returncode
+
     def setup_network_isolation(self, network_id: str, subnet: str) -> bool:
         """
         Set up iptables rules to isolate a range network from the host and PROVING GROUND infrastructure.
@@ -519,11 +559,13 @@ class DockerService:
             # Create a unique chain for this network
             chain_name = f"PROVING GROUND-{network_id[:12]}"
 
-            # Create the chain (ignore error if exists)
-            subprocess.run(["iptables", "-N", chain_name], capture_output=True)
+            # Create the chain. Already existing is fine and expected; anything else - iptables
+            # missing, no CAP_NET_ADMIN - means none of the rules below can be applied either, so it
+            # is not something to swallow.
+            self._iptables(["-N", chain_name], required=True, tolerate=("Chain already exists",))
 
-            # Flush existing rules in the chain
-            subprocess.run(["iptables", "-F", chain_name], capture_output=True)
+            # Flush whatever the chain held from a previous deployment.
+            self._iptables(["-F", chain_name], required=True)
 
             # Add rules to block access to infrastructure
             for dest in blocked_destinations:
@@ -531,54 +573,54 @@ class DockerService:
                 if self._subnets_overlap(subnet, dest):
                     continue
 
-                subprocess.run(
-                    ["iptables", "-A", chain_name, "-s", subnet, "-d", dest, "-j", "DROP"],
-                    check=True,
-                    capture_output=True,
+                self._iptables(
+                    ["-A", chain_name, "-s", subnet, "-d", dest, "-j", "DROP"], required=True
                 )
 
             # Block access to host's physical interfaces
             # Get host IP addresses
             result = subprocess.run(["hostname", "-I"], capture_output=True, text=True)
-            if result.returncode == 0:
-                host_ips = result.stdout.strip().split()
-                for host_ip in host_ips:
-                    if host_ip and not host_ip.startswith(subnet.split("/")[0].rsplit(".", 1)[0]):
-                        subprocess.run(
-                            [
-                                "iptables",
-                                "-A",
-                                chain_name,
-                                "-s",
-                                subnet,
-                                "-d",
-                                f"{host_ip}/32",
-                                "-j",
-                                "DROP",
-                            ],
-                            capture_output=True,
-                        )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "could not determine the host's own addresses (hostname -I exited "
+                    f"{result.returncode}), so the rules that keep a range off the host cannot be "
+                    "written; refusing to report this network as isolated"
+                )
+            host_ips = [ip for ip in result.stdout.strip().split() if ip]
+            if not host_ips:
+                logger.warning(
+                    "hostname -I returned no addresses, so no host-interface DROP rules were "
+                    f"written for {subnet}. The range is isolated from the blocked ranges above but "
+                    "not explicitly from this host."
+                )
+            for host_ip in host_ips:
+                if not host_ip.startswith(subnet.split("/")[0].rsplit(".", 1)[0]):
+                    # required: this is the rule that stops a range reaching the host it runs on.
+                    # It was the one call in this function applied without checking its result.
+                    self._iptables(
+                        ["-A", chain_name, "-s", subnet, "-d", f"{host_ip}/32", "-j", "DROP"],
+                        required=True,
+                    )
 
             # Allow traffic within the same subnet (for VM-to-VM communication)
-            subprocess.run(
-                ["iptables", "-I", chain_name, "1", "-s", subnet, "-d", subnet, "-j", "ACCEPT"],
-                check=True,
-                capture_output=True,
+            self._iptables(
+                ["-I", chain_name, "1", "-s", subnet, "-d", subnet, "-j", "ACCEPT"], required=True
             )
 
             # Add jump to our chain from DOCKER-USER (at the beginning)
             # First check if rule already exists
-            check_result = subprocess.run(
-                ["iptables", "-C", "DOCKER-USER", "-s", subnet, "-j", chain_name],
-                capture_output=True,
+            # -C is a query: a non-zero exit means "no such rule", which is the normal case.
+            already_present = (
+                self._iptables(
+                    ["-C", "DOCKER-USER", "-s", subnet, "-j", chain_name],
+                    required=False,
+                    tolerate=("No chain/target/match", "Bad rule", "does a matching rule exist"),
+                )
+                == 0
             )
-
-            if check_result.returncode != 0:
-                # Rule doesn't exist, add it
-                subprocess.run(
-                    ["iptables", "-I", "DOCKER-USER", "1", "-s", subnet, "-j", chain_name],
-                    check=True,
-                    capture_output=True,
+            if not already_present:
+                self._iptables(
+                    ["-I", "DOCKER-USER", "1", "-s", subnet, "-j", chain_name], required=True
                 )
 
             logger.info(f"Set up network isolation for {network_name} ({subnet})")
@@ -588,6 +630,9 @@ class DockerService:
             logger.error(f"Failed to set up network isolation: {e}")
             return False
         except Exception as e:
+            # Includes the RuntimeError raised by _iptables for a required rule. Returning False is
+            # the contract; whether anyone acts on it is the caller's problem, and networks.py now
+            # does.
             logger.error(f"Failed to set up network isolation: {e}")
             return False
 
@@ -602,20 +647,21 @@ class DockerService:
         Returns:
             True if successful
         """
-        import subprocess
-
         try:
             chain_name = f"PROVING GROUND-{network_id[:12]}"
 
             # Remove jump from DOCKER-USER
-            subprocess.run(
-                ["iptables", "-D", "DOCKER-USER", "-s", subnet, "-j", chain_name],
-                capture_output=True,
-            )  # Ignore errors if rule doesn't exist
-
-            # Flush and delete the chain
-            subprocess.run(["iptables", "-F", chain_name], capture_output=True)
-            subprocess.run(["iptables", "-X", chain_name], capture_output=True)
+            # Teardown tolerates absence - the rule or chain may already be gone - but a failure
+            # for any other reason leaves a stale jump rule behind, so it gets logged rather than
+            # dropped on the floor.
+            absent = ("No chain/target/match", "does a matching rule exist", "No such file")
+            self._iptables(
+                ["-D", "DOCKER-USER", "-s", subnet, "-j", chain_name],
+                required=False,
+                tolerate=absent,
+            )
+            self._iptables(["-F", chain_name], required=False, tolerate=absent)
+            self._iptables(["-X", chain_name], required=False, tolerate=absent)
 
             logger.info(f"Removed network isolation rules for {subnet}")
             return True

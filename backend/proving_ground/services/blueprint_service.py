@@ -6,8 +6,8 @@ All ranges use DinD (Docker-in-Docker) isolation, so IP offset logic is not
 needed. Each range runs in its own isolated network namespace inside a DinD
 container, allowing multiple ranges to use identical IP spaces.
 """
+
 import logging
-import re
 from typing import Dict, List
 
 logger = logging.getLogger(__name__)
@@ -157,60 +157,35 @@ def extract_config_from_range(db: Session, range_id: UUID) -> BlueprintConfig:
     )
 
 
-def extract_subnet_prefix(subnet: str) -> str:
-    """Extract the first two octets from a subnet (e.g., '10.100.0.0/24' -> '10.100')."""
-    match = re.match(r"(\d{1,3})\.(\d{1,3})\.", subnet)
-    if match:
-        return f"{match.group(1)}.{match.group(2)}"
-    return "10.100"  # Default fallback
+def next_instance_ordinal(db: Session, blueprint_id: UUID) -> int:
+    """How many instances of this blueprint already exist -- the next one's label.
 
-
-def apply_subnet_offset(ip_or_subnet: str, base_prefix: str, offset: int) -> str:
+    Era A kept a `next_offset` counter on the blueprint and allocated a subnet per instance from
+    it. DinD isolation made the allocation unnecessary, and PG-122 removed the counter. The number
+    survives only because the UI numbers a blueprint's instances with it, so it is counted from
+    the table it describes rather than carried in a column that could drift from it.
     """
-    Apply subnet offset to an IP or subnet.
+    from proving_ground.models.blueprint import RangeInstance
 
-    Example:
-        apply_subnet_offset("10.100.0.10", "10.100", 2) -> "10.102.0.10"
-        apply_subnet_offset("10.100.1.0/24", "10.100", 2) -> "10.102.1.0/24"
-    """
-    # Parse base prefix
-    base_match = re.match(r"(\d{1,3})\.(\d{1,3})", base_prefix)
-    if not base_match:
-        return ip_or_subnet
-
-    base_second_octet = int(base_match.group(2))
-    new_second_octet = base_second_octet + offset
-
-    if new_second_octet > 255:
-        raise ValueError(f"Offset {offset} would exceed valid IP range")
-
-    # Replace second octet in the IP/subnet
-    pattern = rf"({base_match.group(1)})\.{base_second_octet}\."
-    replacement = rf"\g<1>.{new_second_octet}."
-
-    return re.sub(pattern, replacement, ip_or_subnet)
+    return db.query(RangeInstance).filter(RangeInstance.blueprint_id == blueprint_id).count()
 
 
 def create_range_from_blueprint(
     db: Session,
     config: BlueprintConfig,
     range_name: str,
-    base_prefix: str,
-    offset: int,
     created_by: UUID,
 ) -> Range:
     """
     Create a new Range from blueprint config with exact blueprint IPs.
 
-    All ranges use DinD isolation, so no IP translation is needed.
-    The offset parameter is kept for API compatibility but is ignored.
+    All ranges use DinD isolation, so no IP translation is needed -- every range gets the
+    blueprint's own addresses.
 
     Args:
         db: Database session
         config: Blueprint configuration
         range_name: Name for the new range
-        base_prefix: Base subnet prefix (kept for API compatibility)
-        offset: Subnet offset (ignored - DinD provides isolation)
         created_by: User ID of creator
 
     Returns:

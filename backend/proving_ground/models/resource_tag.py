@@ -1,5 +1,6 @@
 # backend/proving_ground/models/resource_tag.py
 """Resource tags for ABAC visibility control."""
+
 from uuid import UUID
 
 from sqlalchemy import String, UniqueConstraint, Index

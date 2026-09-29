@@ -1,5 +1,6 @@
 # backend/proving_ground/api/content.py
 """Content API endpoints for training materials."""
+
 import hashlib
 import logging
 import markdown

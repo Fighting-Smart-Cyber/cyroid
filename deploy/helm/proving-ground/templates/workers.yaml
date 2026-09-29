@@ -1,6 +1,6 @@
 {{- /* Two workers, as in Compose: `default` for everything, `deploys pool` for range deploys. */ -}}
 {{- range $w := list
-  (dict "name" "pg-worker" "component" "worker" "queues" "default" "cfg" .Values.worker)
+  (dict "name" "worker" "component" "worker" "queues" "default" "cfg" .Values.worker)
   (dict "name" "pg-worker-deploy" "component" "worker-deploy" "queues" "deploys pool" "cfg" .Values.workerDeploy) }}
 ---
 apiVersion: apps/v1
@@ -26,7 +26,7 @@ spec:
       {{- include "pg.imagePullSecrets" $ | nindent 6 }}
       containers:
         - name: worker
-          image: {{ include "pg.image" (dict "Values" $.Values "Chart" $.Chart "name" "pg-worker") }}
+          image: {{ include "pg.image" (dict "Values" $.Values "Chart" $.Chart "name" "worker") }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           command: ["bash", "-c"]
           args:

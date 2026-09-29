@@ -24,6 +24,7 @@ interactive control of a running machine; `check_resource_access` for the
 status and event feeds, because those are reads. The event feed needs one more
 thing than a check at subscribe time -- see `_event_entitlement`.
 """
+
 import asyncio
 import logging
 import time

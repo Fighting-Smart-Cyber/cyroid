@@ -33,11 +33,15 @@ spec:
       {{- include "pg.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: frontend
-          image: {{ include "pg.image" (dict "Values" .Values "Chart" .Chart "name" "pg-frontend") }}
+          image: {{ include "pg.image" (dict "Values" .Values "Chart" .Chart "name" "frontend") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
-              containerPort: 80
+              # 8080, not 80. `frontend/Dockerfile.prod` runs nginx as `USER nginx` and
+              # `frontend/nginx.conf` listens on 8080 -- an unprivileged process cannot bind 80.
+              # The Service still publishes 80 and both probes address this port by name, so this
+              # one number ties the three together.
+              containerPort: 8080
           readinessProbe:
             httpGet: {path: /health, port: http}
             periodSeconds: 5

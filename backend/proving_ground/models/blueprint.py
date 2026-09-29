@@ -15,12 +15,6 @@ class RangeBlueprint(Base, UUIDMixin, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1)
     config: Mapped[dict] = mapped_column(JSON)  # networks, VMs, MSEL, router
 
-    # DEPRECATED: No longer used with DinD isolation - kept for backward compatibility
-    base_subnet_prefix: Mapped[Optional[str]] = mapped_column(
-        String(20), nullable=True, default="10.0.0.0/8"
-    )
-    next_offset: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
-
     # Linked content for training events (auto-selected when blueprint chosen)
     content_ids: Mapped[Optional[List[str]]] = mapped_column(JSON, default=list)
 
@@ -48,7 +42,10 @@ class RangeInstance(Base, UUIDMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(100))
     blueprint_id: Mapped[UUID] = mapped_column(ForeignKey("range_blueprints.id"))
     blueprint_version: Mapped[int] = mapped_column(Integer)
-    subnet_offset: Mapped[int] = mapped_column(Integer)
+    # Which instance of the blueprint this is -- a label, not an allocation. Era A took a subnet
+    # per instance from a counter on the blueprint (`next_offset`); DinD isolation made that
+    # unnecessary and PG-122 removed it. This survives because the UI numbers instances with it.
+    subnet_offset: Mapped[int] = mapped_column(Integer, default=0)
 
     # Ownership
     instructor_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"))

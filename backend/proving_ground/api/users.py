@@ -1,5 +1,6 @@
 # backend/proving_ground/api/users.py
 """User management API endpoints with ABAC attribute support."""
+
 from typing import List
 from uuid import UUID
 
@@ -16,7 +17,7 @@ from proving_ground.schemas.user import (
     UserAttributeResponse,
     AdminCreateUser,
 )
-from proving_ground.utils.security import get_password_hash
+from proving_ground.utils.security import get_password_hash, password_policy_error
 
 router = APIRouter(prefix="/users", tags=["User Management"])
 
@@ -63,6 +64,15 @@ def create_user(user_data: AdminCreateUser, db: DBSession, current_user: AdminUs
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered",
+        )
+
+    # An admin creating an account is still bound by the password policy; the account is created
+    # with password_reset_required=True, but the interim password has to meet the minimum too.
+    policy_error = password_policy_error(user_data.password)
+    if policy_error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=policy_error,
         )
 
     # Validate roles

@@ -191,9 +191,20 @@ def provision_network(network_id: UUID, db: DBSession, current_user: CurrentUser
         # Connect traefik to this network for VNC/web console routing
         docker.connect_traefik_to_network(docker_network_id)
 
-        # If isolated, set up iptables rules to block access to host/infrastructure
+        # If isolated, set up iptables rules to block access to host/infrastructure.
+        # The return value is checked because it used to be discarded: a network whose isolation
+        # rules failed to apply was still recorded and logged as isolated, which is the one outcome
+        # worse than failing - an operator reading is_isolated=True has no reason to look.
         if network.is_isolated:
-            docker.setup_network_isolation(docker_network_id, network.subnet)
+            if not docker.setup_network_isolation(docker_network_id, network.subnet):
+                network.is_isolated = False
+                db.commit()
+                db.refresh(network)
+                logger.error(
+                    f"Network {network.name} was requested isolated but the iptables rules could "
+                    "not be applied; it is recorded as NOT isolated. See the iptables errors above. "
+                    "Anything deployed onto it can reach the host and the other blocked ranges."
+                )
 
         logger.info(f"Provisioned network {network.name} (isolated={network.is_isolated})")
 
@@ -236,7 +247,20 @@ def toggle_network_isolation(network_id: UUID, db: DBSession, current_user: Curr
         else:
             # Apply isolation
             docker.connect_traefik_to_network(network.docker_network_id)
-            docker.setup_network_isolation(network.docker_network_id, network.subnet)
+            # is_isolated follows what actually happened. It used to be set to True unconditionally,
+            # so a failed apply left the database asserting an isolation that was not in place.
+            if not docker.setup_network_isolation(network.docker_network_id, network.subnet):
+                logger.error(
+                    f"Isolation requested for network {network.name} but the iptables rules could "
+                    "not be applied; leaving it recorded as NOT isolated."
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        "Could not apply network isolation; the network is unchanged and is not "
+                        "isolated. Check the API logs for the iptables error."
+                    ),
+                )
             network.is_isolated = True
             logger.info(f"Applied isolation to network {network.name}")
 

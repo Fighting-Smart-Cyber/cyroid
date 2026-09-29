@@ -8,7 +8,10 @@ from proving_ground.api.deps import DBSession, CurrentUser, check_resource_contr
 from proving_ground.capability.blueprint import read_blueprint
 from proving_ground.models import Range, RangeInstance, RangeStatus
 from proving_ground.schemas.blueprint import InstanceResponse, BlueprintConfig
-from proving_ground.services.blueprint_service import create_range_from_blueprint
+from proving_ground.services.blueprint_service import (
+    create_range_from_blueprint,
+    next_instance_ordinal,
+)
 from proving_ground.tasks.deployment import deploy_range_task, teardown_range_task
 
 router = APIRouter(prefix="/instances", tags=["instances"])
@@ -58,9 +61,7 @@ def reset_instance(instance_id: UUID, db: DBSession, current_user: CurrentUser):
     db.flush()
 
     # Recreate from config
-    _recreate_range_contents(
-        db, range_obj, config, blueprint.base_subnet_prefix, instance.subnet_offset
-    )
+    _recreate_range_contents(db, range_obj, config)
 
     # Redeploy (queue async task)
     db.commit()
@@ -104,9 +105,7 @@ def redeploy_instance(instance_id: UUID, db: DBSession, current_user: CurrentUse
     db.flush()
 
     # Recreate from latest config
-    _recreate_range_contents(
-        db, range_obj, config, blueprint.base_subnet_prefix, instance.subnet_offset
-    )
+    _recreate_range_contents(db, range_obj, config)
 
     # Update instance to latest version
     instance.blueprint_version = blueprint.version
@@ -131,10 +130,6 @@ def clone_instance(instance_id: UUID, db: DBSession, current_user: CurrentUser):
     blueprint = instance.blueprint
     _range_under_control(instance, db, current_user)
 
-    # Get next offset
-    offset = blueprint.next_offset
-    blueprint.next_offset += 1
-
     if read_blueprint(blueprint.config).deployable_on_kubernetes:
         # Era B: networks and workloads are realised on the cluster from the config at deploy
         # time, so the range row is the clone's handle and nothing more.
@@ -154,8 +149,6 @@ def clone_instance(instance_id: UUID, db: DBSession, current_user: CurrentUser):
             db=db,
             config=config,
             range_name=f"{instance.name} (Clone)",
-            base_prefix=blueprint.base_subnet_prefix,
-            offset=offset,
             created_by=current_user.id,
         )
 
@@ -164,7 +157,7 @@ def clone_instance(instance_id: UUID, db: DBSession, current_user: CurrentUser):
         name=f"{instance.name} (Clone)",
         blueprint_id=blueprint.id,
         blueprint_version=blueprint.version,
-        subnet_offset=offset,
+        subnet_offset=next_instance_ordinal(db, blueprint.id),
         instructor_id=current_user.id,
         range_id=new_range.id,
     )
@@ -224,24 +217,24 @@ def _range_under_control(instance: RangeInstance, db: Session, current_user) -> 
     return range_obj
 
 
-def _recreate_range_contents(
-    db: Session, range_obj: Range, config: BlueprintConfig, base_prefix: str, offset: int
-):
-    """Recreate networks and VMs in an existing range."""
+def _recreate_range_contents(db: Session, range_obj: Range, config: BlueprintConfig):
+    """Recreate networks and VMs in an existing range, with the blueprint's own addresses.
+
+    A redeploy used to renumber the range by applying the instance's subnet offset, while
+    `create_range_from_blueprint` ignored that offset entirely -- so an instance's networks
+    silently moved the first time it was redeployed. DinD isolation is what made the offset
+    unnecessary; PG-122 removed it, and this path now agrees with creation.
+    """
     from proving_ground.models import Network, VM
-    from proving_ground.services.blueprint_service import apply_subnet_offset
 
     # Create networks
     network_lookup = {}
     for net_config in config.networks:
-        adjusted_subnet = apply_subnet_offset(net_config.subnet, base_prefix, offset)
-        adjusted_gateway = apply_subnet_offset(net_config.gateway, base_prefix, offset)
-
         network = Network(
             range_id=range_obj.id,
             name=net_config.name,
-            subnet=adjusted_subnet,
-            gateway=adjusted_gateway,
+            subnet=net_config.subnet,
+            gateway=net_config.gateway,
             is_isolated=net_config.is_isolated,
         )
         db.add(network)
@@ -269,8 +262,6 @@ def _recreate_range_contents(
             # No image source found, skip this VM
             continue
 
-        adjusted_ip = apply_subnet_offset(vm_config.ip_address, base_prefix, offset)
-
         vm = VM(
             range_id=range_obj.id,
             network_id=network_id,
@@ -278,7 +269,7 @@ def _recreate_range_contents(
             golden_image_id=golden_image_id,
             snapshot_id=snapshot_id,
             hostname=vm_config.hostname,
-            ip_address=adjusted_ip,
+            ip_address=vm_config.ip_address,
             cpu=vm_config.cpu,
             ram_mb=vm_config.ram_mb,
             disk_gb=vm_config.disk_gb,

@@ -32,14 +32,12 @@ depends_on = None
 
 def upgrade() -> None:
     # Case-only rewrite; the set of distinct values is unchanged.
-    op.execute(
-        """
+    op.execute("""
         UPDATE ranges
            SET visibility = lower(visibility)
          WHERE visibility IS NOT NULL
            AND visibility <> lower(visibility)
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

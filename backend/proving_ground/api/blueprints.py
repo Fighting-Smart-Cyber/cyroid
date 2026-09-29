@@ -41,6 +41,7 @@ from proving_ground.schemas.blueprint_export import (
 from proving_ground.services.blueprint_service import (
     extract_config_from_range,
     create_range_from_blueprint,
+    next_instance_ordinal,
 )
 from proving_ground.services.blueprint_export_service import get_blueprint_export_service
 from proving_ground.tasks.deployment import deploy_range_task
@@ -185,15 +186,12 @@ def create_blueprint(data: BlueprintCreate, db: DBSession, current_user: Current
         config = extract_config_from_range(db, data.range_id).model_dump()
 
     # Create blueprint
-    # Note: base_subnet_prefix and next_offset are deprecated with DinD isolation
     blueprint = RangeBlueprint(
         name=data.name,
         description=data.description,
         config=config,
-        base_subnet_prefix=data.base_subnet_prefix,  # Optional, kept for backward compatibility
         created_by=current_user.id,
         version=1,
-        next_offset=0,
     )
     db.add(blueprint)
     db.commit()
@@ -394,10 +392,6 @@ def deploy_instance(
     if not blueprint:
         raise HTTPException(status_code=404, detail="Blueprint not found")
 
-    # Get next offset and increment
-    offset = blueprint.next_offset
-    blueprint.next_offset += 1
-
     if _read(blueprint.config).deployable_on_kubernetes:
         # An Era B blueprint (PG-122): networks and workloads are realised on the cluster from
         # the config at deploy time, not stored as Network and VM rows. The range row is the
@@ -417,13 +411,10 @@ def deploy_instance(
         if blueprint.content_ids:
             config.content_ids = blueprint.content_ids
 
-        # Create range from blueprint with offset
         range_obj = create_range_from_blueprint(
             db=db,
             config=config,
             range_name=data.name,
-            base_prefix=blueprint.base_subnet_prefix,
-            offset=offset,
             created_by=current_user.id,
         )
 
@@ -432,7 +423,7 @@ def deploy_instance(
         name=data.name,
         blueprint_id=blueprint.id,
         blueprint_version=blueprint.version,
-        subnet_offset=offset,
+        subnet_offset=next_instance_ordinal(db, blueprint.id),
         instructor_id=current_user.id,
         range_id=range_obj.id,
     )
@@ -1032,6 +1023,15 @@ def _catalog_origin(blueprint_id: UUID, db: Session):
     return blueprint, origin
 
 
+def _safe_contribution_filename(item_id: str) -> str:
+    """Basename only; strip separators so a hostile item_id cannot escape."""
+    cleaned = item_id.replace("\\", "/")
+    base = Path(cleaned).name
+    for ch in ("\x00", "\n", "\r", "/", "\\"):
+        base = base.replace(ch, "")
+    return base or "contribution"
+
+
 def _origin_response(origin) -> BlueprintCatalogOrigin:
     return BlueprintCatalogOrigin(
         source_id=origin.source_id,
@@ -1137,7 +1137,7 @@ def build_blueprint_catalog_contribution(
         applied=[c.key for c in result.applied],
         notes=result.notes,
         applies_to_source=result.applies_to_source,
-        suggested_filename=f"{origin.item_id}-contribution.patch",
+        suggested_filename=f"{_safe_contribution_filename(origin.item_id)}-contribution.patch",
     )
 
 
@@ -1148,8 +1148,6 @@ def _blueprint_to_response(blueprint: RangeBlueprint, db: Session) -> BlueprintR
         name=blueprint.name,
         description=blueprint.description,
         version=blueprint.version,
-        base_subnet_prefix=blueprint.base_subnet_prefix,
-        next_offset=blueprint.next_offset,
         content_ids=blueprint.content_ids or [],
         created_by=blueprint.created_by,
         created_at=blueprint.created_at,
@@ -1172,8 +1170,6 @@ def _blueprint_to_detail_response(
         name=blueprint.name,
         description=blueprint.description,
         version=blueprint.version,
-        base_subnet_prefix=blueprint.base_subnet_prefix,
-        next_offset=blueprint.next_offset,
         content_ids=blueprint.content_ids or [],
         created_by=blueprint.created_by,
         created_at=blueprint.created_at,

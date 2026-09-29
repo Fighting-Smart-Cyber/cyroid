@@ -18,7 +18,6 @@ from proving_ground.schemas.content import (
 )
 from proving_ground.services.walkthrough_parser import parse_markdown_to_walkthrough
 
-
 router = APIRouter(prefix="/ranges", tags=["walkthrough"])
 
 

@@ -312,7 +312,7 @@ class TestTheNamespaceCarriesTheGrant:
         rbac = RbacStub()
         client = control_plane_client(tmp_path, monkeypatch, rbac)
         await client.ensure_namespace("pg-alpha-jones", {})
-        (namespace, body) = rbac.created[0]
+        namespace, body = rbac.created[0]
         assert namespace == "pg-alpha-jones"
         assert body.metadata.name == RANGE_ROLE_BINDING
         assert (body.role_ref.kind, body.role_ref.name) == ("ClusterRole", RANGE_CLUSTER_ROLE)

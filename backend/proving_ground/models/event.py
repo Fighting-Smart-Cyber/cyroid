@@ -1,5 +1,6 @@
 # backend/proving_ground/models/event.py
 """Training event models for scheduling and role-based content delivery."""
+
 from datetime import datetime
 from enum import Enum
 from typing import List, Optional

@@ -1,5 +1,6 @@
 # backend/proving_ground/schemas/catalog.py
 """Pydantic schemas for Catalog API."""
+
 import re
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -9,7 +10,6 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from proving_ground.models.catalog import CatalogItemType, CatalogSourceType, CatalogSyncStatus
-
 
 # ============ Catalog Source Validation ============
 

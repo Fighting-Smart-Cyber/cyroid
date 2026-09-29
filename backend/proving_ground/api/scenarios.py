@@ -5,6 +5,7 @@ Scenarios API endpoints for training scenarios.
 Scenarios are read directly from YAML files in data/scenarios/.
 No database required - files are immediately visible when added.
 """
+
 import re
 from pathlib import Path
 from typing import Annotated, Any, List, Optional

@@ -6,10 +6,10 @@ Revises: a1r2c3h4v5m6
 Create Date: 2026-01-21 18:52:09.376260
 
 """
+
 from typing import Sequence, Union
 
 from alembic import op
-
 
 # revision identifiers, used by Alembic.
 revision: str = "690fe2a2cae1"
@@ -21,8 +21,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     # First, remove any existing duplicates before adding unique constraints
     # Keep the oldest record (by created_at) for each duplicate iso_path
-    op.execute(
-        """
+    op.execute("""
         DELETE FROM base_images b1
         WHERE iso_path IS NOT NULL
         AND EXISTS (
@@ -30,12 +29,10 @@ def upgrade() -> None:
             WHERE b2.iso_path = b1.iso_path
             AND b2.created_at < b1.created_at
         )
-    """
-    )
+    """)
 
     # Keep the oldest record (by created_at) for each duplicate docker_image_tag
-    op.execute(
-        """
+    op.execute("""
         DELETE FROM base_images b1
         WHERE docker_image_tag IS NOT NULL
         AND EXISTS (
@@ -43,8 +40,7 @@ def upgrade() -> None:
             WHERE b2.docker_image_tag = b1.docker_image_tag
             AND b2.created_at < b1.created_at
         )
-    """
-    )
+    """)
 
     # Now add unique constraints
     op.create_unique_constraint("uq_base_images_iso_path", "base_images", ["iso_path"])

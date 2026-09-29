@@ -6,10 +6,20 @@ alembic==1.13.1
 psycopg2-binary==2.9.9
 pydantic[email]==2.5.3
 pydantic-settings==2.1.0
-python-jose[cryptography]==3.3.0
+# 3.4.0, not 3.3.0: GHSA-6c5p-j8vq-pqhj is a Critical algorithm-confusion flaw in JWT
+# verification, and this is the library that verifies our tokens. A patch bump.
+python-jose[cryptography]==3.4.0
 passlib==1.7.4
 bcrypt==4.2.0
-python-multipart==0.0.6
+# 0.0.22 cleared three High findings (GHSA-2jv5-9r88-3w3p, GHSA-59g5-xgcq-4qw3,
+# GHSA-wp53-j4wj-2cfg); 0.0.31 clears a fourth, GHSA-pp6c-gr5w-3c5g (High), plus
+# GHSA-v9pg-7xvm-68hf, GHSA-vffw-93wf-4j4q and GHSA-6jv3-5f52-599m (Low).
+# Verified the same way each time, because this library renamed its module and
+# fastapi reaches it through a compatibility shim: a multipart form POST is
+# round-tripped through the app before the bump is committed. See
+# tests/unit/test_multipart_form_handling.py, which now does that in CI rather
+# than by hand.
+python-multipart==0.0.31
 dramatiq[redis]==1.15.0
 redis==5.0.1
 minio==7.2.3

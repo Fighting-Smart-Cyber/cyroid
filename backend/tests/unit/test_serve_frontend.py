@@ -25,6 +25,26 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 COMPOSE_SH = REPO_ROOT / "scripts" / "compose.sh"
 SERVE_YML = REPO_ROOT / "docker-compose.serve.yml"
 PG_UPDATE = REPO_ROOT / "scripts" / "pg-update.sh"
+NGINX_CONF = REPO_ROOT / "frontend" / "nginx.conf"
+
+
+def nginx_listen_port():
+    """The port nginx actually listens on, read from its own config.
+
+    Hardcoded 80 here used to be correct and then silently was not: the image now runs nginx as an
+    unprivileged user, which cannot bind a port below 1024, so the listen moved to 8080. Reading the
+    value instead of restating it means this pair of tests keeps checking what it was written to check
+    - that Traefik and the healthcheck agree with nginx - rather than checking a number that has to be
+    updated in three files at once.
+    """
+    match = re.search(r"^\s*listen\s+(\d+);", NGINX_CONF.read_text(), re.MULTILINE)
+    assert match, "no `listen <port>;` found in %s" % NGINX_CONF
+    port = int(match.group(1))
+    assert (
+        port != 5173
+    ), "nginx.conf listens on the Vite dev port; that is the bug these tests exist for"
+    return port
+
 
 needs_repo = pytest.mark.skipif(not COMPOSE_SH.exists(), reason="repo root not present")
 
@@ -86,12 +106,17 @@ class TestTheServeOverlayServesABuild:
     def test_traefik_is_pointed_at_nginx_not_vite(self):
         """A label map merge that missed would route to a port nothing serves."""
         labels = self.frontend["labels"]
-        port = "traefik.http.services.frontend.loadbalancer.server.port=80"
-        assert port in labels, f"labels are {labels}; Traefik would still dial Vite on 5173."
+        expected = (
+            "traefik.http.services.frontend.loadbalancer.server.port=%d" % nginx_listen_port()
+        )
+        assert expected in labels, (
+            f"labels are {labels}; Traefik would dial a port nginx does not listen on "
+            "(Vite's 5173, or the old privileged 80)."
+        )
 
     def test_the_healthcheck_probes_the_port_nginx_listens_on(self):
         probe = " ".join(self.frontend["healthcheck"]["test"])
-        assert ":80/" in probe, (
-            f"healthcheck is {probe!r}; the dev overlay's 5173 probe would "
-            "leave the container permanently unhealthy."
+        assert ":%d/" % nginx_listen_port() in probe, (
+            f"healthcheck is {probe!r} but nginx listens on {nginx_listen_port()}; a probe of the "
+            "wrong port leaves the container permanently unhealthy."
         )

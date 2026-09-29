@@ -139,7 +139,17 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60
 
     # App
-    app_name: str = "PROVING GROUND"
+    # The ENGINE's name, which is what an unconfigured install is. It reaches a public
+    # downloader in three places -- the OpenAPI title at /docs, /api/v1/version, and the health
+    # response -- so a default naming the distribution built on top of the engine is wrong in
+    # all three. Same rule as `frontend/src/lib/branding.ts`, which already defaults to CYROID:
+    # a distribution sets `APP_NAME` in its environment rather than editing this. (`APP_NAME`,
+    # not `PROVING_GROUND_APP_NAME` -- this Settings class declares no env_prefix, so the
+    # variable is the field name. Verified, because the obvious guess is wrong.)
+    #
+    # Renaming this is allowed where renaming the catalog-facing identifiers is not: nothing
+    # resolves against it. The environment variable KEY is unchanged, as CLAUDE.md requires.
+    app_name: str = "CYROID"
     debug: bool = True
 
     # CORS (comma-separated list of allowed origins, or "*" for all)

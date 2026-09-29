@@ -1,5 +1,6 @@
 # backend/proving_ground/schemas/content.py
 """Pydantic schemas for Content API."""
+
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -7,7 +8,6 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from proving_ground.models.content import ContentType
-
 
 # ============ Walkthrough Schemas ============
 #

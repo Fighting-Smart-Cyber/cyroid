@@ -1,5 +1,6 @@
 # backend/tests/unit/test_dind_service.py
 """Unit tests for DinD service using mocks."""
+
 import pytest
 from unittest.mock import MagicMock, patch
 

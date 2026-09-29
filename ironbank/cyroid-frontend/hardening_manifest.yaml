@@ -15,7 +15,7 @@ name: fighting-smart-cyber/cyroid/cyroid-frontend
 
 # Non-latest, per the schema. Kept in step with VERSION; the release pipeline is what advances it.
 tags:
-  - "0.55.1"
+  - "0.56.0"
 
 args:
   # DELIBERATELY EMPTY, and the schema allows it ("May be an empty string if the Dockerfile does
@@ -41,7 +41,7 @@ labels:
   org.opencontainers.image.licenses: "AGPL-3.0-only"
   org.opencontainers.image.url: "https://github.com/Fighting-Smart-Cyber/cyroid"
   org.opencontainers.image.vendor: "Fighting Smart Cyber"
-  org.opencontainers.image.version: "0.55.1"
+  org.opencontainers.image.version: "0.56.0"
   mil.dso.ironbank.image.keywords: "cyber range,training,kubevirt,kubernetes,devsecops"
   mil.dso.ironbank.image.type: "opensource"
   mil.dso.ironbank.product.name: "CYROID"

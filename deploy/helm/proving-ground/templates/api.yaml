@@ -38,7 +38,7 @@ spec:
       {{- include "pg.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: api
-          image: {{ include "pg.image" (dict "Values" .Values "Chart" .Chart "name" "pg-api") }}
+          image: {{ include "pg.image" (dict "Values" .Values "Chart" .Chart "name" "api") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # As the Compose stack does: wait for Postgres, migrate, serve. Migrations run here
           # rather than in a Job so a single `helm upgrade` is the whole update.

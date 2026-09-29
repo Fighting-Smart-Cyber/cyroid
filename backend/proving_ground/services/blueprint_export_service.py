@@ -22,6 +22,7 @@ Version History:
 - 4.0: Unified Range Blueprints: MSEL and artifact options
 - 5.0: Era B (Kubernetes) blueprints
 """
+
 import asyncio
 import hashlib
 import json
@@ -54,6 +55,7 @@ from proving_ground.models.content import Content, ContentAsset
 from proving_ground.models.artifact import Artifact
 from proving_ground.models.user import User
 from proving_ground.config import get_settings
+from proving_ground.utils.safe_archive import safe_extract_tar, safe_extract_zip
 from proving_ground.schemas.blueprint import BlueprintConfig
 from proving_ground.schemas.blueprint_export import (
     PACKAGE_FORMAT_KUBERNETES,
@@ -1167,8 +1169,6 @@ class BlueprintExportService:
                 name=blueprint.name,
                 description=blueprint.description,
                 version=blueprint.version,
-                base_subnet_prefix=blueprint.base_subnet_prefix or "10.0.0.0/8",
-                next_offset=blueprint.next_offset or 0,
                 config=export_config,  # Use export_config which may have MSEL stripped
                 student_guide_id=str(content_id) if content_id else None,
             )
@@ -1301,10 +1301,10 @@ class BlueprintExportService:
             import tarfile
 
             with tarfile.open(archive_path, "r:gz") as tf:
-                tf.extractall(temp_dir)
+                safe_extract_tar(tf, temp_dir, label="Blueprint import")
         else:
             with zipfile.ZipFile(archive_path, "r") as zf:
-                zf.extractall(temp_dir)
+                safe_extract_zip(zf, temp_dir, label="Blueprint import")
 
         # Check for v2.0 Range Export format (uses range.json)
         range_json_path = os.path.join(temp_dir, "range.json")
@@ -1394,8 +1394,6 @@ class BlueprintExportService:
             "name": range_info.get("name", "Imported Range"),
             "description": range_info.get("description"),
             "version": 1,
-            "base_subnet_prefix": "10.0.0.0/8",
-            "next_offset": 0,
             "config": config,
             "student_guide_id": None,
         }
@@ -2049,9 +2047,7 @@ class BlueprintExportService:
                 name=blueprint_name,
                 description=export_data.blueprint.description,
                 config=config_dict,
-                base_subnet_prefix=export_data.blueprint.base_subnet_prefix,
                 version=export_data.blueprint.version,
-                next_offset=0,  # Reset offset for new instance
                 created_by=user.id,
                 content_ids=blueprint_content_ids,  # Link imported content
             )

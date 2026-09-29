@@ -38,6 +38,7 @@ an image-set mismatch, Redis being down, a Docker error - is caught and
 turned into None so the caller (range_deployment_service) falls back to
 cold provisioning. A deploy must never fail because the pool had a problem.
 """
+
 import json
 import logging
 import uuid

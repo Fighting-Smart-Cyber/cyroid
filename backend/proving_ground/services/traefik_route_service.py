@@ -5,6 +5,7 @@ Traefik Route Service
 Manages dynamic Traefik routes for VNC console access in DinD deployments.
 Generates YAML route files that Traefik watches via file provider.
 """
+
 import base64
 import os
 import logging

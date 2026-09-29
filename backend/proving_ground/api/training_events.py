@@ -1,5 +1,6 @@
 # backend/proving_ground/api/training_events.py
 """Training Events API endpoints for scheduling and role-based content delivery."""
+
 import logging
 from datetime import datetime
 from typing import Annotated, List, Optional
@@ -619,19 +620,19 @@ def _range_from_blueprint(
     name: str,
     created_by: UUID,
 ):
-    """Create one range from a blueprint, whichever era wrote it, and take the next subnet."""
+    """Create one range from a blueprint, whichever era wrote it."""
     from proving_ground.models.blueprint import RangeInstance
     from proving_ground.models.range import Range, RangeStatus
-    from proving_ground.services.blueprint_service import create_range_from_blueprint
+    from proving_ground.services.blueprint_service import (
+        create_range_from_blueprint,
+        next_instance_ordinal,
+    )
 
-    offset = blueprint.next_offset or 0
     if blueprint_config is not None:
         range_obj = create_range_from_blueprint(
             db=db,
             config=blueprint_config,
             range_name=name,
-            base_prefix=blueprint.base_subnet_prefix or "10.0.0.0/8",
-            offset=offset,
             created_by=created_by,
         )
     else:
@@ -651,14 +652,15 @@ def _range_from_blueprint(
                 name=name,
                 blueprint_id=blueprint.id,
                 blueprint_version=blueprint.version,
-                subnet_offset=offset,
+                subnet_offset=next_instance_ordinal(db, blueprint.id),
                 instructor_id=created_by,
                 range_id=range_obj.id,
             )
         )
+        # An event creates several ranges in a loop, and the ordinal is counted from the table --
+        # so each instance has to be visible before the next one is numbered.
+        db.flush()
 
-    # Increment offset for next deployment
-    blueprint.next_offset = 1 if blueprint.next_offset is None else blueprint.next_offset + 1
     return range_obj
 
 

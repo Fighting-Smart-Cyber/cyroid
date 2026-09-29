@@ -8,7 +8,6 @@ Create Date: 2026-02-13
 
 from typing import Sequence, Union
 
-
 # revision identifiers, used by Alembic.
 revision: str = "a1b2merge0001"
 down_revision: Union[str, Sequence[str]] = (

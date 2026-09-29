@@ -13,6 +13,7 @@ verified against a real daemon (Engine v1.55) before it was written down here:
 That last point is why VMResourceUpdate carries the bounds - nothing downstream
 will catch an absurd value.
 """
+
 import pytest
 from unittest.mock import MagicMock, patch
 

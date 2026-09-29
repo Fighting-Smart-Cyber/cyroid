@@ -10,7 +10,9 @@ from pydantic import BaseModel, Field
 class BlueprintFieldChange(BaseModel):
     """One difference between the catalog item and the local blueprint."""
 
-    key: str = Field(description="Stable identifier; send this back to select the change")
+    key: str = Field(
+        description="Opaque stable identifier (JSON path segments); send this back to select the change"
+    )
     path: List[str] = Field(description="Location in blueprint.yaml, segment by segment")
     kind: str = Field(description="changed | added | removed")
     label: str

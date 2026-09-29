@@ -1,5 +1,6 @@
 # backend/proving_ground/services/notification_service.py
 """Service for creating and querying user-scoped notifications."""
+
 import asyncio
 import logging
 from datetime import datetime

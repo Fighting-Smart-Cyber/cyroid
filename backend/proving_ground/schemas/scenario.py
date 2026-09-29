@@ -13,6 +13,7 @@ owns them, reading the same filesystem, and the models that used to sit in this
 file described scenarios as database rows with UUID primary keys and generated
 timestamps -- shapes nothing produced and nothing consumed.
 """
+
 from typing import Dict
 from uuid import UUID
 

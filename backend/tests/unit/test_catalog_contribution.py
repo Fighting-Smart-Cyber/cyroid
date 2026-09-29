@@ -1,5 +1,7 @@
 """Contributing a locally-modified blueprint back to its catalog (PG-147)."""
 
+import json
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -17,7 +19,6 @@ from proving_ground.catalog.contribution import (
     render_yaml,
 )
 from proving_ground.services.catalog_service import build_config_from_yaml
-
 
 # A catalog item in the shape cyroid-catalog publishes: some fields stated,
 # plenty left to the installer's defaults, and one VM still on the deprecated
@@ -81,7 +82,7 @@ def test_raising_a_default_valued_field_is_a_change():
     web["ram_mb"] = 4096
 
     diff = diff_blueprint_against_catalog(CATALOG_YAML, config)
-    change = one(diff, "vms/web-01/ram_mb")
+    change = one(diff, k("vms", "web-01", "ram_mb"))
     assert change.kind == ADDED  # the catalog never stated it
     assert change.before == 1024 and change.after == 4096
 
@@ -96,7 +97,7 @@ def test_image_change_is_written_to_the_spelling_the_catalog_uses():
     web["base_image_tag"] = "ubuntu-24.04"
 
     diff = diff_blueprint_against_catalog(CATALOG_YAML, config)
-    change = one(diff, "vms/web-01/template_name")
+    change = one(diff, k("vms", "web-01", "template_name"))
     assert change.before == "ubuntu-22.04" and change.after == "ubuntu-24.04"
 
     doc = apply_changes(CATALOG_YAML, diff.changes)
@@ -128,8 +129,8 @@ def test_added_and_removed_vms():
     )
 
     diff = diff_blueprint_against_catalog(CATALOG_YAML, config)
-    assert one(diff, "vms/dc-01").kind == REMOVED
-    added = one(diff, "vms/kali")
+    assert one(diff, k("vms", "dc-01")).kind == REMOVED
+    added = one(diff, k("vms", "kali"))
     assert added.kind == ADDED
     # Values equal to the installer's defaults are not written back out.
     assert added.after == {
@@ -150,7 +151,7 @@ def test_network_field_change():
     corp["internet_enabled"] = True
 
     diff = diff_blueprint_against_catalog(CATALOG_YAML, config)
-    change = one(diff, "networks/corp/internet_enabled")
+    change = one(diff, k("networks", "corp", "internet_enabled"))
     assert change.kind == ADDED and change.after is True
 
     doc = apply_changes(CATALOG_YAML, diff.changes)
@@ -163,8 +164,8 @@ def test_environment_variables_add_change_and_remove():
     web["environment"] = {"APP_ENV": "staging", "DEBUG": "1"}
 
     diff = diff_blueprint_against_catalog(CATALOG_YAML, config)
-    assert one(diff, "vms/web-01/environment/APP_ENV").kind == CHANGED
-    assert one(diff, "vms/web-01/environment/DEBUG").kind == ADDED
+    assert one(diff, k("vms", "web-01", "environment", "APP_ENV")).kind == CHANGED
+    assert one(diff, k("vms", "web-01", "environment", "DEBUG")).kind == ADDED
 
     doc = apply_changes(CATALOG_YAML, diff.changes)
     env = next(v for v in doc["vms"] if v["hostname"] == "web-01")["environment"]
@@ -203,7 +204,7 @@ def test_only_selected_changes_are_applied():
     diff = diff_blueprint_against_catalog(CATALOG_YAML, config)
     assert len(diff.changes) == 2
 
-    selected = diff.select(["vms/dc-01/cpu"])
+    selected = diff.select([k("vms", "dc-01", "cpu")])
     assert len(selected) == 1
     doc = apply_changes(CATALOG_YAML, selected)
     assert next(v for v in doc["vms"] if v["hostname"] == "dc-01")["cpu"] == 8
@@ -219,7 +220,7 @@ def test_hostname_containing_a_dot_round_trips():
     config["vms"][0]["cpu"] = 16
 
     diff = diff_blueprint_against_catalog(original, config)
-    change = one(diff, "vms/dc-01.corp.local/cpu")
+    change = one(diff, k("vms", "dc-01.corp.local", "cpu"))
     assert change.path == ("vms", "dc-01.corp.local", "cpu")
 
     doc = apply_changes(original, [change])
@@ -237,6 +238,7 @@ def test_msel_and_content_are_reported_as_not_contributable():
     assert any("Content Library" in n for n in diff.notes)
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available in this environment")
 def test_patch_applies_cleanly_to_the_catalog_file(tmp_path: Path):
     """The whole point: `git apply` in a catalog clone must accept this."""
     item_path = "blueprints/red-team-training-lab/blueprint.yaml"
@@ -264,15 +266,13 @@ def test_patch_applies_cleanly_to_the_catalog_file(tmp_path: Path):
 
 
 def test_a_commented_catalog_file_yields_a_patch_that_says_it_will_not_apply():
-    original_text = textwrap.dedent(
-        """\
+    original_text = textwrap.dedent("""\
         # Red team lab, maintained by the catalog team.
         name: Red Team Training Lab
         vms:
           - hostname: dc-01
             base_image_tag: windows-2019
-        """
-    )
+        """)
     doc = yaml.safe_load(original_text)
     config = build_config_from_yaml(doc)
     config["vms"][0]["cpu"] = 2
@@ -300,7 +300,51 @@ def test_nothing_changed_means_an_empty_patch():
     assert result.patch == ""
 
 
+def test_path_segments_containing_slash_do_not_collide_on_key():
+    """A hostname with `/` must not share a key with a longer field path."""
+    original = {
+        "name": "Slash Lab",
+        "networks": [{"name": "corp", "subnet": "10.0.0.0/24"}],
+        "vms": [
+            {
+                "hostname": "a",
+                "base_image_tag": "ubuntu-22.04",
+                "cpu": 1,
+                "network_name": "corp",
+            },
+            {
+                "hostname": "a/cpu",
+                "base_image_tag": "ubuntu-22.04",
+                "cpu": 2,
+                "network_name": "corp",
+            },
+        ],
+    }
+    config = installed_config(original)
+    # Bump CPU on host "a" and remove the oddly-named VM entirely.
+    next(v for v in config["vms"] if v["hostname"] == "a")["cpu"] = 8
+    config["vms"] = [v for v in config["vms"] if v["hostname"] != "a/cpu"]
+
+    diff = diff_blueprint_against_catalog(original, config)
+    field_key = k("vms", "a", "cpu")
+    removed_key = k("vms", "a/cpu")
+    assert field_key != removed_key
+    assert {c.key for c in diff.changes} >= {field_key, removed_key}
+
+    selected = diff.select([field_key])
+    assert [c.key for c in selected] == [field_key]
+    doc = apply_changes(original, selected)
+    assert next(v for v in doc["vms"] if v["hostname"] == "a")["cpu"] == 8
+    # The unselected REMOVED must not have been applied.
+    assert any(v["hostname"] == "a/cpu" for v in doc["vms"])
+
+
 # --- helpers -------------------------------------------------------------
+
+
+def k(*segments: str) -> str:
+    """Stable change key matching FieldChange.key (JSON array of segments)."""
+    return json.dumps(list(segments), ensure_ascii=False, separators=(",", ":"))
 
 
 def one(diff, key):

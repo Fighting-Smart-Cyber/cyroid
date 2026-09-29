@@ -10,7 +10,6 @@ from proving_ground.catalog.dependencies import (
     resolve_install_plan,
 )
 
-
 BLUEPRINT_ITEM = {
     "id": "red-team-lab",
     "type": "blueprint",

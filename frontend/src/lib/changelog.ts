@@ -48,6 +48,29 @@ export interface Release {
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.56.0',
+    date: '2026-09-28',
+    title: 'Install it from a clone',
+    highlights: [
+      {
+        kind: 'feature',
+        text: 'One command stands CYROID up on a throwaway Kubernetes cluster on your own machine \u2014 no cluster to build first, and nothing left behind when you delete it.',
+      },
+      {
+        kind: 'feature',
+        text: 'Release images are published publicly, so an install no longer needs access to a private registry.',
+      },
+      {
+        kind: 'fix',
+        text: 'The web interface now loads on an in-cluster install. It had been answering 404 since the frontend was changed to run unprivileged.',
+      },
+      {
+        kind: 'fix',
+        text: 'Uploading a crafted blueprint or range archive can no longer write files outside the directory it is unpacked into.',
+      },
+    ],
+  },
+  {
     version: '0.55.1',
     date: '2026-09-27',
     // Build and supply-chain metadata. Nothing an operator or a learner sees changes, so no

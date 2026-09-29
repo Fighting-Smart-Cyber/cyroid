@@ -6,6 +6,7 @@ Usage:
 
 If no username is provided, promotes the first user found.
 """
+
 import sys
 import os
 

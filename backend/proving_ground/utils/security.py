@@ -20,6 +20,26 @@ def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 
+# ASD STIG APSC-DV-001680: the application must enforce a minimum 15-character password length.
+# 15, not 8, and enforced in one place on purpose. Three endpoints accept a password - register,
+# admin user-create, and change-password - and before this only change-password checked a length at
+# all, so the minimum could be walked straight past by creating the account instead of changing it.
+# A per-endpoint `if len(...) < N` is how that happened; anything new that accepts a password calls
+# this instead.
+PASSWORD_MIN_LENGTH = 15
+
+
+def password_policy_error(password: Optional[str]) -> Optional[str]:
+    """Return the reason a password is unacceptable, or None when it is fine.
+
+    Returns a message rather than raising, so the HTTP layer keeps deciding status codes and this
+    module stays free of framework imports.
+    """
+    if len(password or "") < PASSWORD_MIN_LENGTH:
+        return "Password must be at least %d characters" % PASSWORD_MIN_LENGTH
+    return None
+
+
 def create_access_token(user_id: UUID, expires_delta: Optional[timedelta] = None) -> str:
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta

@@ -6,6 +6,7 @@ BaseImages are the foundation of the three-tier image system:
 - Golden Images: First snapshots or imported VMs
 - Snapshots: Follow-on snapshots (forks)
 """
+
 from enum import Enum
 from typing import Optional, List, TYPE_CHECKING
 from uuid import UUID

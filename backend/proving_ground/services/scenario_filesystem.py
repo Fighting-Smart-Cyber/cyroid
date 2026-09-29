@@ -10,6 +10,7 @@ is memoised on the bytes that were parsed rather than on the file's timestamp,
 which is what keeps the four copies from answering the same question
 differently. See `_ScenarioMemo`.
 """
+
 import hashlib
 import logging
 import os

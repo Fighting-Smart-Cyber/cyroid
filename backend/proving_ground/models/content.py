@@ -1,5 +1,6 @@
 # backend/proving_ground/models/content.py
 """Content models for training materials (MSELs, student guides, curricula)."""
+
 from enum import Enum
 from typing import List, Optional
 from uuid import UUID

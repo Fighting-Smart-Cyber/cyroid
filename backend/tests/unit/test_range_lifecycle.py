@@ -18,7 +18,6 @@ from proving_ground.capability.workload import DiskSpec, InterfaceSpec, OSFamily
 
 from .test_kubernetes_runtime import FakeKube
 
-
 # FakeKube implements the whole KubeClient port, including the lifecycle surface.
 LifecycleFake = FakeKube
 

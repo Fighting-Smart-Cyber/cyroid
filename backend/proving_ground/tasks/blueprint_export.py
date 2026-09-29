@@ -2,6 +2,7 @@
 """
 Async blueprint export task with progress tracking and cancellation support.
 """
+
 import json
 import logging
 import os
@@ -281,8 +282,6 @@ def export_blueprint_async(
             name=blueprint.name,
             description=blueprint.description,
             version=blueprint.version,
-            base_subnet_prefix=blueprint.base_subnet_prefix or "10.0.0.0/8",
-            next_offset=blueprint.next_offset or 0,
             config=export_config,
             student_guide_id=None,
         )

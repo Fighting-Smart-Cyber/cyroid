@@ -108,6 +108,9 @@ services:
     labels:
       # Add TLS configuration for Let's Encrypt
       - "traefik.http.routers.frontend-secure.tls.certresolver=${SSL_RESOLVER:-}"
+      # Stated rather than left to Traefik's single-exposed-port guess: the image serves on 8080
+      # because nginx runs unprivileged there.
+      - "traefik.http.services.frontend.loadbalancer.server.port=8080"
 
   traefik:
     image: ghcr.io/jongodb/cyroid-proxy:${VERSION:-latest}

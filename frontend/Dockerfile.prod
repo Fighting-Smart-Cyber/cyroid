@@ -55,12 +55,21 @@ COPY nginx-security-headers.conf /etc/nginx/conf.d/security-headers.conf
 # Copy built assets from builder stage
 COPY --from=builder /app/dist /usr/share/nginx/html
 
-# Expose port 80
-EXPOSE 80
+# ASD STIG APSC-DV-000510: the application must execute without excessive account permissions.
+# nginx:alpine ships a uid 101 `nginx` user but runs its master as root, which is more privilege than
+# serving static files needs. Everything the master writes has to move somewhere this user owns: the
+# cache/temp directories (the default client_body/proxy/fastcgi temp paths all live under
+# /var/cache/nginx) and the pid file, which nginx.conf now puts in /tmp. The logs need no change -
+# the base image already symlinks them to /dev/stdout and /dev/stderr.
+RUN chown -R nginx:nginx /var/cache/nginx /usr/share/nginx/html
+USER nginx
+
+# 8080 because uid 101 cannot bind port 80. Both compose files point Traefik at 8080 to match.
+EXPOSE 8080
 
 # Health check (use 127.0.0.1 to avoid IPv6 resolution issues)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/health || exit 1
 
 # Start nginx
 CMD ["nginx", "-g", "daemon off;"]

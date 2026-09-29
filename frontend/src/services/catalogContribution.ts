@@ -8,7 +8,7 @@
 import { api } from './api';
 
 export interface BlueprintFieldChange {
-  /** Stable identifier; send this back to select the change. */
+  /** Opaque stable identifier from the API; send this back to select the change. */
   key: string;
   /** Location in blueprint.yaml, segment by segment. */
   path: string[];

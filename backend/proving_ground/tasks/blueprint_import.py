@@ -2,6 +2,7 @@
 """
 Async blueprint import task with progress tracking and cancellation support.
 """
+
 import logging
 import os
 import shutil
@@ -337,9 +338,7 @@ def import_blueprint_async(
                 name=blueprint_name,
                 description=export_data.blueprint.description,
                 config=config_dict,
-                base_subnet_prefix=export_data.blueprint.base_subnet_prefix,
                 version=export_data.blueprint.version,
-                next_offset=0,
                 created_by=user.id,
                 content_ids=blueprint_content_ids,
             )

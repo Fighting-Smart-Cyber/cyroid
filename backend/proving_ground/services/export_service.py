@@ -6,6 +6,7 @@ Supports two modes:
 - Online: Lightweight export without Docker images (.zip)
 - Offline: Complete export with Docker images for air-gapped deployment (.tar.gz)
 """
+
 import hashlib
 import io
 import json
@@ -26,6 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from proving_ground.config import get_settings
+from proving_ground.utils.safe_archive import safe_extract_tar, safe_extract_zip
 from proving_ground.models.artifact import Artifact, ArtifactPlacement
 from proving_ground.models.content import Content, ContentType
 from proving_ground.models.inject import Inject
@@ -1024,10 +1026,10 @@ class ExportService:
             # Detect archive type and extract
             if str(archive_path).endswith(".zip"):
                 with zipfile.ZipFile(archive_path, "r") as zf:
-                    zf.extractall(temp_dir)
+                    safe_extract_zip(zf, temp_dir, label="Import")
             elif str(archive_path).endswith(".tar.gz") or str(archive_path).endswith(".tgz"):
                 with tarfile.open(archive_path, "r:gz") as tf:
-                    tf.extractall(temp_dir)
+                    safe_extract_tar(tf, temp_dir, label="Import")
             else:
                 raise ValueError(f"Unsupported archive format: {archive_path}")
 
@@ -1094,10 +1096,10 @@ class ExportService:
         try:
             if str(archive_path).endswith(".zip"):
                 with zipfile.ZipFile(archive_path, "r") as zf:
-                    zf.extractall(temp_dir)
+                    safe_extract_zip(zf, temp_dir, label="Import")
             else:
                 with tarfile.open(archive_path, "r:gz") as tf:
-                    tf.extractall(temp_dir)
+                    safe_extract_tar(tf, temp_dir, label="Import")
 
             storage = get_storage_service()
             artifact_hash_to_id: Dict[str, UUID] = {}
@@ -1190,10 +1192,10 @@ class ExportService:
             # Extract archive
             if str(archive_path).endswith(".zip"):
                 with zipfile.ZipFile(archive_path, "r") as zf:
-                    zf.extractall(temp_dir)
+                    safe_extract_zip(zf, temp_dir, label="Import")
             else:
                 with tarfile.open(archive_path, "r:gz") as tf:
-                    tf.extractall(temp_dir)
+                    safe_extract_tar(tf, temp_dir, label="Import")
 
             # Read export data
             export_json_path = os.path.join(temp_dir, "range.json")

@@ -9,11 +9,11 @@ Scenarios are now managed directly from the filesystem (data/scenarios/*.yaml)
 instead of being stored in the database. This provides immediate visibility
 of scenario files without needing database seeding.
 """
+
 from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
-
 
 # revision identifiers, used by Alembic.
 revision: str = "e57dfc82c9fc"

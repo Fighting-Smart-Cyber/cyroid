@@ -1,5 +1,6 @@
 # backend/proving_ground/models/catalog.py
 """Catalog source and installed item models for the PROVING GROUND catalog system."""
+
 from enum import Enum
 from typing import Optional, List
 from uuid import UUID

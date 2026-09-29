@@ -1,5 +1,6 @@
 # backend/proving_ground/models/router.py
 """Range router model for VyOS containers."""
+
 from enum import Enum
 from typing import Optional
 from uuid import UUID

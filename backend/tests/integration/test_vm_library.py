@@ -7,6 +7,7 @@ Tests the following VM Library features:
 
 Note: The first user registered in the system becomes admin automatically.
 """
+
 import pytest
 
 
